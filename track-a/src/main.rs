@@ -108,16 +108,9 @@ impl<'a> LocalCatalog<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Record {
-    local_group_id: u32,
-    latency: u32,
-    is_error: bool,
-}
-
 struct ThreadOutput<'a> {
     catalog: LocalCatalog<'a>,
-    records: Vec<Record>,
+    records: Vec<u64>,
 }
 
 fn main() {
@@ -226,12 +219,9 @@ fn main() {
                         }
                     }
 
-                    let local_group_id = (hour_id * MAX_LOCAL_EPS + ep_id as usize) as u32;
-                    records.push(Record {
-                        local_group_id,
-                        latency,
-                        is_error,
-                    });
+                    let local_group_id = (hour_id * MAX_LOCAL_EPS + ep_id as usize) as u64;
+                    let packed = local_group_id | ((is_error as u64) << 20) | ((latency as u64) << 32);
+                    records.push(packed);
                 }
 
                 ThreadOutput { catalog, records }
@@ -279,14 +269,16 @@ fn main() {
     // Pass A: Count records per global group
     for (th_idx, th) in thread_outputs.iter().enumerate() {
         let remap = &thread_ep_remap[th_idx];
-        for rec in &th.records {
-            let hour_id = (rec.local_group_id as usize) / MAX_LOCAL_EPS;
-            let local_ep = (rec.local_group_id as usize) % MAX_LOCAL_EPS;
+        for &packed in &th.records {
+            let local_group_id = (packed & 0xFFFFF) as usize;
+            let hour_id = local_group_id / MAX_LOCAL_EPS;
+            let local_ep = local_group_id % MAX_LOCAL_EPS;
+            let is_error = ((packed >> 20) & 1) != 0;
             let global_ep = remap[local_ep] as usize;
             let sorted_ep = global_to_sorted[global_ep];
             let g_id = hour_id * num_endpoints + sorted_ep;
             group_counts[g_id] += 1;
-            if rec.is_error {
+            if is_error {
                 group_errors[g_id] += 1;
             }
         }
@@ -307,15 +299,17 @@ fn main() {
     // Pass B: Scatter latencies into contiguous group slices
     for (th_idx, th) in thread_outputs.iter().enumerate() {
         let remap = &thread_ep_remap[th_idx];
-        for rec in &th.records {
-            let hour_id = (rec.local_group_id as usize) / MAX_LOCAL_EPS;
-            let local_ep = (rec.local_group_id as usize) % MAX_LOCAL_EPS;
+        for &packed in &th.records {
+            let local_group_id = (packed & 0xFFFFF) as usize;
+            let hour_id = local_group_id / MAX_LOCAL_EPS;
+            let local_ep = local_group_id % MAX_LOCAL_EPS;
+            let latency = (packed >> 32) as u32;
             let global_ep = remap[local_ep] as usize;
             let sorted_ep = global_to_sorted[global_ep];
             let g_id = hour_id * num_endpoints + sorted_ep;
             let slot = write_cursors[g_id];
             write_cursors[g_id] += 1;
-            flat_latencies[slot] = rec.latency;
+            flat_latencies[slot] = latency;
         }
     }
 

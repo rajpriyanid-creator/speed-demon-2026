@@ -302,113 +302,189 @@ fn main() {
     // Mmap docs.txt
     let docs_mmap = MmapSlice::open(&docs_path).expect("failed to open docs.txt");
     let docs_data = docs_mmap.as_slice();
-
-    let mut term_counts = vec![0u32; num_terms as usize];
-    let mut last_seen: Vec<u32> = vec![u32::MAX; num_terms as usize];
-
-    let mut doc_starts: Vec<u32> = Vec::with_capacity(250_000);
-    let mut doc_lens: Vec<u32> = Vec::with_capacity(250_000);
-
-    let mut i = 0;
     let n = docs_data.len();
-    let mut doc_id = 0u32;
 
-    // Pass 1 on docs.txt: count term occurrences and record doc slices
-    while i < n {
-        while i < n && docs_data[i] != b'\t' {
-            i += 1;
-        }
-        if i >= n { break; }
-        i += 1; // skip TAB
-        let text_start = i;
-        while i < n && docs_data[i] != b'\n' {
-            i += 1;
-        }
-        let text_end = i;
-        i += 1; // skip LF
+    let num_index_threads = std::thread::available_parallelism()
+        .map(|num| num.get())
+        .unwrap_or(6)
+        .min(12);
 
-        let text_len = text_end - text_start;
-        doc_starts.push(text_start as u32);
-        doc_lens.push(text_len as u32);
-
-        let text = &docs_data[text_start..text_end];
-        let mut p = 0;
-        let tlen = text.len();
-        while p < tlen {
-            while p < tlen && !is_token[text[p] as usize] {
-                p += 1;
+    let mut doc_chunks = Vec::with_capacity(num_index_threads);
+    {
+        let mut cur_byte = 0;
+        let mut cur_doc = 0u32;
+        for t in 0..num_index_threads {
+            let target_byte = ((n * (t + 1)) / num_index_threads).min(n);
+            let mut end_byte = target_byte;
+            while end_byte < n && docs_data[end_byte] != b'\n' {
+                end_byte += 1;
             }
-            if p >= tlen { break; }
-            let tok_start = p;
-            while p < tlen && is_token[text[p] as usize] {
-                p += 1;
+            if end_byte < n {
+                end_byte += 1;
             }
-            let tok_len = p - tok_start;
-            if tok_len <= 32 {
-                let mut buf = [0u8; 32];
-                for k in 0..tok_len {
-                    buf[k] = text[tok_start + k].to_ascii_lowercase();
-                }
-                if let Some(term_id) = dict.get(&buf[..tok_len]) {
-                    let tid = term_id as usize;
-                    if last_seen[tid] != doc_id {
-                        last_seen[tid] = doc_id;
-                        term_counts[tid] += 1;
-                    }
-                }
-            }
+            doc_chunks.push((cur_byte, end_byte, cur_doc));
+            let chunk_slice = &docs_data[cur_byte..end_byte];
+            let doc_count = chunk_slice.iter().filter(|&&b| b == b'\n').count() as u32;
+            cur_doc += doc_count;
+            cur_byte = end_byte;
         }
-        doc_id += 1;
     }
 
-    // Prefix sums to build contiguous postings CSR
+    // Pass 1 on docs.txt in parallel: count term occurrences and record doc slices
+    let pass1_results: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte, start_doc)| {
+            let dict_ref = &dict;
+            let is_token_ref = &is_token;
+            let chunk = &docs_data[start_byte..end_byte];
+
+            s.spawn(move || {
+                let mut local_counts = vec![0u32; num_terms as usize];
+                let mut last_seen = vec![u32::MAX; num_terms as usize];
+                let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
+                let mut local_starts = Vec::with_capacity(est_docs);
+                let mut local_lens = Vec::with_capacity(est_docs);
+
+                let mut i = 0;
+                let clen = chunk.len();
+                let mut doc_id = start_doc;
+
+                while i < clen {
+                    while i < clen && chunk[i] != b'\t' {
+                        i += 1;
+                    }
+                    if i >= clen { break; }
+                    i += 1; // skip TAB
+                    let text_start_rel = i;
+                    while i < clen && chunk[i] != b'\n' {
+                        i += 1;
+                    }
+                    let text_end_rel = i;
+                    i += 1; // skip LF
+
+                    let text_len = text_end_rel - text_start_rel;
+                    let global_text_start = (start_byte + text_start_rel) as u32;
+                    local_starts.push(global_text_start);
+                    local_lens.push(text_len as u32);
+
+                    let text = &chunk[text_start_rel..text_end_rel];
+                    let mut p = 0;
+                    let tlen = text.len();
+                    while p < tlen {
+                        while p < tlen && !is_token_ref[text[p] as usize] {
+                            p += 1;
+                        }
+                        if p >= tlen { break; }
+                        let tok_start = p;
+                        while p < tlen && is_token_ref[text[p] as usize] {
+                            p += 1;
+                        }
+                        let tok_len = p - tok_start;
+                        if tok_len <= 32 {
+                            let mut buf = [0u8; 32];
+                            for k in 0..tok_len {
+                                buf[k] = text[tok_start + k].to_ascii_lowercase();
+                            }
+                            if let Some(term_id) = dict_ref.get(&buf[..tok_len]) {
+                                let tid = term_id as usize;
+                                if last_seen[tid] != doc_id {
+                                    last_seen[tid] = doc_id;
+                                    local_counts[tid] += 1;
+                                }
+                            }
+                        }
+                    }
+                    doc_id += 1;
+                }
+
+                (local_counts, local_starts, local_lens)
+            })
+        }).collect();
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Assemble global doc_starts and doc_lens
+    let total_docs_est = pass1_results.iter().map(|r| r.1.len()).sum::<usize>();
+    let mut doc_starts: Vec<u32> = Vec::with_capacity(total_docs_est);
+    let mut doc_lens: Vec<u32> = Vec::with_capacity(total_docs_est);
+    for r in &pass1_results {
+        doc_starts.extend_from_slice(&r.1);
+        doc_lens.extend_from_slice(&r.2);
+    }
+
+    // Prefix sums to build contiguous postings CSR with per-thread write bases
     let mut offsets = vec![0u32; (num_terms as usize) + 1];
+    let mut thread_write_bases: Vec<Vec<u32>> = (0..num_index_threads)
+        .map(|_| vec![0u32; num_terms as usize])
+        .collect();
+
     let mut total_postings = 0u32;
-    for (t, &c) in term_counts.iter().enumerate() {
-        offsets[t] = total_postings;
-        total_postings += c;
+    for term in 0..(num_terms as usize) {
+        offsets[term] = total_postings;
+        let mut cur = total_postings;
+        for t in 0..num_index_threads {
+            thread_write_bases[t][term] = cur;
+            cur += pass1_results[t].0[term];
+        }
+        total_postings = cur;
     }
     offsets[num_terms as usize] = total_postings;
-    drop(term_counts);
 
     let mut all_postings = vec![0u32; total_postings as usize];
-    let mut write_pos = offsets.clone();
-    last_seen.fill(u32::MAX);
 
-    // Pass 2 on docs.txt: populate contiguous all_postings with zero line scanning
-    for (d_id, (&start, &len)) in doc_starts.iter().zip(doc_lens.iter()).enumerate() {
-        let text = &docs_data[start as usize..(start + len) as usize];
-        let mut p = 0;
-        let tlen = text.len();
-        while p < tlen {
-            while p < tlen && !is_token[text[p] as usize] {
-                p += 1;
-            }
-            if p >= tlen { break; }
-            let tok_start = p;
-            while p < tlen && is_token[text[p] as usize] {
-                p += 1;
-            }
-            let tok_len = p - tok_start;
-            if tok_len <= 32 {
-                let mut buf = [0u8; 32];
-                for k in 0..tok_len {
-                    buf[k] = text[tok_start + k].to_ascii_lowercase();
-                }
-                if let Some(term_id) = dict.get(&buf[..tok_len]) {
-                    let tid = term_id as usize;
-                    if last_seen[tid] != d_id as u32 {
-                        last_seen[tid] = d_id as u32;
-                        let slot = write_pos[tid] as usize;
-                        write_pos[tid] += 1;
-                        all_postings[slot] = d_id as u32;
+    let base_addr = all_postings.as_mut_ptr() as usize;
+
+    // Pass 2 on docs.txt in parallel: populate contiguous all_postings with zero line scanning
+    std::thread::scope(|s| {
+        for (t, r) in pass1_results.into_iter().enumerate() {
+            let dict_ref = &dict;
+            let is_token_ref = &is_token;
+            let docs_data_ref = docs_data;
+            let starts = r.1;
+            let lens = r.2;
+            let start_doc = doc_chunks[t].2;
+            let mut write_pos = thread_write_bases[t].clone();
+
+            s.spawn(move || {
+                let raw_ptr = base_addr as *mut u32;
+                let mut last_seen = vec![u32::MAX; num_terms as usize];
+                for (local_idx, (&start, &len)) in starts.iter().zip(lens.iter()).enumerate() {
+                    let d_id = start_doc + local_idx as u32;
+                    let text = &docs_data_ref[start as usize..(start + len) as usize];
+                    let mut p = 0;
+                    let tlen = text.len();
+                    while p < tlen {
+                        while p < tlen && !is_token_ref[text[p] as usize] {
+                            p += 1;
+                        }
+                        if p >= tlen { break; }
+                        let tok_start = p;
+                        while p < tlen && is_token_ref[text[p] as usize] {
+                            p += 1;
+                        }
+                        let tok_len = p - tok_start;
+                        if tok_len <= 32 {
+                            let mut buf = [0u8; 32];
+                            for k in 0..tok_len {
+                                buf[k] = text[tok_start + k].to_ascii_lowercase();
+                            }
+                            if let Some(term_id) = dict_ref.get(&buf[..tok_len]) {
+                                let tid = term_id as usize;
+                                if last_seen[tid] != d_id {
+                                    last_seen[tid] = d_id;
+                                    let slot = write_pos[tid] as usize;
+                                    write_pos[tid] += 1;
+                                    unsafe {
+                                        *raw_ptr.add(slot) = d_id;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            }
+            });
         }
-    }
-    drop(write_pos);
-    drop(last_seen);
+    });
 
     // Parallel query execution
     let num_threads = std::thread::available_parallelism()
