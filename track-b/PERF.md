@@ -4,5 +4,12 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | | | | | |
+| 0 | The reference, unchanged | | 56.35 | 2290 | 0 |
+| 1 | Zero-dep Rust query-driven inverted index with parallel query evaluation | pending | | | |
+
+### Step 1 Architecture
+- Mmap `queries.txt` and `docs.txt` directly to eliminate file copy overhead.
+- Query-driven indexing: Parse `queries.txt` first to catalog the ~75,747 distinct query tokens into an open-addressing hash table with linear probing.
+- Scan `docs.txt` single-pass, tokenizing on ASCII byte boundaries and populating sorted document ID postings lists only for query terms.
+- Phrase queries: Intersect candidate documents starting with the rarest term, then verify consecutive token match on candidate document text without position index memory overhead.
+- Parallel query evaluation across 12 threads using `std::thread::scope` with zero allocation during evaluation.
