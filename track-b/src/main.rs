@@ -138,8 +138,20 @@ fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
             i += 1;
             j += 1;
         } else if va < vb {
+            if i + 8 < na && unsafe { *a.get_unchecked(i + 8) } < vb {
+                i += 8;
+                while i + 8 < na && unsafe { *a.get_unchecked(i + 8) } < vb {
+                    i += 8;
+                }
+            }
             i += 1;
         } else {
+            if j + 8 < nb && unsafe { *b.get_unchecked(j + 8) } < va {
+                j += 8;
+                while j + 8 < nb && unsafe { *b.get_unchecked(j + 8) } < va {
+                    j += 8;
+                }
+            }
             j += 1;
         }
     }
@@ -563,9 +575,17 @@ fn main() {
                             if steps.is_empty() {
                                 write_result(&mut thread_out, r_slice);
                             } else {
-                                buf_a.clear();
-                                buf_a.extend_from_slice(r_slice);
-                                for &(op, maybe_term) in steps {
+                                let (first_op, first_term_opt) = steps[0];
+                                let b_first: &[u32] = match first_term_opt {
+                                    Some(t) => get_postings(t),
+                                    None => &[],
+                                };
+                                match first_op {
+                                    Op::And => intersect(r_slice, b_first, &mut buf_a),
+                                    Op::Or => union(r_slice, b_first, &mut buf_a),
+                                    Op::Not => difference(r_slice, b_first, &mut buf_a),
+                                }
+                                for &(op, maybe_term) in &steps[1..] {
                                     let b: &[u32] = match maybe_term {
                                         Some(t) => get_postings(t),
                                         None => &[],
