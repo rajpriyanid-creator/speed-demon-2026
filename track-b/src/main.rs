@@ -303,7 +303,7 @@ fn main() {
     let docs_mmap = MmapSlice::open(&docs_path).expect("failed to open docs.txt");
     let docs_data = docs_mmap.as_slice();
 
-    let mut postings: Vec<Vec<u32>> = (0..num_terms).map(|_| Vec::new()).collect();
+    let mut term_counts = vec![0u32; num_terms as usize];
     let mut last_seen: Vec<u32> = vec![u32::MAX; num_terms as usize];
 
     let mut doc_starts: Vec<u32> = Vec::with_capacity(250_000);
@@ -313,8 +313,8 @@ fn main() {
     let n = docs_data.len();
     let mut doc_id = 0u32;
 
+    // Pass 1 on docs.txt: count term occurrences and record doc slices
     while i < n {
-        // Skip until TAB
         while i < n && docs_data[i] != b'\t' {
             i += 1;
         }
@@ -353,13 +353,62 @@ fn main() {
                     let tid = term_id as usize;
                     if last_seen[tid] != doc_id {
                         last_seen[tid] = doc_id;
-                        postings[tid].push(doc_id);
+                        term_counts[tid] += 1;
                     }
                 }
             }
         }
         doc_id += 1;
     }
+
+    // Prefix sums to build contiguous postings CSR
+    let mut offsets = vec![0u32; (num_terms as usize) + 1];
+    let mut total_postings = 0u32;
+    for (t, &c) in term_counts.iter().enumerate() {
+        offsets[t] = total_postings;
+        total_postings += c;
+    }
+    offsets[num_terms as usize] = total_postings;
+    drop(term_counts);
+
+    let mut all_postings = vec![0u32; total_postings as usize];
+    let mut write_pos = offsets.clone();
+    last_seen.fill(u32::MAX);
+
+    // Pass 2 on docs.txt: populate contiguous all_postings with zero line scanning
+    for (d_id, (&start, &len)) in doc_starts.iter().zip(doc_lens.iter()).enumerate() {
+        let text = &docs_data[start as usize..(start + len) as usize];
+        let mut p = 0;
+        let tlen = text.len();
+        while p < tlen {
+            while p < tlen && !is_token[text[p] as usize] {
+                p += 1;
+            }
+            if p >= tlen { break; }
+            let tok_start = p;
+            while p < tlen && is_token[text[p] as usize] {
+                p += 1;
+            }
+            let tok_len = p - tok_start;
+            if tok_len <= 32 {
+                let mut buf = [0u8; 32];
+                for k in 0..tok_len {
+                    buf[k] = text[tok_start + k].to_ascii_lowercase();
+                }
+                if let Some(term_id) = dict.get(&buf[..tok_len]) {
+                    let tid = term_id as usize;
+                    if last_seen[tid] != d_id as u32 {
+                        last_seen[tid] = d_id as u32;
+                        let slot = write_pos[tid] as usize;
+                        write_pos[tid] += 1;
+                        all_postings[slot] = d_id as u32;
+                    }
+                }
+            }
+        }
+    }
+    drop(write_pos);
+    drop(last_seen);
 
     // Parallel query execution
     let num_threads = std::thread::available_parallelism()
@@ -371,7 +420,8 @@ fn main() {
 
     let thread_outputs: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = parsed_queries.chunks(chunk_size).map(|chunk| {
-            let postings_ref = &postings;
+            let offsets_ref = &offsets;
+            let all_postings_ref = &all_postings;
             let dict_ref = &dict;
             let doc_starts_ref = &doc_starts;
             let doc_lens_ref = &doc_lens;
@@ -384,11 +434,18 @@ fn main() {
                 let mut doc_tokens = Vec::with_capacity(1024);
                 let mut matches = Vec::new();
 
+                let get_postings = |term_id: u32| -> &[u32] {
+                    let tid = term_id as usize;
+                    let start = offsets_ref[tid] as usize;
+                    let end = offsets_ref[tid + 1] as usize;
+                    &all_postings_ref[start..end]
+                };
+
                 for query in chunk {
                     match query {
                         ParsedQuery::Bool { first_term, steps } => {
                             let r_slice: &[u32] = match *first_term {
-                                Some(t) => &postings_ref[t as usize],
+                                Some(t) => get_postings(t),
                                 None => &[],
                             };
                             if steps.is_empty() {
@@ -398,7 +455,7 @@ fn main() {
                                 buf_a.extend_from_slice(r_slice);
                                 for &(op, maybe_term) in steps {
                                     let b: &[u32] = match maybe_term {
-                                        Some(t) => &postings_ref[t as usize],
+                                        Some(t) => get_postings(t),
                                         None => &[],
                                     };
                                     match op {
@@ -419,7 +476,7 @@ fn main() {
                                 let mut min_idx = 0;
                                 let mut min_len = usize::MAX;
                                 for (idx, &tid) in term_ids.iter().enumerate() {
-                                    let plen = postings_ref[tid as usize].len();
+                                    let plen = (offsets_ref[tid as usize + 1] - offsets_ref[tid as usize]) as usize;
                                     if plen < min_len {
                                         min_len = plen;
                                         min_idx = idx;
@@ -430,11 +487,11 @@ fn main() {
                                     thread_out.extend_from_slice(b"0 0\n");
                                 } else {
                                     buf_a.clear();
-                                    buf_a.extend_from_slice(&postings_ref[term_ids[min_idx] as usize]);
+                                    buf_a.extend_from_slice(get_postings(term_ids[min_idx]));
 
                                     for (idx, &tid) in term_ids.iter().enumerate() {
                                         if idx == min_idx { continue; }
-                                        intersect(&buf_a, &postings_ref[tid as usize], &mut buf_b);
+                                        intersect(&buf_a, get_postings(tid), &mut buf_b);
                                         std::mem::swap(&mut buf_a, &mut buf_b);
                                         if buf_a.is_empty() {
                                             break;

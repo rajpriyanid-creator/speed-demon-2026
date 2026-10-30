@@ -22,6 +22,10 @@ impl std::hash::Hasher for FxHasher {
             self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
         }
     }
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517cc1b727220a95);
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -46,7 +50,17 @@ struct CountryAgg {
     amount_max: Option<i64>,
     name_bytes: u64,
     note_bytes: u64,
-    names: FastHashSet<Box<[u8]>>,
+    names: FastHashSet<u64>,
+}
+
+#[inline(always)]
+fn hash_name(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &byte in b {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^ ((b.len() as u64) << 48)
 }
 
 fn format_cents(cents: i64) -> String {
@@ -243,6 +257,7 @@ fn main() {
                         }
                     }
                     let name_len = name_buf.len() as u64;
+                    let n_hash = hash_name(&name_buf);
 
                     // 3. note
                     let mut note_len: u64 = 0;
@@ -335,9 +350,7 @@ fn main() {
                     });
                     agg.name_bytes += name_len;
                     agg.note_bytes += note_len;
-                    if !agg.names.contains(name_buf.as_slice()) {
-                        agg.names.insert(Box::from(name_buf.as_slice()));
-                    }
+                    agg.names.insert(n_hash);
                 }
                 local_aggs
             }));
@@ -375,10 +388,8 @@ fn main() {
             });
             g_agg.name_bytes += t_agg.name_bytes;
             g_agg.note_bytes += t_agg.note_bytes;
-            for name in &t_agg.names {
-                if !g_agg.names.contains(name.as_ref()) {
-                    g_agg.names.insert(name.clone());
-                }
+            for &n_hash in &t_agg.names {
+                g_agg.names.insert(n_hash);
             }
         }
     }

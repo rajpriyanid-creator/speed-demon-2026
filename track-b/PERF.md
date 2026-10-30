@@ -6,11 +6,10 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2290 | 0 |
 | 1 | Zero-dep Rust query-driven inverted index with parallel query evaluation | run-4c828af558fc | 3.388 | 159.4 | 36.13 |
+| 2 | Contiguous CSR postings arena eliminating 300k dynamic vector reallocations | pending | | | |
 
-### Step 1 Architecture
-- Mmap `queries.txt` and `docs.txt` directly to eliminate file copy overhead.
-- Query-driven indexing: Parse `queries.txt` first to catalog the ~75,747 distinct query tokens into an open-addressing hash table with linear probing.
-- Scan `docs.txt` single-pass, tokenizing on ASCII byte boundaries and populating sorted document ID postings lists only for query terms.
-- Phrase queries: Intersect candidate documents starting with the rarest term, then verify consecutive token match on candidate document text without position index memory overhead.
-- Parallel query evaluation across 12 threads using `std::thread::scope` with zero allocation during evaluation.
-- Scored **36.13 points** on the live Falkenstein board (3.388 s vs 56.35 s Python reference, 159 MB vs 2.29 GB peak memory).
+### Step 2 Architecture
+- Replaced 75,747 dynamic `Vec<Vec<u32>>` heap allocations with a single flat contiguous `all_postings: Vec<u32>` arena (22.24M entries, 89 MB).
+- Pass 1 counts term occurrences and records exact `(start, len)` slices of documents.
+- Computed prefix sums into `offsets: Vec<u32>` and populated postings in Pass 2 with zero text line parsing overhead.
+- All term postings are contiguous L1/L2 cache-friendly slices `&all_postings[offsets[tid]..offsets[tid+1]]`.
