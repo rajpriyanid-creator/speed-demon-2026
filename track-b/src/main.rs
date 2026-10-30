@@ -128,9 +128,11 @@ fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let mut i = 0;
     let mut j = 0;
-    while i < a.len() && j < b.len() {
-        let va = a[i];
-        let vb = b[j];
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = unsafe { *a.get_unchecked(i) };
+        let vb = unsafe { *b.get_unchecked(j) };
         if va == vb {
             out.push(va);
             i += 1;
@@ -148,9 +150,11 @@ fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let mut i = 0;
     let mut j = 0;
-    while i < a.len() && j < b.len() {
-        let va = a[i];
-        let vb = b[j];
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = unsafe { *a.get_unchecked(i) };
+        let vb = unsafe { *b.get_unchecked(j) };
         if va == vb {
             out.push(va);
             i += 1;
@@ -172,9 +176,11 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let mut i = 0;
     let mut j = 0;
-    while i < a.len() && j < b.len() {
-        let va = a[i];
-        let vb = b[j];
+    let na = a.len();
+    let nb = b.len();
+    while i < na && j < nb {
+        let va = unsafe { *a.get_unchecked(i) };
+        let vb = unsafe { *b.get_unchecked(j) };
         if va == vb {
             i += 1;
             j += 1;
@@ -188,6 +194,30 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.extend_from_slice(&a[i..]);
 }
 
+#[inline(always)]
+fn write_u64_fast(mut n: u64, out: &mut Vec<u8>) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
+}
+
+#[inline(always)]
+fn write_u32_fast(n: u32, out: &mut Vec<u8>) {
+    write_u64_fast(n as u64, out);
+}
+
 fn write_result(out: &mut Vec<u8>, ids: &[u32]) {
     if ids.is_empty() {
         out.extend_from_slice(b"0 0\n");
@@ -197,9 +227,12 @@ fn write_result(out: &mut Vec<u8>, ids: &[u32]) {
     let sum: u64 = ids.iter().map(|&x| x as u64).sum();
     let take = count.min(10);
 
-    let _ = write!(out, "{} {}", count, sum);
+    write_u32_fast(count as u32, out);
+    out.push(b' ');
+    write_u64_fast(sum, out);
     for &id in &ids[..take] {
-        let _ = write!(out, " {}", id);
+        out.push(b' ');
+        write_u32_fast(id, out);
     }
     out.push(b'\n');
 }
@@ -312,7 +345,6 @@ fn main() {
     let mut doc_chunks = Vec::with_capacity(num_index_threads);
     {
         let mut cur_byte = 0;
-        let mut cur_doc = 0u32;
         for t in 0..num_index_threads {
             let target_byte = ((n * (t + 1)) / num_index_threads).min(n);
             let mut end_byte = target_byte;
@@ -322,17 +354,14 @@ fn main() {
             if end_byte < n {
                 end_byte += 1;
             }
-            doc_chunks.push((cur_byte, end_byte, cur_doc));
-            let chunk_slice = &docs_data[cur_byte..end_byte];
-            let doc_count = chunk_slice.iter().filter(|&&b| b == b'\n').count() as u32;
-            cur_doc += doc_count;
+            doc_chunks.push((cur_byte, end_byte));
             cur_byte = end_byte;
         }
     }
 
     // Pass 1 on docs.txt in parallel: count term occurrences and record doc slices
     let pass1_results: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte, start_doc)| {
+        let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte)| {
             let dict_ref = &dict;
             let is_token_ref = &is_token;
             let chunk = &docs_data[start_byte..end_byte];
@@ -346,7 +375,7 @@ fn main() {
 
                 let mut i = 0;
                 let clen = chunk.len();
-                let mut doc_id = start_doc;
+                let mut local_doc_id = 0u32;
 
                 while i < clen {
                     while i < clen && chunk[i] != b'\t' {
@@ -386,14 +415,14 @@ fn main() {
                             }
                             if let Some(term_id) = dict_ref.get(&buf[..tok_len]) {
                                 let tid = term_id as usize;
-                                if last_seen[tid] != doc_id {
-                                    last_seen[tid] = doc_id;
+                                if last_seen[tid] != local_doc_id {
+                                    last_seen[tid] = local_doc_id;
                                     local_counts[tid] += 1;
                                 }
                             }
                         }
                     }
-                    doc_id += 1;
+                    local_doc_id += 1;
                 }
 
                 (local_counts, local_starts, local_lens)
@@ -402,6 +431,13 @@ fn main() {
 
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+
+    let mut thread_start_docs = Vec::with_capacity(num_index_threads);
+    let mut cur_global_doc = 0u32;
+    for r in &pass1_results {
+        thread_start_docs.push(cur_global_doc);
+        cur_global_doc += r.1.len() as u32;
+    }
 
     // Assemble global doc_starts and doc_lens
     let total_docs_est = pass1_results.iter().map(|r| r.1.len()).sum::<usize>();
@@ -442,7 +478,7 @@ fn main() {
             let docs_data_ref = docs_data;
             let starts = r.1;
             let lens = r.2;
-            let start_doc = doc_chunks[t].2;
+            let start_doc = thread_start_docs[t];
             let mut write_pos = thread_write_bases[t].clone();
 
             s.spawn(move || {

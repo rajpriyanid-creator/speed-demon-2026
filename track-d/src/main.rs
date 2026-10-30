@@ -269,7 +269,7 @@ fn main() {
     unsafe { munmap(q_ptr, q_len); }
 
     let num_queries = queries.len();
-    let num_threads = 3;
+    let num_threads = 6;
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
 
     let mut results: Vec<i64> = vec![-1; num_queries];
