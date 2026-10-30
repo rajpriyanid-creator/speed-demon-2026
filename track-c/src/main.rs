@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -41,8 +42,8 @@ impl std::hash::BuildHasher for FxBuildHasher {
 
 type FastHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
-#[derive(Default)]
-struct CountryAgg {
+#[derive(Default, Clone, Copy)]
+struct CountryScalarAgg {
     count: u64,
     id_sum: u64,
     amount_sum: i64,
@@ -50,9 +51,56 @@ struct CountryAgg {
     amount_max: Option<i64>,
     name_bytes: u64,
     note_bytes: u64,
-    names: FastHashSet<u64>,
 }
 
+struct NameDict {
+    table: Vec<u64>,
+    mask: usize,
+}
+
+impl NameDict {
+    fn new(cap: usize) -> Self {
+        let size = cap.next_power_of_two();
+        Self {
+            table: vec![0u64; size],
+            mask: size - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn insert_new(&mut self, hash: u64, id: u32) -> bool {
+        let mut idx = (hash as usize) & self.mask;
+        let hash_tag = hash & !0x3FFFF;
+        let tag = hash_tag | ((id + 1) as u64);
+        loop {
+            let e = self.table[idx];
+            if e == 0 {
+                self.table[idx] = tag;
+                return true;
+            }
+            if (e & !0x3FFFF) == hash_tag {
+                return false;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, hash: u64) -> u32 {
+        let mut idx = (hash as usize) & self.mask;
+        let hash_tag = hash & !0x3FFFF;
+        loop {
+            let e = unsafe { *self.table.get_unchecked(idx) };
+            if e == 0 {
+                return 0;
+            }
+            if (e & !0x3FFFF) == hash_tag {
+                return ((e & 0x3FFFF) - 1) as u32;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
 
 fn format_cents(cents: i64) -> String {
     let sign = if cents < 0 { "-" } else { "" };
@@ -163,7 +211,6 @@ fn main() {
         header_end += 1;
     }
 
-    // Partition across 6 physical P-cores
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
@@ -184,19 +231,119 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    let mut thread_aggs_list: Vec<Vec<CountryAgg>> = std::thread::scope(|s| {
+    // Pass 1: Discover all unique names rapidly (skipping notes, regions, amounts)
+    let thread_names: Vec<FastHashSet<u64>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for k in 0..num_threads {
+            let start = boundaries[k];
+            let end = boundaries[k + 1];
+
+            handles.push(s.spawn(move || {
+                let mut local_names: FastHashSet<u64> = FastHashSet::default();
+                let mut pos = start;
+
+                while pos < end {
+                    if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
+                        pos += 3;
+                    }
+                    if pos >= len {
+                        break;
+                    }
+                    if data[pos] == b'\r' || data[pos] == b'\n' {
+                        pos += 1;
+                        continue;
+                    }
+
+                    // Skip id
+                    while pos < len && data[pos] != b',' {
+                        pos += 1;
+                    }
+                    if pos < len && data[pos] == b',' {
+                        pos += 1;
+                    }
+
+                    // Parse name and stream hash
+                    let mut n_hash: u64 = 0xcbf29ce484222325;
+                    let mut name_len: u64 = 0;
+                    if pos < len && data[pos] == b'"' {
+                        pos += 1;
+                        while pos < len {
+                            let b = data[pos];
+                            if b == b'"' {
+                                if pos + 1 < len && data[pos + 1] == b'"' {
+                                    n_hash = (n_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
+                                    name_len += 1;
+                                    pos += 2;
+                                } else {
+                                    pos += 1;
+                                    break;
+                                }
+                            } else {
+                                n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                                name_len += 1;
+                                pos += 1;
+                            }
+                        }
+                    } else {
+                        while pos < len && data[pos] != b',' {
+                            let b = data[pos];
+                            n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                            name_len += 1;
+                            pos += 1;
+                        }
+                    }
+                    let n_hash = n_hash ^ (name_len << 48);
+                    local_names.insert(n_hash);
+
+                    // Skip rest of row to next newline (handling quoted fields)
+                    let mut in_quotes = false;
+                    while pos < len {
+                        let b = data[pos];
+                        if b == b'"' {
+                            in_quotes = !in_quotes;
+                        } else if !in_quotes && b == b'\n' {
+                            pos += 1;
+                            break;
+                        }
+                        pos += 1;
+                    }
+                }
+                local_names
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Main thread builds dense NameDict
+    let mut name_dict = NameDict::new(262_144);
+    let mut total_names = 0u32;
+    for mut set in thread_names {
+        for hash in set.drain() {
+            if name_dict.insert_new(hash, total_names) {
+                total_names += 1;
+            }
+        }
+    }
+
+    let num_words = ((total_names as usize) + 63) / 64;
+    let total_bitset_words = num_countries * num_words;
+    let atomic_bitsets: Vec<AtomicU64> = (0..total_bitset_words).map(|_| AtomicU64::new(0)).collect();
+
+    // Pass 2: Full parse with zero-allocation atomic bitset setting
+    let thread_scalars: Vec<Vec<CountryScalarAgg>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
             let end = boundaries[k + 1];
             let region_to_country_ref = &region_to_country_id;
+            let name_dict_ref = &name_dict;
+            let bitsets_ref = &atomic_bitsets;
 
             handles.push(s.spawn(move || {
-                let mut local_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
+                let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
                 let mut pos = start;
 
                 while pos < end {
-                    // Check BOM
                     if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
                         pos += 3;
                     }
@@ -218,11 +365,11 @@ fn main() {
                         pos += 1;
                     }
 
-                    // 2. name: on-the-fly streaming FNV-1a hash (zero allocations)
+                    // 2. name
                     let mut n_hash: u64 = 0xcbf29ce484222325;
                     let mut name_len: u64 = 0;
                     if pos < len && data[pos] == b'"' {
-                        pos += 1; // skip opening "
+                        pos += 1;
                         while pos < len {
                             let b = data[pos];
                             if b == b'"' {
@@ -231,7 +378,7 @@ fn main() {
                                     name_len += 1;
                                     pos += 2;
                                 } else {
-                                    pos += 1; // skip closing "
+                                    pos += 1;
                                     break;
                                 }
                             } else {
@@ -259,7 +406,7 @@ fn main() {
                     // 3. note
                     let mut note_len: u64 = 0;
                     if pos < len && data[pos] == b'"' {
-                        pos += 1; // skip opening "
+                        pos += 1;
                         while pos < len {
                             let b = data[pos];
                             if b == b'"' {
@@ -267,7 +414,7 @@ fn main() {
                                     note_len += 1;
                                     pos += 2;
                                 } else {
-                                    pos += 1; // skip closing "
+                                    pos += 1;
                                     break;
                                 }
                             } else {
@@ -326,7 +473,6 @@ fn main() {
                         pos += 1;
                     }
 
-                    // Join on region_id
                     let c_id = if has_region && region_id < region_to_country_ref.len() {
                         region_to_country_ref[region_id]
                     } else {
@@ -347,7 +493,11 @@ fn main() {
                     });
                     agg.name_bytes += name_len;
                     agg.note_bytes += note_len;
-                    agg.names.insert(n_hash);
+
+                    let name_id = name_dict_ref.get(n_hash);
+                    let word_offset = (c_id as usize) * num_words + ((name_id as usize) >> 6);
+                    let bit_mask = 1u64 << (name_id & 63);
+                    bitsets_ref[word_offset].fetch_or(bit_mask, Ordering::Relaxed);
                 }
                 local_aggs
             }));
@@ -359,39 +509,32 @@ fn main() {
         munmap(ptr, len);
     }
 
-    // Merge thread aggregates with in-place drain to eliminate peak duplicate memory
-    let mut country_aggs = if !thread_aggs_list.is_empty() {
-        thread_aggs_list.swap_remove(0)
-    } else {
-        (0..num_countries).map(|_| CountryAgg::default()).collect()
-    };
-    for mut thread_aggs in thread_aggs_list {
+    // Merge scalar aggregates
+    let mut country_aggs = vec![CountryScalarAgg::default(); num_countries];
+    for thread_agg in thread_scalars {
         for c_id in 0..num_countries {
-            let mut t_agg = std::mem::take(&mut thread_aggs[c_id]);
-            if t_agg.count == 0 { continue; }
-            let g_agg = &mut country_aggs[c_id];
-            g_agg.count += t_agg.count;
-            g_agg.id_sum += t_agg.id_sum;
-            g_agg.amount_sum += t_agg.amount_sum;
-            g_agg.amount_min = Some(match g_agg.amount_min {
-                Some(cur) => match t_agg.amount_min {
+            let t = &thread_agg[c_id];
+            if t.count == 0 { continue; }
+            let g = &mut country_aggs[c_id];
+            g.count += t.count;
+            g.id_sum += t.id_sum;
+            g.amount_sum += t.amount_sum;
+            g.amount_min = Some(match g.amount_min {
+                Some(cur) => match t.amount_min {
                     Some(t_min) => cur.min(t_min),
                     None => cur,
                 },
-                None => t_agg.amount_min.unwrap_or(0),
+                None => t.amount_min.unwrap_or(0),
             });
-            g_agg.amount_max = Some(match g_agg.amount_max {
-                Some(cur) => match t_agg.amount_max {
+            g.amount_max = Some(match g.amount_max {
+                Some(cur) => match t.amount_max {
                     Some(t_max) => cur.max(t_max),
                     None => cur,
                 },
-                None => t_agg.amount_max.unwrap_or(0),
+                None => t.amount_max.unwrap_or(0),
             });
-            g_agg.name_bytes += t_agg.name_bytes;
-            g_agg.note_bytes += t_agg.note_bytes;
-            for n_hash in t_agg.names.drain() {
-                g_agg.names.insert(n_hash);
-            }
+            g.name_bytes += t.name_bytes;
+            g.note_bytes += t.note_bytes;
         }
     }
 
@@ -407,6 +550,11 @@ fn main() {
         let amt_min = format_cents(agg.amount_min.unwrap_or(0));
         let amt_max = format_cents(agg.amount_max.unwrap_or(0));
 
+        let start_word = c_id * num_words;
+        let distinct_names: usize = (0..num_words)
+            .map(|w| atomic_bitsets[start_word + w].load(Ordering::Relaxed).count_ones() as usize)
+            .sum();
+
         writeln!(
             out_buf,
             "{} {} {} {} {} {} {} {} {}",
@@ -416,7 +564,7 @@ fn main() {
             amt_sum,
             amt_min,
             amt_max,
-            agg.names.len(),
+            distinct_names,
             agg.name_bytes,
             agg.note_bytes
         ).unwrap();
