@@ -173,7 +173,10 @@ fn main() {
     }
 
     // Partition across 6 physical P-cores
-    let num_threads = 6;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .min(12);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 

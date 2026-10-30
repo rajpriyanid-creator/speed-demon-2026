@@ -18,8 +18,9 @@ fn parse_hour_id(line: &[u8]) -> usize {
     if line.len() < 13 {
         return 0;
     }
-    let day = (line[8] - b'0') as usize * 10 + (line[9] - b'0') as usize;
-    let hr = (line[11] - b'0') as usize * 10 + (line[12] - b'0') as usize;
+    let p = line.as_ptr();
+    let day = unsafe { (*p.add(8) - b'0') as usize * 10 + (*p.add(9) - b'0') as usize };
+    let hr = unsafe { (*p.add(11) - b'0') as usize * 10 + (*p.add(12) - b'0') as usize };
     let day_offset = match day {
         30 => 0,
         31 => 24,
@@ -186,31 +187,33 @@ fn main() {
                     }
 
                     let hour_id = parse_hour_id(line);
+                    let lptr = line.as_ptr();
+                    let llen = line.len();
                     let mut idx = 28;
-                    while idx < line.len() && line[idx] != b' ' {
+                    while idx < llen && unsafe { *lptr.add(idx) } != b' ' {
                         idx += 1;
                     }
-                    if idx >= line.len() {
+                    if idx >= llen {
                         continue;
                     }
                     idx += 1; // skip method space
                     let ep_start = idx;
-                    while idx < line.len() && line[idx] != b' ' {
+                    while idx < llen && unsafe { *lptr.add(idx) } != b' ' {
                         idx += 1;
                     }
-                    if idx >= line.len() {
+                    if idx >= llen {
                         continue;
                     }
                     let ep_slice = &line[ep_start..idx];
                     let ep_id = catalog.get_or_insert(ep_slice);
                     idx += 1; // skip space
 
-                    let is_error = line[idx] == b'5';
+                    let is_error = unsafe { *lptr.add(idx) } == b'5';
                     idx += 4; // skip status and space
 
                     let mut latency: u32 = 0;
-                    while idx < line.len() {
-                        let b = line[idx];
+                    while idx < llen {
+                        let b = unsafe { *lptr.add(idx) };
                         if b >= b'0' && b <= b'9' {
                             latency = latency * 10 + (b - b'0') as u32;
                             idx += 1;
