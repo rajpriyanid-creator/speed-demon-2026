@@ -227,7 +227,7 @@ fn main() {
     let num_queries = queries.len();
     let mut answers = vec![-1i64; num_queries];
 
-    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(12);
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(6);
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
 
     let head_ref = &head;
@@ -241,8 +241,8 @@ fn main() {
             let start_q = th_idx * chunk_size;
             s.spawn(move || {
                 let mut dist = vec![u64::MAX; n];
-                let mut visited_gen = vec![0u32; n];
-                let mut cur_gen = 0u32;
+                let mut visited_gen = vec![0u16; n];
+                let mut cur_gen = 0u16;
                 let mut heap = MinHeap::new(4096);
 
                 for (offset, ans_slot) in out_chunk.iter_mut().enumerate() {

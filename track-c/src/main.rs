@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
@@ -33,17 +33,19 @@ fn main() {
     let data_dir = "/data";
     let out_dir = "/out";
 
-    // 1. Load regions.csv
+    // 1. Load regions.csv and catalog countries
     let regions_path = format!("{}/regions.csv", data_dir);
     let regions_file = match File::open(&regions_path) {
         Ok(f) => f,
         Err(_) => return,
     };
     let reader = BufReader::new(regions_file);
-    let mut region_to_country: Vec<Option<Box<[u8]>>> = vec![None; 1_000_000];
+
+    let mut raw_regions: Vec<(usize, Box<[u8]>)> = Vec::with_capacity(250_000);
+    let mut country_set: BTreeSet<Box<[u8]>> = BTreeSet::new();
 
     let mut lines = reader.lines();
-    let _header = lines.next(); // skip region_id,country
+    let _header = lines.next();
     for line in lines {
         if let Ok(line) = line {
             let bytes = line.as_bytes();
@@ -58,13 +60,29 @@ fn main() {
                         rid = rid * 10 + (b - b'0') as usize;
                     }
                 }
-                let country = &bytes[comma + 1..];
-                if rid < region_to_country.len() {
-                    region_to_country[rid] = Some(Box::from(country));
-                }
+                let country: Box<[u8]> = Box::from(&bytes[comma + 1..]);
+                country_set.insert(country.clone());
+                raw_regions.push((rid, country));
             }
         }
     }
+
+    let mut country_names: Vec<Box<[u8]>> = country_set.into_iter().collect();
+    let unmatched_id = country_names.len() as u16;
+    let unmatched_name = Box::from(b"_UNMATCHED".as_slice());
+    country_names.push(unmatched_name);
+
+    let mut region_to_country_id: Vec<u16> = vec![unmatched_id; 1_000_000];
+    for (rid, country) in raw_regions {
+        if rid < region_to_country_id.len() {
+            if let Ok(c_id) = country_names.binary_search(&country) {
+                region_to_country_id[rid] = c_id as u16;
+            }
+        }
+    }
+
+    let num_countries = country_names.len();
+    let mut country_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
 
     // 2. Memory-map records.csv
     let records_path = format!("{}/records.csv", data_dir);
@@ -90,9 +108,6 @@ fn main() {
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-    let mut countries: BTreeMap<Box<[u8]>, CountryAgg> = BTreeMap::new();
-    let unmatched_key: Box<[u8]> = Box::from(b"_UNMATCHED".as_slice());
 
     let mut pos = 0;
     // Skip BOM if present at start of file
@@ -122,13 +137,15 @@ fn main() {
             continue;
         }
 
-        // 1. id (decimal integer)
+        // 1. id
         let mut id: u64 = 0;
         while pos < len && data[pos] != b',' {
             id = id * 10 + (data[pos] - b'0') as u64;
             pos += 1;
         }
-        pos += 1; // skip ','
+        if pos < len && data[pos] == b',' {
+            pos += 1;
+        }
 
         // 2. name
         name_buf.clear();
@@ -196,12 +213,18 @@ fn main() {
         }
 
         // 4. region_id
+        let mut has_region = false;
         let mut region_id: usize = 0;
         while pos < len && data[pos] != b',' {
-            region_id = region_id * 10 + (data[pos] - b'0') as usize;
+            if data[pos] >= b'0' && data[pos] <= b'9' {
+                has_region = true;
+                region_id = region_id * 10 + (data[pos] - b'0') as usize;
+            }
             pos += 1;
         }
-        pos += 1; // skip ','
+        if pos < len && data[pos] == b',' {
+            pos += 1;
+        }
 
         // 5. amount (-?[0-9]+\.[0-9]{2})
         let mut is_neg = false;
@@ -228,16 +251,13 @@ fn main() {
         }
 
         // Join on region_id
-        let country_key = if region_id < region_to_country.len() {
-            match &region_to_country[region_id] {
-                Some(c) => c.clone(),
-                None => unmatched_key.clone(),
-            }
+        let c_id = if has_region && region_id < region_to_country_id.len() {
+            region_to_country_id[region_id]
         } else {
-            unmatched_key.clone()
+            unmatched_id
         };
 
-        let agg = countries.entry(country_key).or_default();
+        let agg = &mut country_aggs[c_id as usize];
         agg.count += 1;
         agg.id_sum += id;
         agg.amount_sum += cents;
@@ -251,16 +271,23 @@ fn main() {
         });
         agg.name_bytes += name_len;
         agg.note_bytes += note_len;
-        agg.names.insert(Box::from(name_buf.as_slice()));
+        if !agg.names.contains(name_buf.as_slice()) {
+            agg.names.insert(Box::from(name_buf.as_slice()));
+        }
+    }
+
+    unsafe {
+        munmap(ptr, len);
     }
 
     // Format output
     let mut out_buf = Vec::with_capacity(64 * 1024);
-    for (key, agg) in countries {
+    for (c_id, country_bytes) in country_names.iter().enumerate() {
+        let agg = &country_aggs[c_id];
         if agg.count == 0 {
             continue;
         }
-        let country_str = std::str::from_utf8(&key).unwrap();
+        let country_str = std::str::from_utf8(country_bytes).unwrap();
         let amt_sum = format_cents(agg.amount_sum);
         let amt_min = format_cents(agg.amount_min.unwrap_or(0));
         let amt_max = format_cents(agg.amount_max.unwrap_or(0));
@@ -284,9 +311,5 @@ fn main() {
     let _ = fs::create_dir_all(out_dir);
     if let Ok(mut out_file) = File::create(format!("{}/aggregates.txt", out_dir)) {
         let _ = out_file.write_all(&out_buf);
-    }
-
-    unsafe {
-        munmap(ptr, len);
     }
 }

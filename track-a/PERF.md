@@ -6,16 +6,12 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | Multi-threaded Rust with mmap and select_nth_unstable (BTreeMap baseline) | run-c90c25d39a4e | 0.291 | 67.8 | 52.34 |
-| 2 | Flat array indexing, zero-allocation endpoint catalog, O(N) bucket/counting sort | (pending run) | ~0.04 | ~20 | ~75+ |
+| 2 | Open-addressing EndpointCatalog, single-pass parallel record packing, and contiguous counting sort | run-6187a1d17f52 | 0.1469 | 57.7 | 58.55 |
 
-### Optimization Journey
-- **Step 1 (run-c90c25d39a4e)**:
-  - Switched from naive Python (32.05 s) to compiled Rust 2021 with zero runtime dependencies ($D=1$).
-  - Memory-mapped `/data/requests.log` with `MAP_SHARED` to utilize host page-cache directly.
-  - Partitioned work across 12 logical threads using `std::thread::scope`.
-  - Achieved **0.291 s (110x speedup)** and scored **52.34 points** on the live Falkenstein board.
-- **Step 2**:
-  - Replaced tree-based `BTreeMap` and `Box<[u8]>` heap allocations with a pre-indexed `EndpointCatalog` in L1/L2 cache.
-  - Mapped group keys to dense integers: `group_id = hour_id * num_endpoints + sorted_ep_id`.
-  - Replaced hash table lookups with single-pass counting sort into a flat contiguous latency buffer.
-  - Eliminated per-record heap churn and reduced cache misses.
+### Step 2 Optimization Details
+- Replaced per-record `BTreeMap` lookups with thread-local open-addressing `LocalCatalog` using linear probing in L1/L2 cache.
+- Partitioned 238 MB log across 12 threads with zero mutex contention or thread synchronization during parse.
+- Flat record structure packed into 12 bytes (`(local_group_id, latency, is_error)`).
+- After threads join, unified local catalogs into canonical sorted ranks and scattered latencies into a single flat buffer using two-pass counting sort.
+- Computed percentiles via `select_nth_unstable` directly on contiguous group slices.
+- Achieved **0.1469 s (218x faster than Python)** and **58.55 points** on the live Falkenstein board.
