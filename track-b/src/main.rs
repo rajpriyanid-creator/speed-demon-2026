@@ -36,12 +36,26 @@ impl MmapSlice {
     }
 }
 
+const IS_TOKEN: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0u8;
+    loop {
+        if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || (b >= b'0' && b <= b'9') {
+            table[b as usize] = true;
+        }
+        if b == 255 { break; }
+        b += 1;
+    }
+    table
+};
+
 #[derive(Clone, Copy)]
+#[repr(C, align(32))]
 struct DictEntry {
-    hash: u64,
+    hash: u32,
     term_id: u32,
     len: u8,
-    bytes: [u8; 32],
+    bytes: [u8; 23],
 }
 
 struct Dict {
@@ -53,28 +67,28 @@ impl Dict {
     fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two();
         Self {
-            table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 32] }; cap],
+            table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 23] }; cap],
             mask: cap - 1,
         }
     }
 
     #[inline(always)]
-    fn hash_bytes(b: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
+    fn hash_bytes(b: &[u8]) -> u32 {
+        let mut h: u32 = 0x811c9dc5;
         for &byte in b {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x100000001b3);
+            h ^= (byte | 0x20) as u32;
+            h = h.wrapping_mul(0x01000193);
         }
-        h
+        if h == 0 { 1 } else { h }
     }
 
     fn insert(&mut self, term: &[u8], term_id: u32) {
-        if term.len() > 32 { return; }
+        if term.len() > 23 { return; }
         let h = Self::hash_bytes(term);
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = &mut self.table[idx];
-            if e.len == 0 {
+            if e.hash == 0 {
                 e.hash = h;
                 e.term_id = term_id;
                 e.len = term.len() as u8;
@@ -90,12 +104,12 @@ impl Dict {
 
     #[inline(always)]
     fn get(&self, term: &[u8]) -> Option<u32> {
-        if term.len() > 32 { return None; }
+        if term.len() > 23 { return None; }
         let h = Self::hash_bytes(term);
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = unsafe { self.table.get_unchecked(idx) };
-            if e.len == 0 {
+            if e.hash == 0 {
                 return None;
             }
             if e.hash == h && e.len as usize == term.len() && &e.bytes[..term.len()] == term {
@@ -106,24 +120,19 @@ impl Dict {
     }
 
     #[inline(always)]
-    fn get_ascii_lower(&self, raw: &[u8]) -> Option<u32> {
+    fn get_with_hash(&self, raw: &[u8], h: u32) -> Option<u32> {
         let len = raw.len();
-        if len > 32 { return None; }
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in raw {
-            h ^= (b | 0x20) as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
+        if len > 23 { return None; }
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = unsafe { self.table.get_unchecked(idx) };
-            if e.len == 0 {
+            if e.hash == 0 {
                 return None;
             }
             if e.hash == h && e.len as usize == len {
                 let mut match_tok = true;
                 for k in 0..len {
-                    if e.bytes[k] != (raw[k] | 0x20) {
+                    if unsafe { *e.bytes.get_unchecked(k) != (*raw.get_unchecked(k) | 0x20) } {
                         match_tok = false;
                         break;
                     }
@@ -144,14 +153,79 @@ enum Op {
     Not,
 }
 
-enum ParsedQuery {
+enum ParsedQuery<'a> {
     Bool {
         first_term: Option<u32>,
         steps: Vec<(Op, Option<u32>)>,
     },
     Phrase {
         terms: Vec<Option<u32>>,
+        raw_tokens: Vec<&'a [u8]>,
     },
+}
+
+#[inline(always)]
+fn phrase_matches(doc_text: &[u8], phrase: &[&[u8]]) -> bool {
+    if phrase.is_empty() { return true; }
+    let t0 = phrase[0];
+    let l0 = t0.len();
+    let tlen = doc_text.len();
+    let mut p = 0;
+    while p < tlen {
+        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p) as usize) } {
+            p += 1;
+        }
+        if p >= tlen { break; }
+        let tok_start = p;
+        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p) as usize) } {
+            p += 1;
+        }
+        let tok_len = p - tok_start;
+        if tok_len == l0 {
+            let mut matches_t0 = true;
+            for m in 0..l0 {
+                if unsafe { (*doc_text.get_unchecked(tok_start + m) | 0x20) != *t0.get_unchecked(m) } {
+                    matches_t0 = false;
+                    break;
+                }
+            }
+            if matches_t0 {
+                let mut curr_p = p;
+                let mut all_match = true;
+                for &next_tok in &phrase[1..] {
+                    while curr_p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) } {
+                        curr_p += 1;
+                    }
+                    if curr_p >= tlen {
+                        all_match = false;
+                        break;
+                    }
+                    let nt_start = curr_p;
+                    while curr_p < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) } {
+                        curr_p += 1;
+                    }
+                    let nt_len = curr_p - nt_start;
+                    if nt_len != next_tok.len() {
+                        all_match = false;
+                        break;
+                    }
+                    for m in 0..nt_len {
+                        if unsafe { (*doc_text.get_unchecked(nt_start + m) | 0x20) != *next_tok.get_unchecked(m) } {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if !all_match {
+                        break;
+                    }
+                }
+                if all_match {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[inline(always)]
@@ -305,7 +379,7 @@ fn main() {
     let q_mmap = MmapSlice::open(&queries_path).expect("failed to open queries.txt");
     let q_data = q_mmap.as_slice();
 
-    let mut dict = Dict::new(262_144);
+    let mut dict = Dict::new(131_072);
     let mut num_terms = 0u32;
 
     // Pass 1 on queries: collect all unique query terms
@@ -360,20 +434,16 @@ fn main() {
         } else if line.starts_with(b"PHRASE \"") {
             let inner = &line[8..line.len().saturating_sub(1)];
             let mut terms = Vec::new();
+            let mut raw_tokens = Vec::new();
             for part in inner.split(|&b| b == b' ') {
                 if !part.is_empty() {
                     terms.push(dict.get(part));
+                    raw_tokens.push(part);
                 }
             }
-            parsed_queries.push(ParsedQuery::Phrase { terms });
+            parsed_queries.push(ParsedQuery::Phrase { terms, raw_tokens });
         }
     }
-
-    // Prepare token lookup table
-    let mut is_token = [false; 256];
-    for b in b'a'..=b'z' { is_token[b as usize] = true; }
-    for b in b'A'..=b'Z' { is_token[b as usize] = true; }
-    for b in b'0'..=b'9' { is_token[b as usize] = true; }
 
     // Mmap docs.txt
     let docs_mmap = MmapSlice::open(&docs_path).expect("failed to open docs.txt");
@@ -406,7 +476,6 @@ fn main() {
     let pass1_results: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
         let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte)| {
             let dict_ref = &dict;
-            let is_token_ref = &is_token;
             let chunk = &docs_data[start_byte..end_byte];
 
             s.spawn(move || {
@@ -442,21 +511,26 @@ fn main() {
                     let mut p = 0;
                     let tlen = text.len();
                     while p < tlen {
-                        while p < tlen && !is_token_ref[text[p] as usize] {
+                        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                             p += 1;
                         }
                         if p >= tlen { break; }
                         let tok_start = p;
-                        while p < tlen && is_token_ref[text[p] as usize] {
+                        let mut h = 0x811c9dc5u32;
+                        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                            let b = unsafe { *text.get_unchecked(p) };
+                            h ^= (b | 0x20) as u32;
+                            h = h.wrapping_mul(0x01000193);
                             p += 1;
                         }
                         let tok_len = p - tok_start;
-                        if tok_len <= 32 {
-                            if let Some(term_id) = dict_ref.get_ascii_lower(&text[tok_start..p]) {
+                        if tok_len <= 23 {
+                            if h == 0 { h = 1; }
+                            if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
                                 let tid = term_id as usize;
-                                if last_seen[tid] != local_doc_id {
-                                    last_seen[tid] = local_doc_id;
-                                    local_counts[tid] += 1;
+                                if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
+                                    unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
+                                    unsafe { *local_counts.get_unchecked_mut(tid) += 1; }
                                 }
                             }
                         }
@@ -513,7 +587,6 @@ fn main() {
     std::thread::scope(|s| {
         for (t, r) in pass1_results.into_iter().enumerate() {
             let dict_ref = &dict;
-            let is_token_ref = &is_token;
             let docs_data_ref = docs_data;
             let starts = r.1;
             let lens = r.2;
@@ -529,23 +602,28 @@ fn main() {
                     let mut p = 0;
                     let tlen = text.len();
                     while p < tlen {
-                        while p < tlen && !is_token_ref[text[p] as usize] {
+                        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                             p += 1;
                         }
                         if p >= tlen { break; }
                         let tok_start = p;
-                        while p < tlen && is_token_ref[text[p] as usize] {
+                        let mut h = 0x811c9dc5u32;
+                        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                            let b = unsafe { *text.get_unchecked(p) };
+                            h ^= (b | 0x20) as u32;
+                            h = h.wrapping_mul(0x01000193);
                             p += 1;
                         }
                         let tok_len = p - tok_start;
-                        if tok_len <= 32 {
-                            if let Some(term_id) = dict_ref.get_ascii_lower(&text[tok_start..p]) {
+                        if tok_len <= 23 {
+                            if h == 0 { h = 1; }
+                            if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
                                 let tid = term_id as usize;
-                                if last_seen[tid] != d_id {
-                                    last_seen[tid] = d_id;
-                                    let slot = write_pos[tid] as usize;
-                                    write_pos[tid] += 1;
+                                if unsafe { *last_seen.get_unchecked(tid) } != d_id {
+                                    unsafe { *last_seen.get_unchecked_mut(tid) = d_id; }
+                                    let slot = unsafe { *write_pos.get_unchecked(tid) } as usize;
                                     unsafe {
+                                        *write_pos.get_unchecked_mut(tid) += 1;
                                         *raw_ptr.add(slot) = d_id;
                                     }
                                 }
@@ -569,16 +647,14 @@ fn main() {
         let handles: Vec<_> = parsed_queries.chunks(chunk_size).map(|chunk| {
             let offsets_ref = &offsets;
             let all_postings_ref = &all_postings;
-            let dict_ref = &dict;
             let doc_starts_ref = &doc_starts;
             let doc_lens_ref = &doc_lens;
             let docs_data_ref = docs_data;
 
             s.spawn(move || {
                 let mut thread_out = Vec::with_capacity(chunk.len() * 32);
-                let mut buf_a = Vec::with_capacity(250_000);
-                let mut buf_b = Vec::with_capacity(250_000);
-                let mut doc_tokens = Vec::with_capacity(1024);
+                let mut buf_a = Vec::with_capacity(32_768);
+                let mut buf_b = Vec::with_capacity(32_768);
                 let mut matches = Vec::new();
 
                 let get_postings = |term_id: u32| -> &[u32] {
@@ -623,7 +699,7 @@ fn main() {
                                 write_result(&mut thread_out, &buf_a);
                             }
                         }
-                        ParsedQuery::Phrase { terms } => {
+                        ParsedQuery::Phrase { terms, raw_tokens } => {
                             if terms.iter().any(|t| t.is_none()) {
                                 thread_out.extend_from_slice(b"0 0\n");
                             } else {
@@ -657,38 +733,11 @@ fn main() {
                                         thread_out.extend_from_slice(b"0 0\n");
                                     } else {
                                         matches.clear();
-                                        let k = term_ids.len();
                                         for &cand_id in &buf_a {
                                             let start = doc_starts_ref[cand_id as usize] as usize;
                                             let len = doc_lens_ref[cand_id as usize] as usize;
                                             let doc_text = &docs_data_ref[start..start + len];
-
-                                            doc_tokens.clear();
-                                            let mut p = 0;
-                                            let tlen = doc_text.len();
-                                            while p < tlen {
-                                                while p < tlen && !is_token[doc_text[p] as usize] {
-                                                    p += 1;
-                                                }
-                                                if p >= tlen { break; }
-                                                let tok_start = p;
-                                                while p < tlen && is_token[doc_text[p] as usize] {
-                                                    p += 1;
-                                                }
-                                                let tok_len = p - tok_start;
-                                                if tok_len <= 32 {
-                                                    let mut buf = [0u8; 32];
-                                                    for m in 0..tok_len {
-                                                        buf[m] = doc_text[tok_start + m].to_ascii_lowercase();
-                                                    }
-                                                    let tid = dict_ref.get(&buf[..tok_len]).unwrap_or(u32::MAX);
-                                                    doc_tokens.push(tid);
-                                                } else {
-                                                    doc_tokens.push(u32::MAX);
-                                                }
-                                            }
-
-                                            if doc_tokens.windows(k).any(|w| w == term_ids.as_slice()) {
+                                            if phrase_matches(doc_text, raw_tokens) {
                                                 matches.push(cand_id);
                                             }
                                         }

@@ -28,18 +28,8 @@ impl MinHeap {
     }
 
     #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    #[inline(always)]
     fn clear(&mut self) {
         self.data.clear();
-    }
-
-    #[inline(always)]
-    fn peek(&self) -> Option<State> {
-        self.data.first().copied()
     }
 
     #[inline(always)]
@@ -153,7 +143,12 @@ fn main() {
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
-    let num_load_threads = 4;
+    // Pass 1: count forward degrees in parallel
+    let num_load_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+
     let mut edge_chunks = Vec::with_capacity(num_load_threads);
     {
         let total_edge_bytes = g_len - edges_start;
@@ -172,70 +167,54 @@ fn main() {
         }
     }
 
-    // Pass 1: count forward and reverse degrees in parallel
-    let deg_results: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    let deg_results: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = edge_chunks.iter().map(|&(start, end)| {
             s.spawn(move || {
                 let mut local_f_deg = vec![0u32; n];
-                let mut local_r_deg = vec![0u32; n];
                 let mut pos = start;
                 while pos < end {
                     let u = parse_u32(g_data, &mut pos) as usize;
                     if pos < end { pos += 1; }
-                    let v = parse_u32(g_data, &mut pos) as usize;
+                    let _v = parse_u32(g_data, &mut pos);
                     if pos < end { pos += 1; }
                     while pos < end && g_data[pos] != b'\n' { pos += 1; }
                     if pos < end { pos += 1; }
 
                     if u < n { local_f_deg[u] += 1; }
-                    if v < n { local_r_deg[v] += 1; }
                 }
-                (local_f_deg, local_r_deg)
+                local_f_deg
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let mut f_head = vec![0u32; n + 1];
-    let mut r_head = vec![0u32; n + 1];
     let mut thread_f_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
-    let mut thread_r_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
 
     let mut cur_f = 0u32;
-    let mut cur_r = 0u32;
     for i in 0..n {
         f_head[i] = cur_f;
-        r_head[i] = cur_r;
         let mut f_sum = cur_f;
-        let mut r_sum = cur_r;
         for t in 0..num_load_threads {
             thread_f_write[t][i] = f_sum;
-            thread_r_write[t][i] = r_sum;
-            f_sum += deg_results[t].0[i];
-            r_sum += deg_results[t].1[i];
+            f_sum += deg_results[t][i];
         }
         cur_f = f_sum;
-        cur_r = r_sum;
     }
     f_head[n] = cur_f;
-    r_head[n] = cur_r;
     drop(deg_results);
 
     // Packed edges: lower 32 bits = dest node, upper 32 bits = weight
     let mut f_edges = vec![0u64; m];
-    let mut r_edges = vec![0u64; m];
     let f_edges_addr = f_edges.as_mut_ptr() as usize;
-    let r_edges_addr = r_edges.as_mut_ptr() as usize;
 
-    // Pass 2: populate forward and reverse CSR in parallel
+    // Pass 2: populate forward CSR in parallel
     std::thread::scope(|s| {
         for (t, &(start, end)) in edge_chunks.iter().enumerate() {
             let mut f_write = thread_f_write[t].clone();
-            let mut r_write = thread_r_write[t].clone();
 
             s.spawn(move || {
                 let f_raw = f_edges_addr as *mut u64;
-                let r_raw = r_edges_addr as *mut u64;
                 let mut pos = start;
                 while pos < end {
                     let u = parse_u32(g_data, &mut pos) as usize;
@@ -247,24 +226,17 @@ fn main() {
                     if pos < end && g_data[pos] == b'\n' { pos += 1; }
 
                     let packed_f = (v as u64) | (w << 32);
-                    let packed_r = (u as u64) | (w << 32);
 
                     if u < n {
                         let slot = f_write[u] as usize;
                         f_write[u] += 1;
                         unsafe { *f_raw.add(slot) = packed_f; }
                     }
-                    if v < n {
-                        let slot = r_write[v] as usize;
-                        r_write[v] += 1;
-                        unsafe { *r_raw.add(slot) = packed_r; }
-                    }
                 }
             });
         }
     });
     drop(thread_f_write);
-    drop(thread_r_write);
     unsafe { munmap(g_ptr, g_len); }
 
     // 2. Mmap queries.txt
@@ -307,16 +279,17 @@ fn main() {
     unsafe { munmap(q_ptr, q_len); }
 
     let num_queries = queries.len();
-    let num_threads = 6;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .min(12);
     let chunk_size = (num_queries + num_threads - 1) / num_threads;
 
     let mut results: Vec<i64> = vec![-1; num_queries];
 
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
-        let r_head_ref = &r_head;
         let f_edges_ref = &f_edges;
-        let r_edges_ref = &r_edges;
 
         let mut chunks: Vec<&mut [i64]> = Vec::new();
         let mut rest = results.as_mut_slice();
@@ -332,13 +305,9 @@ fn main() {
             let query_slice = &queries[start_q..start_q + res_chunk.len()];
 
             s.spawn(move || {
-                let mut q_f = MinHeap::new(4096);
-                let mut q_r = MinHeap::new(4096);
-
-                let mut dist_f: Vec<u64> = vec![u64::MAX; n];
-                let mut dist_r: Vec<u64> = vec![u64::MAX; n];
-                let mut visited_f: Vec<u32> = Vec::with_capacity(4096);
-                let mut visited_r: Vec<u32> = Vec::with_capacity(4096);
+                let mut q = MinHeap::new(4096);
+                let mut dist: Vec<u64> = vec![u64::MAX; n];
+                let mut visited: Vec<u32> = Vec::with_capacity(4096);
 
                 for (i, &(src, dst)) in query_slice.iter().enumerate() {
                     if src == dst {
@@ -353,105 +322,46 @@ fn main() {
                     }
 
                     // Reset visited nodes from previous query
-                    for &node in &visited_f {
-                        dist_f[node as usize] = u64::MAX;
+                    for &node in &visited {
+                        dist[node as usize] = u64::MAX;
                     }
-                    visited_f.clear();
+                    visited.clear();
+                    q.clear();
 
-                    for &node in &visited_r {
-                        dist_r[node as usize] = u64::MAX;
-                    }
-                    visited_r.clear();
+                    dist[s_idx] = 0;
+                    visited.push(src);
+                    q.push(State { cost: 0, node: src });
 
-                    q_f.clear();
-                    q_r.clear();
-
-                    dist_f[s_idx] = 0;
-                    visited_f.push(src);
-                    q_f.push(State { cost: 0, node: src });
-
-                    dist_r[t_idx] = 0;
-                    visited_r.push(dst);
-                    q_r.push(State { cost: 0, node: dst });
-
-                    let mut mu = u64::MAX;
-
-                    while !q_f.is_empty() && !q_r.is_empty() {
-                        let top_f = q_f.peek().unwrap().cost;
-                        let top_r = q_r.peek().unwrap().cost;
-
-                        if top_f.saturating_add(top_r) >= mu {
+                    let mut found = -1i64;
+                    while let Some(curr) = q.pop() {
+                        if curr.cost > dist[curr.node as usize] {
+                            continue;
+                        }
+                        if curr.node == dst {
+                            found = curr.cost as i64;
                             break;
                         }
+                        let u = curr.node as usize;
+                        let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
+                        let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
 
-                        if top_f <= top_r {
-                            let curr = q_f.pop().unwrap();
-                            if curr.cost > dist_f[curr.node as usize] {
-                                continue;
-                            }
-                            let u = curr.node as usize;
-                            let e_start = f_head_ref[u] as usize;
-                            let e_end = f_head_ref[u + 1] as usize;
+                        for edge_idx in e_start..e_end {
+                            let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
+                            let v = (packed & 0xFFFF_FFFF) as u32;
+                            let w = packed >> 32;
+                            let new_dist = curr.cost + w;
+                            let v_idx = v as usize;
 
-                            for edge_idx in e_start..e_end {
-                                let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
-                                let v = (packed & 0xFFFF_FFFF) as u32;
-                                let w = packed >> 32;
-                                let new_dist = curr.cost + w;
-
-                                let v_idx = v as usize;
-                                if new_dist < dist_f[v_idx] {
-                                    if dist_f[v_idx] == u64::MAX {
-                                        visited_f.push(v);
-                                    }
-                                    dist_f[v_idx] = new_dist;
-                                    q_f.push(State { cost: new_dist, node: v });
-
-                                    let r_dist = dist_r[v_idx];
-                                    if r_dist != u64::MAX {
-                                        let total = new_dist.saturating_add(r_dist);
-                                        if total < mu {
-                                            mu = total;
-                                        }
-                                    }
+                            if new_dist < unsafe { *dist.get_unchecked(v_idx) } {
+                                if unsafe { *dist.get_unchecked(v_idx) } == u64::MAX {
+                                    visited.push(v);
                                 }
-                            }
-                        } else {
-                            let curr = q_r.pop().unwrap();
-                            if curr.cost > dist_r[curr.node as usize] {
-                                continue;
-                            }
-                            let v = curr.node as usize;
-                            let e_start = r_head_ref[v] as usize;
-                            let e_end = r_head_ref[v + 1] as usize;
-
-                            for edge_idx in e_start..e_end {
-                                let packed = unsafe { *r_edges_ref.get_unchecked(edge_idx) };
-                                let u = (packed & 0xFFFF_FFFF) as u32;
-                                let w = packed >> 32;
-                                let new_dist = curr.cost + w;
-
-                                let u_idx = u as usize;
-                                if new_dist < dist_r[u_idx] {
-                                    if dist_r[u_idx] == u64::MAX {
-                                        visited_r.push(u);
-                                    }
-                                    dist_r[u_idx] = new_dist;
-                                    q_r.push(State { cost: new_dist, node: u });
-
-                                    let f_dist = dist_f[u_idx];
-                                    if f_dist != u64::MAX {
-                                        let total = new_dist.saturating_add(f_dist);
-                                        if total < mu {
-                                            mu = total;
-                                        }
-                                    }
-                                }
+                                unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
+                                q.push(State { cost: new_dist, node: v });
                             }
                         }
                     }
-
-                    res_chunk[i] = if mu == u64::MAX { -1 } else { mu as i64 };
+                    res_chunk[i] = found;
                 }
             });
         }
@@ -464,7 +374,27 @@ fn main() {
 
     let mut out_buf = Vec::with_capacity(32 * 1024);
     for d in results {
-        let _ = writeln!(out_buf, "{}", d);
+        if d == -1 {
+            out_buf.extend_from_slice(b"-1\n");
+        } else {
+            let mut n = d as u64;
+            if n == 0 {
+                out_buf.push(b'0');
+            } else {
+                let mut digits = [0u8; 20];
+                let mut dig_i = 0;
+                while n > 0 {
+                    digits[dig_i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    dig_i += 1;
+                }
+                while dig_i > 0 {
+                    dig_i -= 1;
+                    out_buf.push(digits[dig_i]);
+                }
+            }
+            out_buf.push(b'\n');
+        }
         if out_buf.len() > 24 * 1024 {
             out_file.write_all(&out_buf).unwrap();
             out_buf.clear();
