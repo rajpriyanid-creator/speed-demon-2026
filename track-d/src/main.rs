@@ -153,80 +153,118 @@ fn main() {
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
-    // Pass 1: count forward and reverse degrees
-    let mut f_deg = vec![0u32; n];
-    let mut r_deg = vec![0u32; n];
+    let num_load_threads = 4;
+    let mut edge_chunks = Vec::with_capacity(num_load_threads);
     {
-        let mut pos = edges_start;
-        for _ in 0..m {
-            let u = parse_u32(g_data, &mut pos) as usize;
-            if pos < g_len { pos += 1; }
-            let v = parse_u32(g_data, &mut pos) as usize;
-            if pos < g_len { pos += 1; }
-            while pos < g_len && g_data[pos] != b'\n' { pos += 1; }
-            if pos < g_len { pos += 1; }
-
-            if u < n { f_deg[u] += 1; }
-            if v < n { r_deg[v] += 1; }
+        let total_edge_bytes = g_len - edges_start;
+        let mut cur = edges_start;
+        for t in 0..num_load_threads {
+            let target = edges_start + ((total_edge_bytes * (t + 1)) / num_load_threads);
+            let mut end = target.min(g_len);
+            while end < g_len && g_data[end] != b'\n' {
+                end += 1;
+            }
+            if end < g_len {
+                end += 1;
+            }
+            edge_chunks.push((cur, end));
+            cur = end;
         }
     }
 
-    // Forward CSR head
-    let mut f_head = vec![0u32; n + 1];
-    let mut cur_f = 0u32;
-    for i in 0..n {
-        f_head[i] = cur_f;
-        cur_f += f_deg[i];
-    }
-    f_head[n] = cur_f;
-    drop(f_deg);
+    // Pass 1: count forward and reverse degrees in parallel
+    let deg_results: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = edge_chunks.iter().map(|&(start, end)| {
+            s.spawn(move || {
+                let mut local_f_deg = vec![0u32; n];
+                let mut local_r_deg = vec![0u32; n];
+                let mut pos = start;
+                while pos < end {
+                    let u = parse_u32(g_data, &mut pos) as usize;
+                    if pos < end { pos += 1; }
+                    let v = parse_u32(g_data, &mut pos) as usize;
+                    if pos < end { pos += 1; }
+                    while pos < end && g_data[pos] != b'\n' { pos += 1; }
+                    if pos < end { pos += 1; }
 
-    // Reverse CSR head
+                    if u < n { local_f_deg[u] += 1; }
+                    if v < n { local_r_deg[v] += 1; }
+                }
+                (local_f_deg, local_r_deg)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut f_head = vec![0u32; n + 1];
     let mut r_head = vec![0u32; n + 1];
+    let mut thread_f_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
+    let mut thread_r_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
+
+    let mut cur_f = 0u32;
     let mut cur_r = 0u32;
     for i in 0..n {
+        f_head[i] = cur_f;
         r_head[i] = cur_r;
-        cur_r += r_deg[i];
+        let mut f_sum = cur_f;
+        let mut r_sum = cur_r;
+        for t in 0..num_load_threads {
+            thread_f_write[t][i] = f_sum;
+            thread_r_write[t][i] = r_sum;
+            f_sum += deg_results[t].0[i];
+            r_sum += deg_results[t].1[i];
+        }
+        cur_f = f_sum;
+        cur_r = r_sum;
     }
+    f_head[n] = cur_f;
     r_head[n] = cur_r;
-    drop(r_deg);
-
-    let mut f_write = f_head.clone();
-    let mut r_write = r_head.clone();
+    drop(deg_results);
 
     // Packed edges: lower 32 bits = dest node, upper 32 bits = weight
     let mut f_edges = vec![0u64; m];
     let mut r_edges = vec![0u64; m];
+    let f_edges_addr = f_edges.as_mut_ptr() as usize;
+    let r_edges_addr = r_edges.as_mut_ptr() as usize;
 
-    // Pass 2: populate forward and reverse CSR
-    {
-        let mut pos = edges_start;
-        for _ in 0..m {
-            let u = parse_u32(g_data, &mut pos) as usize;
-            if pos < g_len { pos += 1; }
-            let v = parse_u32(g_data, &mut pos) as usize;
-            if pos < g_len { pos += 1; }
-            let w = parse_u32(g_data, &mut pos) as u64;
-            if pos < g_len && g_data[pos] == b'\r' { pos += 1; }
-            if pos < g_len && g_data[pos] == b'\n' { pos += 1; }
+    // Pass 2: populate forward and reverse CSR in parallel
+    std::thread::scope(|s| {
+        for (t, &(start, end)) in edge_chunks.iter().enumerate() {
+            let mut f_write = thread_f_write[t].clone();
+            let mut r_write = thread_r_write[t].clone();
 
-            let packed_f = (v as u64) | (w << 32);
-            let packed_r = (u as u64) | (w << 32);
+            s.spawn(move || {
+                let f_raw = f_edges_addr as *mut u64;
+                let r_raw = r_edges_addr as *mut u64;
+                let mut pos = start;
+                while pos < end {
+                    let u = parse_u32(g_data, &mut pos) as usize;
+                    if pos < end { pos += 1; }
+                    let v = parse_u32(g_data, &mut pos) as usize;
+                    if pos < end { pos += 1; }
+                    let w = parse_u32(g_data, &mut pos) as u64;
+                    if pos < end && g_data[pos] == b'\r' { pos += 1; }
+                    if pos < end && g_data[pos] == b'\n' { pos += 1; }
 
-            if u < n {
-                let slot = f_write[u] as usize;
-                f_write[u] += 1;
-                f_edges[slot] = packed_f;
-            }
-            if v < n {
-                let slot = r_write[v] as usize;
-                r_write[v] += 1;
-                r_edges[slot] = packed_r;
-            }
+                    let packed_f = (v as u64) | (w << 32);
+                    let packed_r = (u as u64) | (w << 32);
+
+                    if u < n {
+                        let slot = f_write[u] as usize;
+                        f_write[u] += 1;
+                        unsafe { *f_raw.add(slot) = packed_f; }
+                    }
+                    if v < n {
+                        let slot = r_write[v] as usize;
+                        r_write[v] += 1;
+                        unsafe { *r_raw.add(slot) = packed_r; }
+                    }
+                }
+            });
         }
-    }
-    drop(f_write);
-    drop(r_write);
+    });
+    drop(thread_f_write);
+    drop(thread_r_write);
     unsafe { munmap(g_ptr, g_len); }
 
     // 2. Mmap queries.txt
