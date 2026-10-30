@@ -62,6 +62,25 @@ fn nearest_rank(n: usize, p: usize) -> usize {
 }
 
 #[inline(always)]
+fn write_u64_into(mut n: u64, out: &mut Vec<u8>) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
+}
+
+#[inline(always)]
 fn hash_bytes(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &x in b {
@@ -266,99 +285,175 @@ fn main() {
     }
 
     let total_groups = NUM_HOURS * num_endpoints;
+    let num_worker_threads = thread_outputs.len();
+
+    // Parallel Pass A: Count records and errors per global group
+    let (thread_counts, thread_errors): (Vec<Vec<u32>>, Vec<Vec<u32>>) = thread::scope(|s| {
+        let handles: Vec<_> = thread_outputs
+            .iter()
+            .enumerate()
+            .map(|(th_idx, th)| {
+                let remap = &thread_ep_remap[th_idx];
+                let global_to_sorted_ref = &global_to_sorted;
+
+                s.spawn(move || {
+                    let mut local_counts = vec![0u32; total_groups];
+                    let mut local_errors = vec![0u32; total_groups];
+                    for &packed in &th.records {
+                        let local_group_id = (packed & 0xFFFFF) as usize;
+                        let hour_id = local_group_id / MAX_LOCAL_EPS;
+                        let local_ep = local_group_id % MAX_LOCAL_EPS;
+                        let is_error = ((packed >> 20) & 1) != 0;
+                        let global_ep = remap[local_ep] as usize;
+                        let sorted_ep = global_to_sorted_ref[global_ep];
+                        let g_id = hour_id * num_endpoints + sorted_ep;
+                        local_counts[g_id] += 1;
+                        if is_error {
+                            local_errors[g_id] += 1;
+                        }
+                    }
+                    (local_counts, local_errors)
+                })
+            })
+            .collect();
+
+        let mut tc = Vec::with_capacity(handles.len());
+        let mut te = Vec::with_capacity(handles.len());
+        for h in handles {
+            let (c, e) = h.join().unwrap();
+            tc.push(c);
+            te.push(e);
+        }
+        (tc, te)
+    });
+
+    // Compute prefix sums and thread write bases
     let mut group_counts = vec![0u32; total_groups];
     let mut group_errors = vec![0u32; total_groups];
-
-    // Pass A: Count records per global group
-    for (th_idx, th) in thread_outputs.iter().enumerate() {
-        let remap = &thread_ep_remap[th_idx];
-        for &packed in &th.records {
-            let local_group_id = (packed & 0xFFFFF) as usize;
-            let hour_id = local_group_id / MAX_LOCAL_EPS;
-            let local_ep = local_group_id % MAX_LOCAL_EPS;
-            let is_error = ((packed >> 20) & 1) != 0;
-            let global_ep = remap[local_ep] as usize;
-            let sorted_ep = global_to_sorted[global_ep];
-            let g_id = hour_id * num_endpoints + sorted_ep;
-            group_counts[g_id] += 1;
-            if is_error {
-                group_errors[g_id] += 1;
-            }
-        }
-    }
-
-    // Prefix sums for flat latency storage
+    let mut thread_dest_offsets: Vec<Vec<u32>> = (0..num_worker_threads).map(|_| vec![0u32; total_groups]).collect();
     let mut group_offsets = vec![0usize; total_groups + 1];
-    let mut total_records = 0usize;
-    for i in 0..total_groups {
-        group_offsets[i] = total_records;
-        total_records += group_counts[i] as usize;
-    }
-    group_offsets[total_groups] = total_records;
 
-    let mut flat_latencies = vec![0u32; total_records];
-    let mut write_cursors = group_offsets.clone();
-
-    // Pass B: Scatter latencies into contiguous group slices
-    for (th_idx, th) in thread_outputs.iter().enumerate() {
-        let remap = &thread_ep_remap[th_idx];
-        for &packed in &th.records {
-            let local_group_id = (packed & 0xFFFFF) as usize;
-            let hour_id = local_group_id / MAX_LOCAL_EPS;
-            let local_ep = local_group_id % MAX_LOCAL_EPS;
-            let latency = (packed >> 32) as u32;
-            let global_ep = remap[local_ep] as usize;
-            let sorted_ep = global_to_sorted[global_ep];
-            let g_id = hour_id * num_endpoints + sorted_ep;
-            let slot = write_cursors[g_id];
-            write_cursors[g_id] += 1;
-            flat_latencies[slot] = latency;
+    let mut cur_total = 0usize;
+    for g in 0..total_groups {
+        group_offsets[g] = cur_total;
+        let mut g_cnt = 0u32;
+        let mut g_err = 0u32;
+        let mut cur_slot = cur_total as u32;
+        for t in 0..num_worker_threads {
+            thread_dest_offsets[t][g] = cur_slot;
+            let c = thread_counts[t][g];
+            cur_slot += c;
+            g_cnt += c;
+            g_err += thread_errors[t][g];
         }
+        group_counts[g] = g_cnt;
+        group_errors[g] = g_err;
+        cur_total = cur_slot as usize;
     }
+    group_offsets[total_groups] = cur_total;
+    drop(thread_counts);
+    drop(thread_errors);
 
-    drop(write_cursors);
-    drop(thread_outputs);
+    let mut flat_latencies = vec![0u32; cur_total];
+    let flat_ptr = flat_latencies.as_mut_ptr() as usize;
 
-    // Format output
+    // Parallel Pass B: Scatter latencies into contiguous group slices
+    thread::scope(|s| {
+        for (th_idx, (th, mut dest_offsets)) in thread_outputs.into_iter().zip(thread_dest_offsets.into_iter()).enumerate() {
+            let remap = &thread_ep_remap[th_idx];
+            let global_to_sorted_ref = &global_to_sorted;
+
+            s.spawn(move || {
+                let raw_ptr = flat_ptr as *mut u32;
+                for &packed in &th.records {
+                    let local_group_id = (packed & 0xFFFFF) as usize;
+                    let hour_id = local_group_id / MAX_LOCAL_EPS;
+                    let local_ep = local_group_id % MAX_LOCAL_EPS;
+                    let latency = (packed >> 32) as u32;
+                    let global_ep = remap[local_ep] as usize;
+                    let sorted_ep = global_to_sorted_ref[global_ep];
+                    let g_id = hour_id * num_endpoints + sorted_ep;
+                    let slot = dest_offsets[g_id] as usize;
+                    dest_offsets[g_id] += 1;
+                    unsafe {
+                        *raw_ptr.add(slot) = latency;
+                    }
+                }
+            });
+        }
+    });
+    drop(thread_ep_remap);
+
+    // Parallel percentiles computation & output formatting
+    let hours_per_chunk = (NUM_HOURS + num_threads - 1) / num_threads;
+    let formatted_chunks: Vec<Vec<u8>> = thread::scope(|s| {
+        let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_chunk).map(|h_start| {
+            let h_end = (h_start + hours_per_chunk).min(NUM_HOURS);
+            let group_counts_ref = &group_counts;
+            let group_errors_ref = &group_errors;
+            let group_offsets_ref = &group_offsets;
+            let sorted_endpoints_ref = &sorted_endpoints;
+            let flat_latencies_ref = &flat_latencies;
+
+            s.spawn(move || {
+                let mut out = Vec::with_capacity((h_end - h_start) * num_endpoints * 48);
+                for hour_id in h_start..h_end {
+                    let hour_str = hour_to_string(hour_id);
+                    for sorted_ep in 0..num_endpoints {
+                        let g_id = hour_id * num_endpoints + sorted_ep;
+                        let count = group_counts_ref[g_id] as usize;
+                        if count == 0 {
+                            continue;
+                        }
+                        let start = group_offsets_ref[g_id];
+                        let end = group_offsets_ref[g_id + 1];
+                        let lats_ptr = flat_latencies_ref.as_ptr() as *mut u32;
+                        let lats_slice = unsafe { std::slice::from_raw_parts_mut(lats_ptr.add(start), end - start) };
+                        lats_slice.sort_unstable();
+
+                        let p50_idx = nearest_rank(count, 50);
+                        let p95_idx = nearest_rank(count, 95);
+                        let p99_idx = nearest_rank(count, 99);
+
+                        let p50 = lats_slice[p50_idx];
+                        let p95 = lats_slice[p95_idx];
+                        let p99 = lats_slice[p99_idx];
+
+                        let errors = group_errors_ref[g_id] as u64;
+                        let error_ppm = (errors * 1_000_000) / (count as u64);
+                        let ep_bytes = sorted_endpoints_ref[sorted_ep].1;
+
+                        out.extend_from_slice(&hour_str);
+                        out.push(b' ');
+                        out.extend_from_slice(ep_bytes);
+                        out.push(b' ');
+                        write_u64_into(count as u64, &mut out);
+                        out.push(b' ');
+                        write_u64_into(p50 as u64, &mut out);
+                        out.push(b' ');
+                        write_u64_into(p95 as u64, &mut out);
+                        out.push(b' ');
+                        write_u64_into(p99 as u64, &mut out);
+                        out.push(b' ');
+                        write_u64_into(errors, &mut out);
+                        out.push(b' ');
+                        write_u64_into(error_ppm, &mut out);
+                        out.push(b'\n');
+                    }
+                }
+                out
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Write formatted chunks sequentially
     let _ = fs::create_dir_all("/out");
-    let out_file = match File::create("/out/summary.txt") {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let mut writer = std::io::BufWriter::with_capacity(128 * 1024, out_file);
-
-    for hour_id in 0..NUM_HOURS {
-        let hour_str = hour_to_string(hour_id);
-        for sorted_ep in 0..num_endpoints {
-            let g_id = hour_id * num_endpoints + sorted_ep;
-            let count = group_counts[g_id] as usize;
-            if count == 0 {
-                continue;
-            }
-
-            let start = group_offsets[g_id];
-            let end = group_offsets[g_id + 1];
-            let lats = &mut flat_latencies[start..end];
-
-            let p50_idx = nearest_rank(count, 50);
-            let p95_idx = nearest_rank(count, 95);
-            let p99_idx = nearest_rank(count, 99);
-
-            let p50 = *lats.select_nth_unstable(p50_idx).1;
-            let p95 = *lats.select_nth_unstable(p95_idx).1;
-            let p99 = *lats.select_nth_unstable(p99_idx).1;
-
-            let errors = group_errors[g_id] as u64;
-            let error_ppm = (errors * 1_000_000) / (count as u64);
-            let ep_bytes = sorted_endpoints[sorted_ep].1;
-
-            let _ = writer.write_all(&hour_str);
-            let _ = writer.write_all(b" ");
-            let _ = writer.write_all(ep_bytes);
-            let _ = writeln!(writer, " {} {} {} {} {} {}", count, p50, p95, p99, errors, error_ppm);
-        }
+    let mut out_file = File::create("/out/summary.txt").unwrap();
+    for chunk in formatted_chunks {
+        out_file.write_all(&chunk).unwrap();
     }
+    out_file.flush().unwrap();
 
-    let _ = writer.flush();
     unsafe { munmap(ptr, len); }
 }
