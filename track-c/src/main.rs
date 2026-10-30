@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
@@ -11,6 +11,32 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 { self.0 }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct FxBuildHasher;
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    #[inline(always)]
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0)
+    }
+}
+
+type FastHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
+
 #[derive(Default)]
 struct CountryAgg {
     count: u64,
@@ -20,7 +46,7 @@ struct CountryAgg {
     amount_max: Option<i64>,
     name_bytes: u64,
     note_bytes: u64,
-    names: HashSet<Box<[u8]>>,
+    names: FastHashSet<Box<[u8]>>,
 }
 
 fn format_cents(cents: i64) -> String {
@@ -30,8 +56,21 @@ fn format_cents(cents: i64) -> String {
 }
 
 fn main() {
-    let data_dir = "/data";
-    let out_dir = "/out";
+    let mut data_dir = "/data".to_string();
+    let mut out_dir = "/out".to_string();
+    let args: Vec<String> = std::env::args().collect();
+    let mut arg_i = 1;
+    while arg_i < args.len() {
+        if args[arg_i] == "--data" && arg_i + 1 < args.len() {
+            data_dir = args[arg_i + 1].clone();
+            arg_i += 2;
+        } else if args[arg_i] == "--out" && arg_i + 1 < args.len() {
+            out_dir = args[arg_i + 1].clone();
+            arg_i += 2;
+        } else {
+            arg_i += 1;
+        }
+    }
 
     // 1. Load regions.csv and catalog countries
     let regions_path = format!("{}/regions.csv", data_dir);
@@ -82,7 +121,6 @@ fn main() {
     }
 
     let num_countries = country_names.len();
-    let mut country_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
 
     // 2. Memory-map records.csv
     let records_path = format!("{}/records.csv", data_dir);
@@ -96,7 +134,7 @@ fn main() {
     };
     let len = meta.len() as usize;
     if len == 0 {
-        let _ = fs::create_dir_all(out_dir);
+        let _ = fs::create_dir_all(&out_dir);
         let _ = File::create(format!("{}/aggregates.txt", out_dir));
         return;
     }
@@ -109,175 +147,240 @@ fn main() {
     }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    let mut pos = 0;
-    // Skip BOM if present at start of file
-    if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
-        pos += 3;
+    let mut header_end = 0;
+    if header_end + 3 <= len && &data[header_end..header_end + 3] == b"\xEF\xBB\xBF" {
+        header_end += 3;
     }
-    // Skip header line
-    while pos < len && data[pos] != b'\n' {
-        pos += 1;
+    while header_end < len && data[header_end] != b'\n' {
+        header_end += 1;
     }
-    if pos < len {
-        pos += 1;
+    if header_end < len {
+        header_end += 1;
     }
 
-    let mut name_buf = Vec::with_capacity(256);
+    // Partition across 6 physical P-cores
+    let num_threads = 6;
+    let mut boundaries = vec![header_end; num_threads + 1];
+    let chunk_target = (len - header_end) / num_threads;
 
-    while pos < len {
-        // Skip mid-file BOM if present
-        if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
-            pos += 3;
-        }
-        if pos >= len {
-            break;
-        }
-        if data[pos] == b'\r' || data[pos] == b'\n' {
-            pos += 1;
-            continue;
-        }
-
-        // 1. id
-        let mut id: u64 = 0;
-        while pos < len && data[pos] != b',' {
-            id = id * 10 + (data[pos] - b'0') as u64;
+    for k in 1..num_threads {
+        let target = header_end + k * chunk_target;
+        let mut pos = target;
+        while pos + 1 < len && !(data[pos] == b'\r' && data[pos + 1] == b'\n') {
             pos += 1;
         }
-        if pos < len && data[pos] == b',' {
-            pos += 1;
+        if pos + 1 < len {
+            pos += 2;
         }
+        boundaries[k] = pos;
+    }
+    boundaries[num_threads] = len;
 
-        // 2. name
-        name_buf.clear();
-        if pos < len && data[pos] == b'"' {
-            pos += 1; // skip opening "
-            while pos < len {
-                let b = data[pos];
-                if b == b'"' {
-                    if pos + 1 < len && data[pos + 1] == b'"' {
-                        name_buf.push(b'"');
-                        pos += 2;
-                    } else {
-                        pos += 1; // skip closing "
+    let thread_aggs_list: Vec<Vec<CountryAgg>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for k in 0..num_threads {
+            let start = boundaries[k];
+            let end = boundaries[k + 1];
+            let region_to_country_ref = &region_to_country_id;
+
+            handles.push(s.spawn(move || {
+                let mut local_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
+                let mut pos = start;
+                let mut name_buf = Vec::with_capacity(256);
+
+                while pos < end {
+                    // Check BOM
+                    if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
+                        pos += 3;
+                    }
+                    if pos >= len {
                         break;
                     }
-                } else {
-                    name_buf.push(b);
-                    pos += 1;
-                }
-            }
-            if pos < len && data[pos] == b',' {
-                pos += 1;
-            }
-        } else {
-            while pos < len && data[pos] != b',' {
-                name_buf.push(data[pos]);
-                pos += 1;
-            }
-            if pos < len && data[pos] == b',' {
-                pos += 1;
-            }
-        }
-        let name_len = name_buf.len() as u64;
-
-        // 3. note
-        let mut note_len: u64 = 0;
-        if pos < len && data[pos] == b'"' {
-            pos += 1; // skip opening "
-            while pos < len {
-                let b = data[pos];
-                if b == b'"' {
-                    if pos + 1 < len && data[pos + 1] == b'"' {
-                        note_len += 1;
-                        pos += 2;
-                    } else {
-                        pos += 1; // skip closing "
-                        break;
+                    if data[pos] == b'\r' || data[pos] == b'\n' {
+                        pos += 1;
+                        continue;
                     }
-                } else {
-                    note_len += 1;
-                    pos += 1;
+
+                    // 1. id
+                    let mut id: u64 = 0;
+                    while pos < len && data[pos] != b',' {
+                        id = id * 10 + (data[pos] - b'0') as u64;
+                        pos += 1;
+                    }
+                    if pos < len && data[pos] == b',' {
+                        pos += 1;
+                    }
+
+                    // 2. name
+                    name_buf.clear();
+                    if pos < len && data[pos] == b'"' {
+                        pos += 1; // skip opening "
+                        while pos < len {
+                            let b = data[pos];
+                            if b == b'"' {
+                                if pos + 1 < len && data[pos + 1] == b'"' {
+                                    name_buf.push(b'"');
+                                    pos += 2;
+                                } else {
+                                    pos += 1; // skip closing "
+                                    break;
+                                }
+                            } else {
+                                name_buf.push(b);
+                                pos += 1;
+                            }
+                        }
+                        if pos < len && data[pos] == b',' {
+                            pos += 1;
+                        }
+                    } else {
+                        while pos < len && data[pos] != b',' {
+                            name_buf.push(data[pos]);
+                            pos += 1;
+                        }
+                        if pos < len && data[pos] == b',' {
+                            pos += 1;
+                        }
+                    }
+                    let name_len = name_buf.len() as u64;
+
+                    // 3. note
+                    let mut note_len: u64 = 0;
+                    if pos < len && data[pos] == b'"' {
+                        pos += 1; // skip opening "
+                        while pos < len {
+                            let b = data[pos];
+                            if b == b'"' {
+                                if pos + 1 < len && data[pos + 1] == b'"' {
+                                    note_len += 1;
+                                    pos += 2;
+                                } else {
+                                    pos += 1; // skip closing "
+                                    break;
+                                }
+                            } else {
+                                note_len += 1;
+                                pos += 1;
+                            }
+                        }
+                        if pos < len && data[pos] == b',' {
+                            pos += 1;
+                        }
+                    } else {
+                        while pos < len && data[pos] != b',' {
+                            note_len += 1;
+                            pos += 1;
+                        }
+                        if pos < len && data[pos] == b',' {
+                            pos += 1;
+                        }
+                    }
+
+                    // 4. region_id
+                    let mut has_region = false;
+                    let mut region_id: usize = 0;
+                    while pos < len && data[pos] != b',' {
+                        if data[pos] >= b'0' && data[pos] <= b'9' {
+                            has_region = true;
+                            region_id = region_id * 10 + (data[pos] - b'0') as usize;
+                        }
+                        pos += 1;
+                    }
+                    if pos < len && data[pos] == b',' {
+                        pos += 1;
+                    }
+
+                    // 5. amount (-?[0-9]+\.[0-9]{2})
+                    let mut is_neg = false;
+                    if pos < len && data[pos] == b'-' {
+                        is_neg = true;
+                        pos += 1;
+                    }
+                    let mut cents: i64 = 0;
+                    while pos < len && data[pos] != b'\r' && data[pos] != b'\n' {
+                        let b = data[pos];
+                        if b >= b'0' && b <= b'9' {
+                            cents = cents * 10 + (b - b'0') as i64;
+                        }
+                        pos += 1;
+                    }
+                    if is_neg {
+                        cents = -cents;
+                    }
+                    if pos < len && data[pos] == b'\r' {
+                        pos += 1;
+                    }
+                    if pos < len && data[pos] == b'\n' {
+                        pos += 1;
+                    }
+
+                    // Join on region_id
+                    let c_id = if has_region && region_id < region_to_country_ref.len() {
+                        region_to_country_ref[region_id]
+                    } else {
+                        unmatched_id
+                    };
+
+                    let agg = &mut local_aggs[c_id as usize];
+                    agg.count += 1;
+                    agg.id_sum += id;
+                    agg.amount_sum += cents;
+                    agg.amount_min = Some(match agg.amount_min {
+                        Some(cur) => cur.min(cents),
+                        None => cents,
+                    });
+                    agg.amount_max = Some(match agg.amount_max {
+                        Some(cur) => cur.max(cents),
+                        None => cents,
+                    });
+                    agg.name_bytes += name_len;
+                    agg.note_bytes += note_len;
+                    if !agg.names.contains(name_buf.as_slice()) {
+                        agg.names.insert(Box::from(name_buf.as_slice()));
+                    }
                 }
-            }
-            if pos < len && data[pos] == b',' {
-                pos += 1;
-            }
-        } else {
-            while pos < len && data[pos] != b',' {
-                note_len += 1;
-                pos += 1;
-            }
-            if pos < len && data[pos] == b',' {
-                pos += 1;
-            }
+                local_aggs
+            }));
         }
-
-        // 4. region_id
-        let mut has_region = false;
-        let mut region_id: usize = 0;
-        while pos < len && data[pos] != b',' {
-            if data[pos] >= b'0' && data[pos] <= b'9' {
-                has_region = true;
-                region_id = region_id * 10 + (data[pos] - b'0') as usize;
-            }
-            pos += 1;
-        }
-        if pos < len && data[pos] == b',' {
-            pos += 1;
-        }
-
-        // 5. amount (-?[0-9]+\.[0-9]{2})
-        let mut is_neg = false;
-        if pos < len && data[pos] == b'-' {
-            is_neg = true;
-            pos += 1;
-        }
-        let mut cents: i64 = 0;
-        while pos < len && data[pos] != b'\r' && data[pos] != b'\n' {
-            let b = data[pos];
-            if b >= b'0' && b <= b'9' {
-                cents = cents * 10 + (b - b'0') as i64;
-            }
-            pos += 1;
-        }
-        if is_neg {
-            cents = -cents;
-        }
-        if pos < len && data[pos] == b'\r' {
-            pos += 1;
-        }
-        if pos < len && data[pos] == b'\n' {
-            pos += 1;
-        }
-
-        // Join on region_id
-        let c_id = if has_region && region_id < region_to_country_id.len() {
-            region_to_country_id[region_id]
-        } else {
-            unmatched_id
-        };
-
-        let agg = &mut country_aggs[c_id as usize];
-        agg.count += 1;
-        agg.id_sum += id;
-        agg.amount_sum += cents;
-        agg.amount_min = Some(match agg.amount_min {
-            Some(cur) => cur.min(cents),
-            None => cents,
-        });
-        agg.amount_max = Some(match agg.amount_max {
-            Some(cur) => cur.max(cents),
-            None => cents,
-        });
-        agg.name_bytes += name_len;
-        agg.note_bytes += note_len;
-        if !agg.names.contains(name_buf.as_slice()) {
-            agg.names.insert(Box::from(name_buf.as_slice()));
-        }
-    }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
     unsafe {
         munmap(ptr, len);
+    }
+
+    // Merge thread aggregates
+    let mut country_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
+    for thread_aggs in thread_aggs_list {
+        for c_id in 0..num_countries {
+            let t_agg = &thread_aggs[c_id];
+            if t_agg.count == 0 { continue; }
+            let g_agg = &mut country_aggs[c_id];
+            g_agg.count += t_agg.count;
+            g_agg.id_sum += t_agg.id_sum;
+            g_agg.amount_sum += t_agg.amount_sum;
+            g_agg.amount_min = Some(match g_agg.amount_min {
+                Some(cur) => match t_agg.amount_min {
+                    Some(t_min) => cur.min(t_min),
+                    None => cur,
+                },
+                None => t_agg.amount_min.unwrap_or(0),
+            });
+            g_agg.amount_max = Some(match g_agg.amount_max {
+                Some(cur) => match t_agg.amount_max {
+                    Some(t_max) => cur.max(t_max),
+                    None => cur,
+                },
+                None => t_agg.amount_max.unwrap_or(0),
+            });
+            g_agg.name_bytes += t_agg.name_bytes;
+            g_agg.note_bytes += t_agg.note_bytes;
+            for name in &t_agg.names {
+                if !g_agg.names.contains(name.as_ref()) {
+                    g_agg.names.insert(name.clone());
+                }
+            }
+        }
     }
 
     // Format output
@@ -304,12 +407,11 @@ fn main() {
             agg.names.len(),
             agg.name_bytes,
             agg.note_bytes
-        )
-        .unwrap();
+        ).unwrap();
     }
 
-    let _ = fs::create_dir_all(out_dir);
-    if let Ok(mut out_file) = File::create(format!("{}/aggregates.txt", out_dir)) {
-        let _ = out_file.write_all(&out_buf);
-    }
+    fs::create_dir_all(&out_dir).unwrap();
+    let out_file_path = format!("{}/aggregates.txt", out_dir);
+    let mut out_file = File::create(&out_file_path).unwrap();
+    out_file.write_all(&out_buf).unwrap();
 }
