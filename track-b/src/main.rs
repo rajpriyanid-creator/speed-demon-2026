@@ -104,6 +104,37 @@ impl Dict {
             idx = (idx + 1) & self.mask;
         }
     }
+
+    #[inline(always)]
+    fn get_ascii_lower(&self, raw: &[u8]) -> Option<u32> {
+        let len = raw.len();
+        if len > 32 { return None; }
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in raw {
+            h ^= (b | 0x20) as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let e = unsafe { self.table.get_unchecked(idx) };
+            if e.len == 0 {
+                return None;
+            }
+            if e.hash == h && e.len as usize == len {
+                let mut match_tok = true;
+                for k in 0..len {
+                    if e.bytes[k] != (raw[k] | 0x20) {
+                        match_tok = false;
+                        break;
+                    }
+                }
+                if match_tok {
+                    return Some(e.term_id);
+                }
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -421,11 +452,7 @@ fn main() {
                         }
                         let tok_len = p - tok_start;
                         if tok_len <= 32 {
-                            let mut buf = [0u8; 32];
-                            for k in 0..tok_len {
-                                buf[k] = text[tok_start + k].to_ascii_lowercase();
-                            }
-                            if let Some(term_id) = dict_ref.get(&buf[..tok_len]) {
+                            if let Some(term_id) = dict_ref.get_ascii_lower(&text[tok_start..p]) {
                                 let tid = term_id as usize;
                                 if last_seen[tid] != local_doc_id {
                                     last_seen[tid] = local_doc_id;
@@ -512,11 +539,7 @@ fn main() {
                         }
                         let tok_len = p - tok_start;
                         if tok_len <= 32 {
-                            let mut buf = [0u8; 32];
-                            for k in 0..tok_len {
-                                buf[k] = text[tok_start + k].to_ascii_lowercase();
-                            }
-                            if let Some(term_id) = dict_ref.get(&buf[..tok_len]) {
+                            if let Some(term_id) = dict_ref.get_ascii_lower(&text[tok_start..p]) {
                                 let tid = term_id as usize;
                                 if last_seen[tid] != d_id {
                                     last_seen[tid] = d_id;

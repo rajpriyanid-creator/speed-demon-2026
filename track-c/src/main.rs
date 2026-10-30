@@ -53,15 +53,6 @@ struct CountryAgg {
     names: FastHashSet<u64>,
 }
 
-#[inline(always)]
-fn hash_name(b: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &byte in b {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h ^ ((b.len() as u64) << 48)
-}
 
 fn format_cents(cents: i64) -> String {
     let sign = if cents < 0 { "-" } else { "" };
@@ -193,7 +184,7 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    let thread_aggs_list: Vec<Vec<CountryAgg>> = std::thread::scope(|s| {
+    let mut thread_aggs_list: Vec<Vec<CountryAgg>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
@@ -203,7 +194,6 @@ fn main() {
             handles.push(s.spawn(move || {
                 let mut local_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
                 let mut pos = start;
-                let mut name_buf = Vec::with_capacity(256);
 
                 while pos < end {
                     // Check BOM
@@ -228,22 +218,25 @@ fn main() {
                         pos += 1;
                     }
 
-                    // 2. name
-                    name_buf.clear();
+                    // 2. name: on-the-fly streaming FNV-1a hash (zero allocations)
+                    let mut n_hash: u64 = 0xcbf29ce484222325;
+                    let mut name_len: u64 = 0;
                     if pos < len && data[pos] == b'"' {
                         pos += 1; // skip opening "
                         while pos < len {
                             let b = data[pos];
                             if b == b'"' {
                                 if pos + 1 < len && data[pos + 1] == b'"' {
-                                    name_buf.push(b'"');
+                                    n_hash = (n_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
+                                    name_len += 1;
                                     pos += 2;
                                 } else {
                                     pos += 1; // skip closing "
                                     break;
                                 }
                             } else {
-                                name_buf.push(b);
+                                n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                                name_len += 1;
                                 pos += 1;
                             }
                         }
@@ -252,15 +245,16 @@ fn main() {
                         }
                     } else {
                         while pos < len && data[pos] != b',' {
-                            name_buf.push(data[pos]);
+                            let b = data[pos];
+                            n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                            name_len += 1;
                             pos += 1;
                         }
                         if pos < len && data[pos] == b',' {
                             pos += 1;
                         }
                     }
-                    let name_len = name_buf.len() as u64;
-                    let n_hash = hash_name(&name_buf);
+                    let n_hash = n_hash ^ (name_len << 48);
 
                     // 3. note
                     let mut note_len: u64 = 0;
@@ -365,11 +359,15 @@ fn main() {
         munmap(ptr, len);
     }
 
-    // Merge thread aggregates
-    let mut country_aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
-    for thread_aggs in thread_aggs_list {
+    // Merge thread aggregates with in-place drain to eliminate peak duplicate memory
+    let mut country_aggs = if !thread_aggs_list.is_empty() {
+        thread_aggs_list.swap_remove(0)
+    } else {
+        (0..num_countries).map(|_| CountryAgg::default()).collect()
+    };
+    for mut thread_aggs in thread_aggs_list {
         for c_id in 0..num_countries {
-            let t_agg = &thread_aggs[c_id];
+            let mut t_agg = std::mem::take(&mut thread_aggs[c_id]);
             if t_agg.count == 0 { continue; }
             let g_agg = &mut country_aggs[c_id];
             g_agg.count += t_agg.count;
@@ -391,7 +389,7 @@ fn main() {
             });
             g_agg.name_bytes += t_agg.name_bytes;
             g_agg.note_bytes += t_agg.note_bytes;
-            for &n_hash in &t_agg.names {
+            for n_hash in t_agg.names.drain() {
                 g_agg.names.insert(n_hash);
             }
         }
