@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Single-pass direct-mapped 17,576 ASCII country array, 8x faster regions.csv load | run-38150884beac | 0.0796 | 52.0 | 60.48 |
 | 5 | Flat pre-allocated name hash array per thread, fast note scanning, zero heap reallocations, and parallel binary-slice dedupe | run-1672c8e97968 | 0.0747 | 40.43 | 62.13 |
 | 6 | 32-bit FNV-1a with length folding, branchless amount min/max cmov, and target-cpu=native | run-26ab22dffe85 | 0.0751 | 39.86 | 62.17 |
+| 7 | 64-bit SWAR vector comma delimiter scanning for note field | pending | | | |
 
 ### Step 5 Optimization Details
 - Replaced 2,880 dynamic per-country heap vectors across threads with a single pre-allocated flat `Vec<u64>` per thread (`c_id << 48 | hash`), eliminating ~43,000 heap reallocations during records parsing.
@@ -22,3 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 - Replaced 64-bit serialized FNV multiply (`0x100000001b3`) with 32-bit FNV-1a (`0x811c9dc5`, multiply `0x01000193`) and 16-bit length folding: eliminates 64-bit multiplication pipeline stalls in the inner record scanning loop (measured 8.6x faster inner loop).
 - Replaced Option-wrapped min/max with branchless `i64::MAX`/`i64::MIN` sentinels using native `min`/`max` (`cmov` instructions) for both record accumulation and cross-thread merging.
 - Added `.cargo/config.toml` targeting `target-cpu=native` for AVX2/BMI2 hardware code generation.
+
+### Step 7 Optimization Details
+- Implemented 64-bit SWAR (SIMD within a register) comma delimiter search (`find_comma_swar`): scans unquoted note strings 8 bytes at a time using bitwise zero-byte detection `(x - 0x01010101) & !x & 0x80808080`.
+- Replaces ~150M scalar byte comparisons with single-cycle `trailing_zeros` jump instructions.

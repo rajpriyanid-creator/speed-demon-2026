@@ -10,6 +10,27 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
+#[inline(always)]
+unsafe fn find_comma_swar(p: *const u8, mut pos: usize, end: usize) -> usize {
+    const COMMA_MASK: u64 = 0x2C2C2C2C_2C2C2C2C;
+    const LO_MAGIC: u64 = 0x01010101_01010101;
+    const HI_MAGIC: u64 = 0x80808080_80808080;
+
+    while pos + 8 <= end {
+        let val = std::ptr::read_unaligned(p.add(pos) as *const u64);
+        let x = val ^ COMMA_MASK;
+        let zeros = x.wrapping_sub(LO_MAGIC) & !x & HI_MAGIC;
+        if zeros != 0 {
+            return pos + (zeros.trailing_zeros() as usize >> 3);
+        }
+        pos += 8;
+    }
+    while pos < end && *p.add(pos) != b',' {
+        pos += 1;
+    }
+    pos
+}
+
 #[derive(Clone, Copy)]
 struct CountryScalarAgg {
     count: u64,
@@ -281,9 +302,7 @@ fn main() {
                             }
                         } else {
                             let n_start = pos;
-                            while *p.add(pos) != b',' {
-                                pos += 1;
-                            }
+                            pos = find_comma_swar(p, pos, end);
                             note_len = (pos - n_start) as u64;
                             pos += 1; // skip comma
                         }
