@@ -5,6 +5,7 @@ use std::os::unix::io::AsRawFd;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn malloc_trim(pad: usize) -> i32;
 }
 
 struct MmapSlice {
@@ -473,15 +474,15 @@ fn main() {
     }
 
     // Single-pass indexing on docs.txt in parallel:
-    // Each thread collects (term_id << 32) | local_doc_id in local_records, sorts locally, and builds offsets.
-    let thread_data: Vec<(Vec<u64>, Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    // Packed u32: (term_id << 15) | local_doc_id (17 bits term_id <= 131071, 15 bits local_doc_id <= 32767)
+    let thread_data: Vec<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
         let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte)| {
             let dict_ref = &dict;
             let chunk = &docs_data[start_byte..end_byte];
 
             s.spawn(move || {
-                let est_records = 1_000_000;
-                let mut local_records: Vec<u64> = Vec::with_capacity(est_records);
+                let est_records = 1_870_000;
+                let mut local_records: Vec<u32> = Vec::with_capacity(est_records);
                 let mut last_seen = vec![u32::MAX; num_terms as usize];
                 let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
                 let mut local_starts = Vec::with_capacity(est_docs);
@@ -532,7 +533,7 @@ fn main() {
                                 let tid = term_id as usize;
                                 if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
                                     unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
-                                    local_records.push(((term_id as u64) << 32) | (local_doc_id as u64));
+                                    local_records.push((term_id << 15) | local_doc_id);
                                 }
                             }
                         }
@@ -545,7 +546,7 @@ fn main() {
                 let mut term_offsets = vec![0u32; (num_terms as usize) + 1];
                 let mut cur_term = 0usize;
                 for (idx, &entry) in local_records.iter().enumerate() {
-                    let term = (entry >> 32) as usize;
+                    let term = (entry >> 15) as usize;
                     while cur_term < term {
                         term_offsets[cur_term + 1] = idx as u32;
                         cur_term += 1;
@@ -615,13 +616,19 @@ fn main() {
                     let dest = write_bases[term] as usize;
                     for k in 0..count {
                         let entry = unsafe { *local_records.get_unchecked(start_idx + k) };
-                        let doc_id = start_doc + (entry as u32);
+                        let doc_id = start_doc + (entry & 0x7FFF);
                         unsafe { *raw_ptr.add(dest + k) = doc_id; }
                     }
                 }
             });
         }
     });
+
+    // Drop intermediate build memory and trim heap before queries
+    drop(thread_data);
+    drop(thread_write_bases);
+    drop(thread_start_docs);
+    unsafe { malloc_trim(0); }
 
     // Parallel query execution
     let num_threads = std::thread::available_parallelism()
