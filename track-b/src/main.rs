@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
@@ -707,7 +708,10 @@ fn main() {
 
         // Parallel Query Evaluation against block b
         let num_query_threads = num_threads;
-        let chunk_size = (num_queries + num_query_threads - 1) / num_query_threads;
+        let query_cursor = std::sync::atomic::AtomicUsize::new(0);
+        const QUERY_BATCH: usize = 1024;
+        let query_cursor_ref = &query_cursor;
+        let parsed_queries_ref = &parsed_queries;
         let b_offsets_ref = &b_offsets;
         let b_postings_ref = &b_postings;
         let block_doc_starts_ref = &block_doc_starts;
@@ -716,19 +720,19 @@ fn main() {
         let query_accums_ptr = query_accums.as_mut_ptr() as usize;
 
         std::thread::scope(|s| {
-            let handles: Vec<_> = (0..num_queries).step_by(chunk_size).map(|q_start| {
-                let q_end = (q_start + chunk_size).min(num_queries);
-                let q_slice = &parsed_queries[q_start..q_end];
-                let out_offset = q_start;
-
+            let handles: Vec<_> = (0..num_query_threads).map(|_| {
                 s.spawn(move || {
                     let mut buf_a = Vec::with_capacity(16_384);
                     let mut buf_b = Vec::with_capacity(16_384);
                     let base_doc_id = block_base_doc as u64;
                     let raw_accums = query_accums_ptr as *mut QueryAccum;
 
-                    for (idx, query) in q_slice.iter().enumerate() {
-                        let res = unsafe { &mut *raw_accums.add(out_offset + idx) };
+                    loop {
+                        let q_start = query_cursor_ref.fetch_add(QUERY_BATCH, Relaxed);
+                        if q_start >= num_queries { break; }
+                        let q_end = (q_start + QUERY_BATCH).min(num_queries);
+                        for (idx, query) in parsed_queries_ref[q_start..q_end].iter().enumerate() {
+                        let res = unsafe { &mut *raw_accums.add(q_start + idx) };
                         match query {
                             ParsedQuery::Bool { first_term, steps } => {
                                 let get_postings = |term_id: u32| -> &[u16] {
@@ -840,6 +844,7 @@ fn main() {
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 })
