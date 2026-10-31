@@ -478,7 +478,7 @@ fn main() {
     }
     block_byte_boundaries[NUM_BLOCKS] = n;
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
 
     let mut block_offsets: [Vec<u32>; NUM_BLOCKS] = [
         vec![0u32; (num_terms as usize) + 1],

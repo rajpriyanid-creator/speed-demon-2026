@@ -235,8 +235,8 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // Phase 1: Parse records, accumulate scalar aggs, and bucket name CRCs per country
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
+    // ONE PASS: Each thread collects flat u64 records: (c_id << 32) | name_crc
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u64>, Vec<u32>); // (local_aggs, records, country_counts)
     let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -246,7 +246,8 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut country_crcs: Vec<Vec<u32>> = (0..num_countries).map(|_| Vec::with_capacity(1200)).collect();
+                let mut local_counts = vec![0u32; num_countries];
+                let mut local_records = Vec::with_capacity(140_000);
 
                 let p = data.as_ptr();
                 let mut pos = start;
@@ -258,6 +259,7 @@ fn main() {
                             pos += 3;
                         }
                         if pos >= len { break; }
+
                         let b_lead = *p.add(pos);
                         if b_lead == b'\r' || b_lead == b'\n' {
                             pos += 1;
@@ -414,9 +416,10 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        country_crcs[c_id as usize].push(name_crc);
+                        local_counts[c_id as usize] += 1;
+                        local_records.push(((c_id as u64) << 32) | (name_crc as u64));
 
-                        if pos - last_madv_pos >= 2 * 1024 * 1024 {
+                        if pos - last_madv_pos >= 4 * 1024 * 1024 {
                             let madv_len = (pos - last_madv_pos) & !4095;
                             madvise(p.add(last_madv_pos) as *mut _, madv_len, 4);
                             last_madv_pos += madv_len;
@@ -430,13 +433,56 @@ fn main() {
                     }
                 }
 
-                (local_aggs, country_crcs)
+                (local_aggs, local_records, local_counts)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     unsafe { munmap(ptr, len); }
+
+    // Consolidate offsets and write pointers
+    let mut country_offsets = vec![0u32; num_countries + 1];
+    let mut thread_write_ptrs: Vec<Vec<u32>> = (0..num_threads)
+        .map(|_| vec![0u32; num_countries])
+        .collect();
+
+    let mut total_records = 0u32;
+    for c in 0..num_countries {
+        country_offsets[c] = total_records;
+        let mut cur = total_records;
+        for t in 0..num_threads {
+            thread_write_ptrs[t][c] = cur;
+            cur += thread_results[t].2[c];
+        }
+        total_records = cur;
+    }
+    country_offsets[num_countries] = total_records;
+
+    // Allocate flat all_crcs: 4.0 MB!
+    let mut all_crcs = vec![0u32; total_records as usize];
+    let raw_crcs_ptr = all_crcs.as_mut_ptr() as usize;
+
+    // Parallel O(N) Zero-Sort Scatter into all_crcs
+    std::thread::scope(|s| {
+        for (t, res) in thread_results.iter().enumerate() {
+            let mut write_ptrs = std::mem::take(&mut thread_write_ptrs[t]);
+            let recs = &res.1;
+
+            s.spawn(move || {
+                let crcs_ptr = raw_crcs_ptr as *mut u32;
+                for &rec in recs {
+                    let c_id = (rec >> 32) as usize;
+                    let crc = rec as u32;
+                    let dest = unsafe { *write_ptrs.get_unchecked(c_id) };
+                    unsafe {
+                        *write_ptrs.get_unchecked_mut(c_id) += 1;
+                        *crcs_ptr.add(dest as usize) = crc;
+                    }
+                }
+            });
+        }
+    });
 
     // Parallel Country Consolidation & Distinct Count
     let country_chunk = (num_countries + num_threads - 1) / num_threads;
@@ -445,81 +491,74 @@ fn main() {
             let c_end = (c_start + country_chunk).min(num_countries);
             let thread_results_ref = &thread_results;
             let country_names_ref = &country_names;
+            let country_offsets_ref = &country_offsets;
 
             s.spawn(move || {
                 let mut out = Vec::with_capacity((c_end - c_start) * 128);
-                let mut scratch = Vec::with_capacity(32_768);
+                let crcs_ptr = raw_crcs_ptr as *mut u32;
 
                 for c_id in c_start..c_end {
-                    let mut count = 0u64;
-                    let mut id_sum = 0u64;
-                    let mut amount_sum = 0i64;
-                    let mut amount_min = i64::MAX;
-                    let mut amount_max = i64::MIN;
-                    let mut name_bytes = 0u64;
-                    let mut note_bytes = 0u64;
-
-                    scratch.clear();
-
+                    let mut total_agg = CountryScalarAgg::default();
                     for t in 0..num_threads {
-                        let agg = &thread_results_ref[t].0[c_id];
-                        if agg.count > 0 {
-                            count += agg.count;
-                            id_sum += agg.id_sum;
-                            amount_sum += agg.amount_sum;
-                            amount_min = amount_min.min(agg.amount_min);
-                            amount_max = amount_max.max(agg.amount_max);
-                            name_bytes += agg.name_bytes;
-                            note_bytes += agg.note_bytes;
-                            scratch.extend_from_slice(&thread_results_ref[t].1[c_id]);
+                        let a = &thread_results_ref[t].0[c_id];
+                        total_agg.count += a.count;
+                        total_agg.id_sum += a.id_sum;
+                        total_agg.amount_sum += a.amount_sum;
+                        total_agg.amount_min = total_agg.amount_min.min(a.amount_min);
+                        total_agg.amount_max = total_agg.amount_max.max(a.amount_max);
+                        total_agg.name_bytes += a.name_bytes;
+                        total_agg.note_bytes += a.note_bytes;
+                    }
+
+                    if total_agg.count == 0 {
+                        continue;
+                    }
+
+                    let s_off = country_offsets_ref[c_id] as usize;
+                    let e_off = country_offsets_ref[c_id + 1] as usize;
+                    let c_slice = unsafe { std::slice::from_raw_parts_mut(crcs_ptr.add(s_off), e_off - s_off) };
+                    c_slice.sort_unstable();
+
+                    let mut distinct: u64 = 0;
+                    let mut i = 0;
+                    while i < c_slice.len() {
+                        distinct += 1;
+                        let val = c_slice[i];
+                        while i < c_slice.len() && c_slice[i] == val {
+                            i += 1;
                         }
                     }
 
-                    if count == 0 { continue; }
-
-                    scratch.sort_unstable();
-                    let mut distinct = 0usize;
-                    let mut last = u32::MAX;
-                    for &crc in &scratch {
-                        if crc != last {
-                            distinct += 1;
-                            last = crc;
-                        }
-                    }
-
-                    // Format line
-                    let c_name = &country_names_ref[c_id];
-                    out.extend_from_slice(c_name);
+                    out.extend_from_slice(&country_names_ref[c_id]);
                     out.push(b' ');
-                    write_u64_fast(count, &mut out);
+                    write_u64_fast(total_agg.count, &mut out);
                     out.push(b' ');
-                    write_u64_fast(id_sum, &mut out);
+                    write_u64_fast(total_agg.id_sum, &mut out);
                     out.push(b' ');
-                    write_cents_fast(amount_sum, &mut out);
+                    write_cents_fast(total_agg.amount_sum, &mut out);
                     out.push(b' ');
-                    write_cents_fast(amount_min, &mut out);
+                    write_cents_fast(total_agg.amount_min, &mut out);
                     out.push(b' ');
-                    write_cents_fast(amount_max, &mut out);
+                    write_cents_fast(total_agg.amount_max, &mut out);
                     out.push(b' ');
-                    write_u64_fast(distinct as u64, &mut out);
+                    write_u64_fast(distinct, &mut out);
                     out.push(b' ');
-                    write_u64_fast(name_bytes, &mut out);
+                    write_u64_fast(total_agg.name_bytes, &mut out);
                     out.push(b' ');
-                    write_u64_fast(note_bytes, &mut out);
+                    write_u64_fast(total_agg.note_bytes, &mut out);
                     out.push(b'\n');
                 }
                 out
             })
         }).collect();
+
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let _ = std::fs::create_dir_all(&out_dir);
-    let mut out_file = match File::create(format!("{}/aggregates.txt", out_dir)) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    for chunk in &formatted_outputs {
-        let _ = out_file.write_all(chunk);
+    let results_path = format!("{}/aggregates.txt", out_dir);
+    if let Ok(mut out_file) = File::create(&results_path) {
+        for part in formatted_outputs {
+            let _ = out_file.write_all(&part);
+        }
     }
 }
