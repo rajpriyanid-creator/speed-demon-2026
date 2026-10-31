@@ -1,13 +1,18 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+const PROT_READ: i32 = 1;
+const MAP_SHARED: i32 = 1;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn malloc_trim(pad: usize) -> i32;
 }
+
+const NUM_BLOCKS: usize = 4;
+const BLOCK_CAP: u32 = 65_536;
 
 struct MmapSlice {
     ptr: *mut u8,
@@ -22,7 +27,7 @@ impl MmapSlice {
             return Some(Self { ptr: std::ptr::null_mut(), len: 0 });
         }
         let fd = file.as_raw_fd();
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, fd, 0) };
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, fd, 0) };
         if ptr == usize::MAX as *mut u8 || ptr.is_null() {
             return None;
         }
@@ -60,25 +65,23 @@ const IS_TOKEN: [bool; 256] = {
 };
 
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
-struct DictEntry {
+struct DictEntry<'a> {
     hash: u32,
     term_id: u32,
-    len: u8,
-    bytes: [u8; 23],
+    key: &'a [u8],
 }
 
-struct Dict {
-    table: Vec<DictEntry>,
+struct Dict<'a> {
+    table: Vec<DictEntry<'a>>,
     bloom: [u64; 16384],
     mask: usize,
 }
 
-impl Dict {
+impl<'a> Dict<'a> {
     fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two();
         Self {
-            table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 23] }; cap],
+            table: vec![DictEntry { hash: 0, term_id: 0, key: &[] }; cap],
             bloom: [0u64; 16384],
             mask: cap - 1,
         }
@@ -94,31 +97,6 @@ impl Dict {
         if h == 0 { 1 } else { h }
     }
 
-    fn insert(&mut self, term: &[u8], term_id: u32) {
-        if term.len() > 23 { return; }
-        let h = Self::hash_bytes(term);
-        let b1 = (h as usize) & 0xF_FFFF;
-        let b2 = ((h.rotate_left(11) ^ (h >> 16)) as usize) & 0xF_FFFF;
-        self.bloom[b1 >> 6] |= 1u64 << (b1 & 63);
-        self.bloom[b2 >> 6] |= 1u64 << (b2 & 63);
-
-        let mut idx = (h as usize) & self.mask;
-        loop {
-            let e = &mut self.table[idx];
-            if e.hash == 0 {
-                e.hash = h;
-                e.term_id = term_id;
-                e.len = term.len() as u8;
-                e.bytes[..term.len()].copy_from_slice(term);
-                return;
-            }
-            if e.hash == h && e.len as usize == term.len() && &e.bytes[..term.len()] == term {
-                return;
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-
     #[inline(always)]
     fn bloom_check(&self, h: u32) -> bool {
         let b1 = (h as usize) & 0xF_FFFF;
@@ -130,16 +108,14 @@ impl Dict {
     }
 
     #[inline(always)]
-    fn get(&self, term: &[u8]) -> Option<u32> {
-        if term.len() > 23 { return None; }
-        let h = Self::hash_bytes(term);
+    fn get_with_hash(&self, raw: &[u8], h: u32) -> Option<u32> {
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = unsafe { self.table.get_unchecked(idx) };
             if e.hash == 0 {
                 return None;
             }
-            if e.hash == h && e.len as usize == term.len() && &e.bytes[..term.len()] == term {
+            if e.hash == h && e.key.eq_ignore_ascii_case(raw) {
                 return Some(e.term_id);
             }
             idx = (idx + 1) & self.mask;
@@ -147,26 +123,44 @@ impl Dict {
     }
 
     #[inline(always)]
-    fn get_with_hash(&self, raw: &[u8], h: u32) -> Option<u32> {
-        let len = raw.len();
-        if len > 23 { return None; }
+    fn get(&self, raw: &[u8]) -> Option<u32> {
+        let h = Self::hash_bytes(raw);
+        self.get_with_hash(raw, h)
+    }
+}
+
+struct FastCatalog<'a> {
+    keys: Vec<&'a [u8]>,
+    hashes: Vec<u32>,
+    table: Vec<(u32, u32)>,
+    mask: usize,
+}
+
+impl<'a> FastCatalog<'a> {
+    fn new(cap: usize) -> Self {
+        let size = cap.next_power_of_two();
+        Self {
+            keys: Vec::with_capacity(cap),
+            hashes: Vec::with_capacity(cap),
+            table: vec![(0, 0); size],
+            mask: size - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn get_or_insert(&mut self, key: &'a [u8], h: u32) -> u32 {
         let mut idx = (h as usize) & self.mask;
         loop {
-            let e = unsafe { self.table.get_unchecked(idx) };
-            if e.hash == 0 {
-                return None;
+            let slot = unsafe { *self.table.get_unchecked(idx) };
+            if slot.0 == h && unsafe { *self.keys.get_unchecked(slot.1 as usize) } == key {
+                return slot.1;
             }
-            if e.hash == h && e.len as usize == len {
-                let mut match_tok = true;
-                for k in 0..len {
-                    if unsafe { *e.bytes.get_unchecked(k) != (*raw.get_unchecked(k) | 0x20) } {
-                        match_tok = false;
-                        break;
-                    }
-                }
-                if match_tok {
-                    return Some(e.term_id);
-                }
+            if slot.0 == 0 {
+                let id = self.keys.len() as u32;
+                self.keys.push(key);
+                self.hashes.push(h);
+                unsafe { *self.table.get_unchecked_mut(idx) = (h, id); }
+                return id;
             }
             idx = (idx + 1) & self.mask;
         }
@@ -211,159 +205,21 @@ impl Default for QueryResult {
 }
 
 #[inline(always)]
-fn phrase_matches(doc_text: &[u8], query_tokens: &[&[u8]]) -> bool {
-    let q_len = query_tokens.len();
-    if q_len == 0 { return true; }
-
-    let tlen = doc_text.len();
-    let first_token = query_tokens[0];
-    let first_len = first_token.len();
-    if tlen < first_len { return false; }
-
-    let target_b0 = first_token[0] | 0x20;
-    let mut p = 0;
-
-    'scan: while p + first_len <= tlen {
-        let b = unsafe { *doc_text.get_unchecked(p) };
-        if (b | 0x20) != target_b0 {
-            p += 1;
-            continue;
-        }
-
-        if p > 0 && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p - 1) as usize) } {
-            p += 1;
-            continue;
-        }
-
-        let mut match_first = true;
-        for k in 1..first_len {
-            if unsafe { (*doc_text.get_unchecked(p + k) | 0x20) != *first_token.get_unchecked(k) } {
-                match_first = false;
-                break;
-            }
-        }
-        if !match_first {
-            p += 1;
-            continue;
-        }
-
-        let mut curr = p + first_len;
-        if curr < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr) as usize) } {
-            p += 1;
-            continue;
-        }
-
-        for tok_idx in 1..q_len {
-            let tok = query_tokens[tok_idx];
-            let tok_len = tok.len();
-
-            while curr < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr) as usize) } {
-                curr += 1;
-            }
-            if curr + tok_len > tlen {
-                p += 1;
-                continue 'scan;
-            }
-
-            let mut match_tok = true;
-            for k in 0..tok_len {
-                if unsafe { (*doc_text.get_unchecked(curr + k) | 0x20) != *tok.get_unchecked(k) } {
-                    match_tok = false;
-                    break;
-                }
-            }
-            if !match_tok {
-                p += 1;
-                continue 'scan;
-            }
-
-            curr += tok_len;
-            if curr < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr) as usize) } {
-                p += 1;
-                continue 'scan;
-            }
-        }
-
-        return true;
-    }
-
-    false
-}
-
-#[inline(always)]
-fn galloping_search_u16(arr: &[u16], target: u16) -> usize {
-    let n = arr.len();
-    if n == 0 || unsafe { *arr.get_unchecked(0) } >= target {
-        return 0;
-    }
-    let mut step = 1;
-    let mut curr = 0;
-    while curr + step < n && unsafe { *arr.get_unchecked(curr + step) } < target {
-        curr += step;
-        step <<= 1;
-    }
-    let mut left = curr + 1;
-    let mut right = (curr + step + 1).min(n);
-    while left < right {
-        let mid = (left + right) / 2;
-        if unsafe { *arr.get_unchecked(mid) } < target {
-            left = mid + 1;
-        } else {
-            right = mid;
-        }
-    }
-    left
-}
-
-#[inline(always)]
 fn intersect_u16(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     out.clear();
-    let na = a.len();
-    let nb = b.len();
-    if na == 0 || nb == 0 {
-        return;
-    }
-
-    if na * 16 < nb {
-        let mut j = 0;
-        for &va in a {
-            if j < nb {
-                let adv = galloping_search_u16(&b[j..], va);
-                j += adv;
-            }
-            if j < nb && unsafe { *b.get_unchecked(j) } == va {
-                out.push(va);
-                j += 1;
-            }
-        }
-        return;
-    }
-
-    if nb * 16 < na {
-        let mut i = 0;
-        for &vb in b {
-            if i < na {
-                let adv = galloping_search_u16(&a[i..], vb);
-                i += adv;
-            }
-            if i < na && unsafe { *a.get_unchecked(i) } == vb {
-                out.push(vb);
-                i += 1;
-            }
-        }
-        return;
-    }
-
     let mut i = 0;
     let mut j = 0;
-    while i < na && j < nb {
-        let va = unsafe { *a.get_unchecked(i) };
-        let vb = unsafe { *b.get_unchecked(j) };
-        if va == vb {
-            out.push(va);
+    let len_a = a.len();
+    let len_b = b.len();
+
+    while i < len_a && j < len_b {
+        let val_a = unsafe { *a.get_unchecked(i) };
+        let val_b = unsafe { *b.get_unchecked(j) };
+        if val_a == val_b {
+            out.push(val_a);
             i += 1;
             j += 1;
-        } else if va < vb {
+        } else if val_a < val_b {
             i += 1;
         } else {
             j += 1;
@@ -376,72 +232,106 @@ fn union_u16(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     out.clear();
     let mut i = 0;
     let mut j = 0;
-    let na = a.len();
-    let nb = b.len();
-    while i < na && j < nb {
-        let va = unsafe { *a.get_unchecked(i) };
-        let vb = unsafe { *b.get_unchecked(j) };
-        if va == vb {
-            out.push(va);
+    let len_a = a.len();
+    let len_b = b.len();
+
+    while i < len_a && j < len_b {
+        let val_a = unsafe { *a.get_unchecked(i) };
+        let val_b = unsafe { *b.get_unchecked(j) };
+        if val_a == val_b {
+            out.push(val_a);
             i += 1;
             j += 1;
-        } else if va < vb {
-            out.push(va);
+        } else if val_a < val_b {
+            out.push(val_a);
             i += 1;
         } else {
-            out.push(vb);
+            out.push(val_b);
             j += 1;
         }
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
+    if i < len_a {
+        out.extend_from_slice(&a[i..]);
+    }
+    if j < len_b {
+        out.extend_from_slice(&b[j..]);
+    }
 }
 
 #[inline(always)]
 fn difference_u16(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
     out.clear();
-    let na = a.len();
-    let nb = b.len();
-    if nb == 0 {
-        out.extend_from_slice(a);
-        return;
-    }
-    if na == 0 {
-        return;
-    }
-
-    if na * 16 < nb {
-        let mut j = 0;
-        for &va in a {
-            if j < nb {
-                let adv = galloping_search_u16(&b[j..], va);
-                j += adv;
-            }
-            if j >= nb || unsafe { *b.get_unchecked(j) } != va {
-                out.push(va);
-            } else {
-                j += 1;
-            }
-        }
-        return;
-    }
-
     let mut i = 0;
     let mut j = 0;
-    while i < na && j < nb {
-        let va = unsafe { *a.get_unchecked(i) };
-        let vb = unsafe { *b.get_unchecked(j) };
-        if va == vb {
+    let len_a = a.len();
+    let len_b = b.len();
+
+    while i < len_a && j < len_b {
+        let val_a = unsafe { *a.get_unchecked(i) };
+        let val_b = unsafe { *b.get_unchecked(j) };
+        if val_a == val_b {
             i += 1;
             j += 1;
-        } else if va < vb {
-            out.push(va);
+        } else if val_a < val_b {
+            out.push(val_a);
             i += 1;
         } else {
             j += 1;
         }
     }
-    out.extend_from_slice(&a[i..]);
+    if i < len_a {
+        out.extend_from_slice(&a[i..]);
+    }
+}
+
+#[inline(always)]
+fn phrase_matches(doc: &[u8], phrase_tokens: &[&[u8]]) -> bool {
+    let num_toks = phrase_tokens.len();
+    if num_toks == 0 { return true; }
+
+    let dlen = doc.len();
+    let mut p = 0;
+    let f_tok = phrase_tokens[0];
+    let f_len = f_tok.len();
+
+    while p < dlen {
+        while p < dlen && !unsafe { *IS_TOKEN.get_unchecked(*doc.get_unchecked(p) as usize) } {
+            p += 1;
+        }
+        if p >= dlen { break; }
+        let tok_start = p;
+        while p < dlen && unsafe { *IS_TOKEN.get_unchecked(*doc.get_unchecked(p) as usize) } {
+            p += 1;
+        }
+        let tok_len = p - tok_start;
+        if tok_len == f_len && doc[tok_start..p].eq_ignore_ascii_case(f_tok) {
+            if num_toks == 1 { return true; }
+            let mut curr = p;
+            let mut matched = true;
+            for &target_tok in &phrase_tokens[1..] {
+                while curr < dlen && !unsafe { *IS_TOKEN.get_unchecked(*doc.get_unchecked(curr) as usize) } {
+                    curr += 1;
+                }
+                if curr >= dlen {
+                    matched = false;
+                    break;
+                }
+                let t_start = curr;
+                while curr < dlen && unsafe { *IS_TOKEN.get_unchecked(*doc.get_unchecked(curr) as usize) } {
+                    curr += 1;
+                }
+                let t_len = curr - t_start;
+                if t_len != target_tok.len() || !doc[t_start..curr].eq_ignore_ascii_case(target_tok) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[inline(always)]
@@ -450,7 +340,7 @@ fn write_u64(mut n: u64, out: &mut Vec<u8>) {
         out.push(b'0');
         return;
     }
-    let mut buf = [0u8; 20];
+    let mut buf = [0u8; 24];
     let mut i = 0;
     while n > 0 {
         buf[i] = b'0' + (n % 10) as u8;
@@ -462,9 +352,6 @@ fn write_u64(mut n: u64, out: &mut Vec<u8>) {
         out.push(buf[i]);
     }
 }
-
-const NUM_BLOCKS: usize = 4;
-const BLOCK_CAP: u32 = 65536;
 
 fn main() {
     let mut data_dir = "/data".to_string();
@@ -487,86 +374,146 @@ fn main() {
     let queries_path = format!("{}/queries.txt", data_dir);
     let results_path = format!("{}/results.txt", out_dir);
 
-    // 1. Mmap queries.txt & populate dictionary
+    // 1. Mmap queries.txt & populate dictionary in parallel
     let queries_mmap = MmapSlice::open(&queries_path).expect("failed to open queries.txt");
     let queries_data = queries_mmap.as_slice();
+    let q_len = queries_data.len();
 
+    let num_threads = std::thread::available_parallelism()
+        .map(|num| num.get())
+        .unwrap_or(8)
+        .min(12);
+
+    let mut q_boundaries = Vec::with_capacity(num_threads + 1);
+    q_boundaries.push(0);
+    for i in 1..num_threads {
+        let mut pos = (q_len * i) / num_threads;
+        while pos < q_len && queries_data[pos] != b'\n' { pos += 1; }
+        if pos < q_len { pos += 1; }
+        q_boundaries.push(pos.min(q_len));
+    }
+    q_boundaries.push(q_len);
+
+    // Harvest tokens in parallel
+    let thread_catalogs: Vec<FastCatalog> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for i in 0..num_threads {
+            let start = q_boundaries[i];
+            let end = q_boundaries[i + 1];
+            let chunk = &queries_data[start..end];
+
+            handles.push(s.spawn(move || {
+                let mut cat = FastCatalog::new(16384);
+                for line in chunk.split(|&b| b == b'\n') {
+                    let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
+                    if line.is_empty() { continue; }
+                    if line.starts_with(b"BOOL ") {
+                        for part in line[5..].split(|&b| b == b' ') {
+                            if !part.is_empty() && part != b"AND" && part != b"OR" && part != b"NOT" {
+                                let h = Dict::hash_bytes(part);
+                                cat.get_or_insert(part, h);
+                            }
+                        }
+                    } else if line.starts_with(b"PHRASE \"") {
+                        let inner = &line[8..line.len().saturating_sub(1)];
+                        for part in inner.split(|&b| b == b' ') {
+                            if !part.is_empty() {
+                                let h = Dict::hash_bytes(part);
+                                cat.get_or_insert(part, h);
+                            }
+                        }
+                    }
+                }
+                cat
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Populate global dictionary & bloom filter
     let mut dict = Dict::new(262_144);
     let mut num_terms = 0u32;
+    for cat in &thread_catalogs {
+        for (&key, &h) in cat.keys.iter().zip(cat.hashes.iter()) {
+            let b1 = (h as usize) & 0xF_FFFF;
+            let b2 = ((h.rotate_left(11) ^ (h >> 16)) as usize) & 0xF_FFFF;
+            dict.bloom[b1 >> 6] |= 1u64 << (b1 & 63);
+            dict.bloom[b2 >> 6] |= 1u64 << (b2 & 63);
 
-    for line in queries_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
-        if line.is_empty() { continue; }
-        if line.starts_with(b"BOOL ") {
-            for part in line[5..].split(|&b| b == b' ') {
-                if !part.is_empty() && part != b"AND" && part != b"OR" && part != b"NOT" {
-                    let mut lower = [0u8; 24];
-                    if part.len() <= 23 {
-                        for (i, &b) in part.iter().enumerate() { lower[i] = b | 0x20; }
-                        let term_slice = &lower[..part.len()];
-                        let prev = dict.get_with_hash(term_slice, Dict::hash_bytes(term_slice));
-                        if prev.is_none() {
-                            dict.insert(term_slice, num_terms);
-                            num_terms += 1;
-                        }
-                    }
+            let mut idx = (h as usize) & dict.mask;
+            loop {
+                let slot = &mut dict.table[idx];
+                if slot.hash == 0 {
+                    slot.hash = h;
+                    slot.term_id = num_terms;
+                    slot.key = key;
+                    num_terms += 1;
+                    break;
                 }
-            }
-        } else if line.starts_with(b"PHRASE \"") {
-            let inner = &line[8..line.len().saturating_sub(1)];
-            for part in inner.split(|&b| b == b' ') {
-                if !part.is_empty() {
-                    let mut lower = [0u8; 24];
-                    if part.len() <= 23 {
-                        for (i, &b) in part.iter().enumerate() { lower[i] = b | 0x20; }
-                        let term_slice = &lower[..part.len()];
-                        let prev = dict.get_with_hash(term_slice, Dict::hash_bytes(term_slice));
-                        if prev.is_none() {
-                            dict.insert(term_slice, num_terms);
-                            num_terms += 1;
-                        }
-                    }
+                if slot.hash == h && slot.key.eq_ignore_ascii_case(key) {
+                    break;
                 }
+                idx = (idx + 1) & dict.mask;
             }
         }
     }
+    drop(thread_catalogs);
 
-    // Parse queries
-    let mut parsed_queries = Vec::with_capacity(50_000);
-    for line in queries_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
-        if line.is_empty() { continue; }
+    // Parallel parse queries
+    let thread_parsed_queries: Vec<Vec<ParsedQuery>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for i in 0..num_threads {
+            let start = q_boundaries[i];
+            let end = q_boundaries[i + 1];
+            let chunk = &queries_data[start..end];
+            let dict_ref = &dict;
 
-        if line.starts_with(b"BOOL ") {
-            let mut parts = line[5..].split(|&b| b == b' ').filter(|s| !s.is_empty());
-            let first_term = parts.next().and_then(|tok| dict.get(tok));
-            let mut steps = Vec::new();
+            handles.push(s.spawn(move || {
+                let mut local_queries = Vec::with_capacity(5000);
+                for line in chunk.split(|&b| b == b'\n') {
+                    let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
+                    if line.is_empty() { continue; }
 
-            while let Some(op_bytes) = parts.next() {
-                let op = match op_bytes {
-                    b"AND" => Op::And,
-                    b"OR" => Op::Or,
-                    b"NOT" => Op::Not,
-                    _ => continue,
-                };
-                if let Some(tok) = parts.next() {
-                    let term = dict.get(tok);
-                    steps.push((op, term));
+                    if line.starts_with(b"BOOL ") {
+                        let mut parts = line[5..].split(|&b| b == b' ').filter(|s| !s.is_empty());
+                        let first_term = parts.next().and_then(|tok| dict_ref.get(tok));
+                        let mut steps = Vec::new();
+
+                        while let Some(op_bytes) = parts.next() {
+                            let op = match op_bytes {
+                                b"AND" => Op::And,
+                                b"OR" => Op::Or,
+                                b"NOT" => Op::Not,
+                                _ => continue,
+                            };
+                            if let Some(tok) = parts.next() {
+                                let term = dict_ref.get(tok);
+                                steps.push((op, term));
+                            }
+                        }
+                        local_queries.push(ParsedQuery::Bool { first_term, steps });
+                    } else if line.starts_with(b"PHRASE \"") {
+                        let inner = &line[8..line.len().saturating_sub(1)];
+                        let mut terms = Vec::new();
+                        let mut raw_tokens = Vec::new();
+                        for part in inner.split(|&b| b == b' ') {
+                            if !part.is_empty() {
+                                terms.push(dict_ref.get(part));
+                                raw_tokens.push(part);
+                            }
+                        }
+                        local_queries.push(ParsedQuery::Phrase { terms, raw_tokens });
+                    }
                 }
-            }
-            parsed_queries.push(ParsedQuery::Bool { first_term, steps });
-        } else if line.starts_with(b"PHRASE \"") {
-            let inner = &line[8..line.len().saturating_sub(1)];
-            let mut terms = Vec::new();
-            let mut raw_tokens = Vec::new();
-            for part in inner.split(|&b| b == b' ') {
-                if !part.is_empty() {
-                    terms.push(dict.get(part));
-                    raw_tokens.push(part);
-                }
-            }
-            parsed_queries.push(ParsedQuery::Phrase { terms, raw_tokens });
+                local_queries
+            }));
         }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut parsed_queries = Vec::with_capacity(50_000);
+    for chunk in thread_parsed_queries {
+        parsed_queries.extend(chunk);
     }
 
     // 2. Mmap docs.txt
@@ -574,11 +521,7 @@ fn main() {
     let docs_data = docs_mmap.as_slice();
     let n = docs_data.len();
 
-    let num_index_threads = std::thread::available_parallelism()
-        .map(|num| num.get())
-        .unwrap_or(6)
-        .min(12);
-
+    let num_index_threads = num_threads;
     let mut doc_chunks = Vec::with_capacity(num_index_threads);
     let mut cur_byte = 0;
     for t in 0..num_index_threads {
@@ -620,9 +563,9 @@ fn main() {
     let doc_starts_ptr = doc_starts.as_mut_ptr() as usize;
     let doc_lens_ptr = doc_lens.as_mut_ptr() as usize;
 
-    // PASS 1: Count term frequencies per (thread, block, term)
-    type ThreadBlockCounts = Vec<[u32; NUM_BLOCKS]>;
-    let thread_term_counts: Vec<ThreadBlockCounts> = std::thread::scope(|s| {
+    // PASS 1: Count term frequencies per (thread, block, term) in flat buffer
+    let stride = num_terms as usize;
+    let thread_term_counts: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = doc_chunks.iter().enumerate().map(|(t, &(start_byte, end_byte))| {
             let dict_ref = &dict;
             let chunk = &docs_data[start_byte..end_byte];
@@ -631,8 +574,8 @@ fn main() {
             s.spawn(move || {
                 let raw_starts = doc_starts_ptr as *mut u32;
                 let raw_lens = doc_lens_ptr as *mut u32;
-                let mut counts: Vec<[u32; NUM_BLOCKS]> = vec![[0u32; NUM_BLOCKS]; num_terms as usize];
-                let mut last_seen = vec![u32::MAX; num_terms as usize];
+                let mut counts = vec![0u32; NUM_BLOCKS * stride];
+                let mut last_seen = vec![u32::MAX; stride];
 
                 let mut i = 0;
                 let clen = chunk.len();
@@ -658,6 +601,7 @@ fn main() {
                     let text = &chunk[text_start_rel..text_end_rel];
                     let mut p = 0;
                     let tlen = text.len();
+
                     while p < tlen {
                         while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                             p += 1;
@@ -680,7 +624,7 @@ fn main() {
                                     if unsafe { *last_seen.get_unchecked(tid) } != doc_id {
                                         unsafe {
                                             *last_seen.get_unchecked_mut(tid) = doc_id;
-                                            counts.get_unchecked_mut(tid)[block_idx] += 1;
+                                            *counts.get_unchecked_mut(block_idx * stride + tid) += 1;
                                         }
                                     }
                                 }
@@ -697,34 +641,30 @@ fn main() {
 
     // 4 separate CSR arrays: one per block
     let mut block_offsets: [Vec<u32>; NUM_BLOCKS] = [
-        vec![0u32; (num_terms as usize) + 1],
-        vec![0u32; (num_terms as usize) + 1],
-        vec![0u32; (num_terms as usize) + 1],
-        vec![0u32; (num_terms as usize) + 1],
+        vec![0u32; stride + 1],
+        vec![0u32; stride + 1],
+        vec![0u32; stride + 1],
+        vec![0u32; stride + 1],
     ];
 
-    let mut thread_write_offsets: Vec<[Vec<u32>; NUM_BLOCKS]> = (0..num_index_threads)
-        .map(|_| [
-            vec![0u32; num_terms as usize],
-            vec![0u32; num_terms as usize],
-            vec![0u32; num_terms as usize],
-            vec![0u32; num_terms as usize],
-        ])
+    let mut thread_write_offsets: Vec<Vec<u32>> = (0..num_index_threads)
+        .map(|_| vec![0u32; NUM_BLOCKS * stride])
         .collect();
 
     let mut block_totals = [0u32; NUM_BLOCKS];
     for b in 0..NUM_BLOCKS {
         let mut total = 0u32;
-        for term in 0..num_terms as usize {
+        let b_offset = b * stride;
+        for term in 0..stride {
             block_offsets[b][term] = total;
             let mut slot = total;
             for t in 0..num_index_threads {
-                thread_write_offsets[t][b][term] = slot;
-                slot += thread_term_counts[t][term][b];
+                thread_write_offsets[t][b_offset + term] = slot;
+                slot += thread_term_counts[t][b_offset + term];
             }
             total = slot;
         }
-        block_offsets[b][num_terms as usize] = total;
+        block_offsets[b][stride] = total;
         block_totals[b] = total;
     }
     drop(thread_term_counts);
@@ -758,7 +698,7 @@ fn main() {
                     block_ptrs[2] as *mut u16,
                     block_ptrs[3] as *mut u16,
                 ];
-                let mut last_seen = vec![u32::MAX; num_terms as usize];
+                let mut last_seen = vec![u32::MAX; stride];
 
                 let mut i = 0;
                 let clen = chunk.len();
@@ -780,6 +720,7 @@ fn main() {
                     let text = &chunk[text_start_rel..text_end_rel];
                     let mut p = 0;
                     let tlen = text.len();
+
                     while p < tlen {
                         while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                             p += 1;
@@ -802,8 +743,9 @@ fn main() {
                                     if unsafe { *last_seen.get_unchecked(tid) } != doc_id {
                                         unsafe {
                                             *last_seen.get_unchecked_mut(tid) = doc_id;
-                                            let slot = *write_ptrs[block_idx].get_unchecked(tid);
-                                            *write_ptrs[block_idx].get_unchecked_mut(tid) += 1;
+                                            let slot_idx = block_idx * stride + tid;
+                                            let slot = *write_ptrs.get_unchecked(slot_idx);
+                                            *write_ptrs.get_unchecked_mut(slot_idx) += 1;
                                             *raw_bptrs[block_idx].add(slot as usize) = local_id;
                                         }
                                     }
@@ -819,18 +761,8 @@ fn main() {
 
     drop(thread_write_offsets);
     drop(thread_base_doc);
-    unsafe {
-        madvise(docs_mmap.ptr, docs_mmap.len, 4);
-        malloc_trim(0);
-    }
 
     // 3. Parallel query execution across 4 blocks
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .min(12);
-
     let num_queries = parsed_queries.len();
     let mut results = vec![QueryResult::default(); num_queries];
     let results_ptr = results.as_mut_ptr() as usize;
@@ -999,8 +931,9 @@ fn main() {
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut out_file = File::create(&results_path).expect("failed to create results.txt");
-    let mut out_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    for r in results {
+    let mut out_buf = Vec::with_capacity(num_queries * 48);
+
+    for r in &results {
         write_u64(r.count, &mut out_buf);
         out_buf.push(b' ');
         write_u64(r.id_sum, &mut out_buf);
