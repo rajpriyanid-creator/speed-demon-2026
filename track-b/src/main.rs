@@ -5,7 +5,6 @@ use std::os::unix::io::AsRawFd;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn malloc_trim(pad: usize) -> i32;
 }
 
@@ -22,7 +21,7 @@ impl MmapSlice {
             return Some(Self { ptr: std::ptr::null_mut(), len: 0 });
         }
         let fd = file.as_raw_fd();
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, fd, 0) };
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, fd, 0) };
         if ptr == usize::MAX as *mut u8 || ptr.is_null() {
             return None;
         }
@@ -34,6 +33,14 @@ impl MmapSlice {
             &[]
         } else {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+impl Drop for MmapSlice {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe { munmap(self.ptr, self.len); }
         }
     }
 }
@@ -353,11 +360,30 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let na = a.len();
     let nb = b.len();
-    if na == 0 { return; }
     if nb == 0 {
         out.extend_from_slice(a);
         return;
     }
+    if na == 0 {
+        return;
+    }
+
+    if na * 16 < nb {
+        let mut j = 0;
+        for &va in a {
+            if j < nb {
+                let adv = galloping_search(&b[j..], va);
+                j += adv;
+            }
+            if j >= nb || unsafe { *b.get_unchecked(j) } != va {
+                out.push(va);
+            } else {
+                j += 1;
+            }
+        }
+        return;
+    }
+
     let mut i = 0;
     let mut j = 0;
     while i < na && j < nb {
@@ -370,15 +396,14 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
             out.push(va);
             i += 1;
         } else {
-            let adv = galloping_search(&b[j..], va);
-            j += adv;
+            j += 1;
         }
     }
     out.extend_from_slice(&a[i..]);
 }
 
 #[inline(always)]
-fn write_u64_fast(mut n: u64, out: &mut Vec<u8>) {
+fn write_u64(mut n: u64, out: &mut Vec<u8>) {
     if n == 0 {
         out.push(b'0');
         return;
@@ -394,30 +419,6 @@ fn write_u64_fast(mut n: u64, out: &mut Vec<u8>) {
         i -= 1;
         out.push(buf[i]);
     }
-}
-
-#[inline(always)]
-fn write_u32_fast(n: u32, out: &mut Vec<u8>) {
-    write_u64_fast(n as u64, out);
-}
-
-fn write_result(out: &mut Vec<u8>, ids: &[u32]) {
-    if ids.is_empty() {
-        out.extend_from_slice(b"0 0\n");
-        return;
-    }
-    let count = ids.len();
-    let sum: u64 = ids.iter().map(|&x| x as u64).sum();
-    let take = count.min(10);
-
-    write_u32_fast(count as u32, out);
-    out.push(b' ');
-    write_u64_fast(sum, out);
-    for &id in &ids[..take] {
-        out.push(b' ');
-        write_u32_fast(id, out);
-    }
-    out.push(b'\n');
 }
 
 fn main() {
@@ -437,54 +438,65 @@ fn main() {
         }
     }
 
-    let queries_path = format!("{}/queries.txt", data_dir);
     let docs_path = format!("{}/docs.txt", data_dir);
+    let queries_path = format!("{}/queries.txt", data_dir);
     let results_path = format!("{}/results.txt", out_dir);
 
-    // Mmap queries.txt
-    let q_mmap = MmapSlice::open(&queries_path).expect("failed to open queries.txt");
-    let q_data = q_mmap.as_slice();
+    // 1. Mmap queries.txt & populate dictionary
+    let queries_mmap = MmapSlice::open(&queries_path).expect("failed to open queries.txt");
+    let queries_data = queries_mmap.as_slice();
 
-    let mut dict = Dict::new(131_072);
+    let mut dict = Dict::new(262_144);
     let mut num_terms = 0u32;
 
-    // Pass 1 on queries: collect all unique query terms
-    for line in q_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
+    for line in queries_data.split(|&b| b == b'\n') {
+        let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
         if line.is_empty() { continue; }
         if line.starts_with(b"BOOL ") {
-            let mut parts = line[5..].split(|&b| b == b' ');
-            while let Some(part) = parts.next() {
-                if part == b"AND" || part == b"OR" || part == b"NOT" || part.is_empty() {
-                    continue;
-                }
-                if dict.get(part).is_none() {
-                    dict.insert(part, num_terms);
-                    num_terms += 1;
+            for part in line[5..].split(|&b| b == b' ') {
+                if !part.is_empty() && part != b"AND" && part != b"OR" && part != b"NOT" {
+                    let mut lower = [0u8; 24];
+                    if part.len() <= 23 {
+                        for (i, &b) in part.iter().enumerate() { lower[i] = b | 0x20; }
+                        let term_slice = &lower[..part.len()];
+                        let prev = dict.get_with_hash(term_slice, Dict::hash_bytes(term_slice));
+                        if prev.is_none() {
+                            dict.insert(term_slice, num_terms);
+                            num_terms += 1;
+                        }
+                    }
                 }
             }
         } else if line.starts_with(b"PHRASE \"") {
             let inner = &line[8..line.len().saturating_sub(1)];
             for part in inner.split(|&b| b == b' ') {
-                if part.is_empty() { continue; }
-                if dict.get(part).is_none() {
-                    dict.insert(part, num_terms);
-                    num_terms += 1;
+                if !part.is_empty() {
+                    let mut lower = [0u8; 24];
+                    if part.len() <= 23 {
+                        for (i, &b) in part.iter().enumerate() { lower[i] = b | 0x20; }
+                        let term_slice = &lower[..part.len()];
+                        let prev = dict.get_with_hash(term_slice, Dict::hash_bytes(term_slice));
+                        if prev.is_none() {
+                            dict.insert(term_slice, num_terms);
+                            num_terms += 1;
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Pass 2 on queries: parse into ParsedQuery structs
+    // Pass 2: parse queries into token IDs
     let mut parsed_queries = Vec::with_capacity(50_000);
-    for line in q_data.split(|&b| b == b'\n') {
-        let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
+    for line in queries_data.split(|&b| b == b'\n') {
+        let line = if line.ends_with(b"\r") { &line[..line.len().saturating_sub(1)] } else { line };
         if line.is_empty() { continue; }
+
         if line.starts_with(b"BOOL ") {
-            let mut parts = line[5..].split(|&b| b == b' ');
-            let first = parts.next().unwrap_or(b"");
-            let first_id = dict.get(first);
+            let mut parts = line[5..].split(|&b| b == b' ').filter(|s| !s.is_empty());
+            let first_term = parts.next().and_then(|tok| dict.get(tok));
             let mut steps = Vec::new();
+
             while let Some(op_bytes) = parts.next() {
                 let op = match op_bytes {
                     b"AND" => Op::And,
@@ -492,11 +504,12 @@ fn main() {
                     b"NOT" => Op::Not,
                     _ => continue,
                 };
-                let term_bytes = parts.next().unwrap_or(b"");
-                let term_id = dict.get(term_bytes);
-                steps.push((op, term_id));
+                if let Some(tok) = parts.next() {
+                    let term = dict.get(tok);
+                    steps.push((op, term));
+                }
             }
-            parsed_queries.push(ParsedQuery::Bool { first_term: first_id, steps });
+            parsed_queries.push(ParsedQuery::Bool { first_term, steps });
         } else if line.starts_with(b"PHRASE \"") {
             let inner = &line[8..line.len().saturating_sub(1)];
             let mut terms = Vec::new();
@@ -511,7 +524,7 @@ fn main() {
         }
     }
 
-    // Mmap docs.txt
+    // 2. Mmap docs.txt
     let docs_mmap = MmapSlice::open(&docs_path).expect("failed to open docs.txt");
     let docs_data = docs_mmap.as_slice();
     let n = docs_data.len();
@@ -522,59 +535,79 @@ fn main() {
         .min(12);
 
     let mut doc_chunks = Vec::with_capacity(num_index_threads);
-    {
-        let mut cur_byte = 0;
-        for t in 0..num_index_threads {
-            let target_byte = ((n * (t + 1)) / num_index_threads).min(n);
-            let mut end_byte = target_byte;
-            while end_byte < n && docs_data[end_byte] != b'\n' {
-                end_byte += 1;
-            }
-            if end_byte < n {
-                end_byte += 1;
-            }
-            doc_chunks.push((cur_byte, end_byte));
-            cur_byte = end_byte;
+    let mut cur_byte = 0;
+    for t in 0..num_index_threads {
+        let target_byte = ((n * (t + 1)) / num_index_threads).min(n);
+        let mut end_byte = target_byte;
+        while end_byte < n && docs_data[end_byte] != b'\n' {
+            end_byte += 1;
         }
+        if end_byte < n {
+            end_byte += 1;
+        }
+        doc_chunks.push((cur_byte, end_byte));
+        cur_byte = end_byte;
     }
 
-    // Single-pass indexing on docs.txt in parallel:
-    // Packed u32: (term_id << 15) | local_doc_id (17 bits term_id <= 131071, 15 bits local_doc_id <= 32767)
-    let thread_data: Vec<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte)| {
+    // Count document counts per chunk to establish global document ID mapping
+    let doc_counts: Vec<u32> = std::thread::scope(|s| {
+        let handles: Vec<_> = doc_chunks.iter().map(|&(start, end)| {
+            s.spawn(move || {
+                let mut count = 0u32;
+                let chunk = &docs_data[start..end];
+                for &b in chunk {
+                    if b == b'\n' { count += 1; }
+                }
+                count
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut thread_base_doc = vec![0u32; num_index_threads];
+    let mut total_docs = 0u32;
+    for t in 0..num_index_threads {
+        thread_base_doc[t] = total_docs;
+        total_docs += doc_counts[t];
+    }
+
+    let mut doc_starts = vec![0u32; total_docs as usize];
+    let mut doc_lens = vec![0u32; total_docs as usize];
+    let doc_starts_ptr = doc_starts.as_mut_ptr() as usize;
+    let doc_lens_ptr = doc_lens.as_mut_ptr() as usize;
+
+    // PASS 1: Count term frequencies and collect doc text byte spans
+    let thread_term_counts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let handles: Vec<_> = doc_chunks.iter().enumerate().map(|(t, &(start_byte, end_byte))| {
             let dict_ref = &dict;
             let chunk = &docs_data[start_byte..end_byte];
+            let base_doc = thread_base_doc[t];
 
             s.spawn(move || {
-                let est_records = 1_900_000;
-                let mut local_records: Vec<u32> = Vec::with_capacity(est_records);
+                let raw_starts = doc_starts_ptr as *mut u32;
+                let raw_lens = doc_lens_ptr as *mut u32;
+                let mut term_counts = vec![0u32; num_terms as usize];
                 let mut last_seen = vec![u32::MAX; num_terms as usize];
-                let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
-                let mut local_starts = Vec::with_capacity(est_docs);
-                let mut local_lens = Vec::with_capacity(est_docs);
 
                 let mut i = 0;
-                let mut last_evicted = 0usize;
                 let clen = chunk.len();
                 let mut local_doc_id = 0u32;
 
                 while i < clen {
-                    while i < clen && chunk[i] != b'\t' {
-                        i += 1;
-                    }
+                    while i < clen && chunk[i] != b'\t' { i += 1; }
                     if i >= clen { break; }
-                    i += 1; // skip TAB
+                    i += 1;
                     let text_start_rel = i;
-                    while i < clen && chunk[i] != b'\n' {
-                        i += 1;
-                    }
+                    while i < clen && chunk[i] != b'\n' { i += 1; }
                     let text_end_rel = i;
-                    i += 1; // skip LF
+                    i += 1;
 
+                    let doc_id = base_doc + local_doc_id;
                     let text_len = text_end_rel - text_start_rel;
-                    let global_text_start = (start_byte + text_start_rel) as u32;
-                    local_starts.push(global_text_start);
-                    local_lens.push(text_len as u32);
+                    unsafe {
+                        *raw_starts.add(doc_id as usize) = (start_byte + text_start_rel) as u32;
+                        *raw_lens.add(doc_id as usize) = text_len as u32;
+                    }
 
                     let text = &chunk[text_start_rel..text_end_rel];
                     let mut p = 0;
@@ -598,122 +631,117 @@ fn main() {
                             if dict_ref.bloom_check(h) {
                                 if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
                                     let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
-                                        unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
-                                        local_records.push((term_id << 15) | local_doc_id);
+                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_id {
+                                        unsafe {
+                                            *last_seen.get_unchecked_mut(tid) = doc_id;
+                                            *term_counts.get_unchecked_mut(tid) += 1;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     local_doc_id += 1;
-
-                    if i - last_evicted >= 2 * 1024 * 1024 {
-                        let evict_len = (i - last_evicted) & !4095;
-                        if evict_len > 0 {
-                            let evict_ptr = (chunk.as_ptr() as usize + last_evicted) as *mut u8;
-                            unsafe { madvise(evict_ptr, evict_len, 4); }
-                            last_evicted += evict_len;
-                        }
-                    }
                 }
-
-                let remaining = clen - last_evicted;
-                if remaining > 0 {
-                    let evict_ptr = (chunk.as_ptr() as usize + last_evicted) as *mut u8;
-                    unsafe { madvise(evict_ptr, remaining, 4); }
-                }
-
-                local_records.sort_unstable();
-
-                let mut term_offsets = vec![0u32; (num_terms as usize) + 1];
-                let mut cur_term = 0usize;
-                for (idx, &entry) in local_records.iter().enumerate() {
-                    let term = (entry >> 15) as usize;
-                    while cur_term < term {
-                        term_offsets[cur_term + 1] = idx as u32;
-                        cur_term += 1;
-                    }
-                }
-                while cur_term < num_terms as usize {
-                    term_offsets[cur_term + 1] = local_records.len() as u32;
-                    cur_term += 1;
-                }
-
-                (local_records, term_offsets, local_starts, local_lens)
+                term_counts
             })
         }).collect();
-
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut thread_start_docs = Vec::with_capacity(num_index_threads);
-    let mut cur_global_doc = 0u32;
-    for r in &thread_data {
-        thread_start_docs.push(cur_global_doc);
-        cur_global_doc += r.2.len() as u32;
-    }
-
-    // Assemble global doc_starts and doc_lens
-    let mut doc_starts: Vec<u32> = Vec::with_capacity(cur_global_doc as usize);
-    let mut doc_lens: Vec<u32> = Vec::with_capacity(cur_global_doc as usize);
-    for r in &thread_data {
-        doc_starts.extend_from_slice(&r.2);
-        doc_lens.extend_from_slice(&r.3);
-    }
-
-    // Prefix sums to build contiguous postings CSR with per-thread write bases
+    // Compute prefix sums: CSR offsets for each term and exact thread write pointers
     let mut offsets = vec![0u32; (num_terms as usize) + 1];
-    let mut thread_write_bases: Vec<Vec<u32>> = (0..num_index_threads)
+    let mut thread_write_offsets: Vec<Vec<u32>> = (0..num_index_threads)
         .map(|_| vec![0u32; num_terms as usize])
         .collect();
 
     let mut total_postings = 0u32;
-    for term in 0..(num_terms as usize) {
+    for term in 0..num_terms as usize {
         offsets[term] = total_postings;
-        let mut cur = total_postings;
+        let mut slot = total_postings;
         for t in 0..num_index_threads {
-            thread_write_bases[t][term] = cur;
-            let term_len = thread_data[t].1[term + 1] - thread_data[t].1[term];
-            cur += term_len;
+            thread_write_offsets[t][term] = slot;
+            slot += thread_term_counts[t][term];
         }
-        total_postings = cur;
+        total_postings = slot;
     }
     offsets[num_terms as usize] = total_postings;
+    drop(thread_term_counts);
 
+    // Allocate single contiguous CSR postings array
     let mut all_postings = vec![0u32; total_postings as usize];
-    let base_addr = all_postings.as_mut_ptr() as usize;
+    let postings_ptr = all_postings.as_mut_ptr() as usize;
 
-    // Linear parallel copy of postings directly into all_postings
+    // PASS 2: Stream docs second time, scattering doc_ids DIRECTLY into all_postings with zero sorting!
     std::thread::scope(|s| {
-        for (t, (local_records, term_offsets, _, _)) in thread_data.iter().enumerate() {
-            let write_bases = &thread_write_bases[t];
-            let start_doc = thread_start_docs[t];
+        for (t, &(start_byte, end_byte)) in doc_chunks.iter().enumerate() {
+            let dict_ref = &dict;
+            let chunk = &docs_data[start_byte..end_byte];
+            let base_doc = thread_base_doc[t];
+            let mut write_ptrs = thread_write_offsets[t].clone();
+
             s.spawn(move || {
-                let raw_ptr = base_addr as *mut u32;
-                for term in 0..(num_terms as usize) {
-                    let start_idx = term_offsets[term] as usize;
-                    let end_idx = term_offsets[term + 1] as usize;
-                    let count = end_idx - start_idx;
-                    if count == 0 { continue; }
-                    let dest = write_bases[term] as usize;
-                    for k in 0..count {
-                        let entry = unsafe { *local_records.get_unchecked(start_idx + k) };
-                        let doc_id = start_doc + (entry & 0x7FFF);
-                        unsafe { *raw_ptr.add(dest + k) = doc_id; }
+                let raw_postings = postings_ptr as *mut u32;
+                let mut last_seen = vec![u32::MAX; num_terms as usize];
+                let mut i = 0;
+                let clen = chunk.len();
+                let mut local_doc_id = 0u32;
+
+                while i < clen {
+                    while i < clen && chunk[i] != b'\t' { i += 1; }
+                    if i >= clen { break; }
+                    i += 1;
+                    let text_start_rel = i;
+                    while i < clen && chunk[i] != b'\n' { i += 1; }
+                    let text_end_rel = i;
+                    i += 1;
+
+                    let doc_id = base_doc + local_doc_id;
+                    let text = &chunk[text_start_rel..text_end_rel];
+                    let mut p = 0;
+                    let tlen = text.len();
+                    while p < tlen {
+                        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                            p += 1;
+                        }
+                        if p >= tlen { break; }
+                        let tok_start = p;
+                        let mut h = 0x811c9dc5u32;
+                        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                            let b = unsafe { *text.get_unchecked(p) };
+                            h ^= (b | 0x20) as u32;
+                            h = h.wrapping_mul(0x01000193);
+                            p += 1;
+                        }
+                        let tok_len = p - tok_start;
+                        if tok_len <= 23 {
+                            if h == 0 { h = 1; }
+                            if dict_ref.bloom_check(h) {
+                                if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
+                                    let tid = term_id as usize;
+                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_id {
+                                        unsafe {
+                                            *last_seen.get_unchecked_mut(tid) = doc_id;
+                                            let slot = *write_ptrs.get_unchecked(tid);
+                                            *write_ptrs.get_unchecked_mut(tid) += 1;
+                                            *raw_postings.add(slot as usize) = doc_id;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
+                    local_doc_id += 1;
                 }
             });
         }
     });
 
-    // Drop intermediate build memory and trim heap before queries
-    drop(thread_data);
-    drop(thread_write_bases);
-    drop(thread_start_docs);
+    drop(thread_write_offsets);
+    drop(thread_base_doc);
     unsafe { malloc_trim(0); }
 
-    // Parallel query execution
+    // 3. Parallel query execution
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
@@ -745,87 +773,101 @@ fn main() {
                 for query in chunk {
                     match query {
                         ParsedQuery::Bool { first_term, steps } => {
-                            let r_slice: &[u32] = match *first_term {
-                                Some(t) => get_postings(t),
-                                None => &[],
-                            };
-                            if steps.is_empty() {
-                                write_result(&mut thread_out, r_slice);
-                            } else {
-                                let (first_op, first_term_opt) = steps[0];
-                                let b_first: &[u32] = match first_term_opt {
+                            buf_a.clear();
+                            match *first_term {
+                                Some(t) => buf_a.extend_from_slice(get_postings(t)),
+                                None => {}
+                            }
+
+                            for &(op, term_opt) in steps {
+                                let term_slice: &[u32] = match term_opt {
                                     Some(t) => get_postings(t),
                                     None => &[],
                                 };
-                                match first_op {
-                                    Op::And => intersect(r_slice, b_first, &mut buf_a),
-                                    Op::Or => union(r_slice, b_first, &mut buf_a),
-                                    Op::Not => difference(r_slice, b_first, &mut buf_a),
+
+                                match op {
+                                    Op::And => intersect(&buf_a, term_slice, &mut buf_b),
+                                    Op::Or => union(&buf_a, term_slice, &mut buf_b),
+                                    Op::Not => difference(&buf_a, term_slice, &mut buf_b),
                                 }
-                                for &(op, maybe_term) in &steps[1..] {
-                                    let b: &[u32] = match maybe_term {
-                                        Some(t) => get_postings(t),
-                                        None => &[],
-                                    };
-                                    match op {
-                                        Op::And => intersect(&buf_a, b, &mut buf_b),
-                                        Op::Or => union(&buf_a, b, &mut buf_b),
-                                        Op::Not => difference(&buf_a, b, &mut buf_b),
-                                    }
-                                    std::mem::swap(&mut buf_a, &mut buf_b);
-                                }
-                                write_result(&mut thread_out, &buf_a);
+                                std::mem::swap(&mut buf_a, &mut buf_b);
                             }
+
+                            let count = buf_a.len();
+                            let mut id_sum: u64 = 0;
+                            for &id in &buf_a {
+                                id_sum += id as u64;
+                            }
+
+                            write_u64(count as u64, &mut thread_out);
+                            thread_out.push(b' ');
+                            write_u64(id_sum, &mut thread_out);
+
+                            let top_k = count.min(10);
+                            for &id in &buf_a[..top_k] {
+                                thread_out.push(b' ');
+                                write_u64(id as u64, &mut thread_out);
+                            }
+                            thread_out.push(b'\n');
                         }
                         ParsedQuery::Phrase { terms, raw_tokens } => {
-                            if terms.iter().any(|t| t.is_none()) {
-                                thread_out.extend_from_slice(b"0 0\n");
-                            } else {
-                                let term_ids: Vec<u32> = terms.iter().map(|t| t.unwrap()).collect();
-                                let mut min_idx = 0;
-                                let mut min_len = usize::MAX;
-                                for (idx, &tid) in term_ids.iter().enumerate() {
-                                    let plen = (offsets_ref[tid as usize + 1] - offsets_ref[tid as usize]) as usize;
-                                    if plen < min_len {
-                                        min_len = plen;
-                                        min_idx = idx;
-                                    }
+                            let mut has_none = false;
+                            for t in terms {
+                                if t.is_none() {
+                                    has_none = true;
+                                    break;
                                 }
+                            }
 
-                                if min_len == 0 {
-                                    thread_out.extend_from_slice(b"0 0\n");
-                                } else {
-                                    buf_a.clear();
-                                    buf_a.extend_from_slice(get_postings(term_ids[min_idx]));
+                            if has_none || terms.is_empty() {
+                                thread_out.extend_from_slice(b"0 0\n");
+                                continue;
+                            }
 
-                                    for (idx, &tid) in term_ids.iter().enumerate() {
-                                        if idx == min_idx { continue; }
-                                        intersect(&buf_a, get_postings(tid), &mut buf_b);
-                                        std::mem::swap(&mut buf_a, &mut buf_b);
-                                        if buf_a.is_empty() {
-                                            break;
-                                        }
-                                    }
+                            buf_a.clear();
+                            buf_a.extend_from_slice(get_postings(terms[0].unwrap()));
 
-                                    if buf_a.is_empty() {
-                                        thread_out.extend_from_slice(b"0 0\n");
-                                    } else {
-                                        matches.clear();
-                                        for &cand_id in &buf_a {
-                                            let start = doc_starts_ref[cand_id as usize] as usize;
-                                            let len = doc_lens_ref[cand_id as usize] as usize;
-                                            let doc_text = &docs_data_ref[start..start + len];
-                                            if phrase_matches(doc_text, raw_tokens) {
-                                                matches.push(cand_id);
-                                            }
-                                        }
-                                        write_result(&mut thread_out, &matches);
+                            for &t_opt in &terms[1..] {
+                                let t_slice = get_postings(t_opt.unwrap());
+                                intersect(&buf_a, t_slice, &mut buf_b);
+                                std::mem::swap(&mut buf_a, &mut buf_b);
+                                if buf_a.is_empty() {
+                                    break;
+                                }
+                            }
+
+                            matches.clear();
+                            let mut count = 0usize;
+                            let mut id_sum: u64 = 0;
+
+                            for &doc_id in &buf_a {
+                                let doc_idx = doc_id as usize;
+                                let d_start = unsafe { *doc_starts_ref.get_unchecked(doc_idx) } as usize;
+                                let d_len = unsafe { *doc_lens_ref.get_unchecked(doc_idx) } as usize;
+                                let doc_text = &docs_data_ref[d_start..d_start + d_len];
+
+                                if phrase_matches(doc_text, raw_tokens) {
+                                    count += 1;
+                                    id_sum += doc_id as u64;
+                                    if matches.len() < 10 {
+                                        matches.push(doc_id);
                                     }
                                 }
                             }
+
+                            write_u64(count as u64, &mut thread_out);
+                            thread_out.push(b' ');
+                            write_u64(id_sum, &mut thread_out);
+
+                            for &id in &matches {
+                                thread_out.push(b' ');
+                                write_u64(id as u64, &mut thread_out);
+                            }
+                            thread_out.push(b'\n');
                         }
                     }
                 }
+
                 thread_out
             })
         }).collect();
@@ -833,19 +875,10 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Write output
-    std::fs::create_dir_all(&out_dir).expect("failed to create out directory");
+    let _ = std::fs::create_dir_all(&out_dir);
     let mut out_file = File::create(&results_path).expect("failed to create results.txt");
-    for chunk_out in thread_outputs {
-        out_file.write_all(&chunk_out).expect("failed to write output chunk");
+    for out in thread_outputs {
+        out_file.write_all(&out).expect("failed to write results");
     }
-    out_file.flush().expect("failed to flush results.txt");
-
-    // Munmap at end
-    if q_mmap.len > 0 {
-        unsafe { munmap(q_mmap.ptr, q_mmap.len); }
-    }
-    if docs_mmap.len > 0 {
-        unsafe { munmap(docs_mmap.ptr, docs_mmap.len); }
-    }
+    out_file.flush().expect("failed to flush results");
 }

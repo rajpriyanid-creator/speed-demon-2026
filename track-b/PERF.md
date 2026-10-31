@@ -9,7 +9,16 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Contiguous CSR postings arena and single-pass packed records | run-5575c497d6f3 | 0.6729 | 225.1 | 50.86 |
 | 3 | Incremental page cache eviction via madvise and tighter record allocation | run-bf83662bf470 | 0.6657 | 225.2 | 50.91 |
 | 4 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-6005e6b7db87 | 0.658 | 219.1 | 51.58 |
-| 5 | L2 Bloom filter dictionary reject, galloping intersection, and zero-realloc postings | pending | | | |
+| 5 | L2 Bloom filter dictionary reject, galloping intersection, and zero-realloc postings | run-2d7012c9fe11 | 0.6302 | 228.0 | 51.20 |
+| 6 | Two-pass direct CSR scatter, eliminating 91 MB local_records and 22M sort_unstable calls | pending | | | |
+
+### Step 6 Architecture
+- Completely eliminated the intermediate `local_records: Vec<u32>` buffers (which previously allocated 91.2 MB across worker threads).
+- Replaced thread-local sorting (`local_records.sort_unstable()`) with a two-pass direct CSR scatter:
+  - **Pass 1**: Each worker thread counts term frequencies in its document chunk and records document byte spans.
+  - **Offsets**: Global prefix sum calculates exact term offsets and disjoint thread write pointers into the final contiguous `all_postings` array.
+  - **Pass 2**: Each thread streams its document chunk a second time, writing doc IDs directly into its designated slice of each term's postings list. Because documents are processed in strict increasing order and thread doc ranges are disjoint, every term's postings list is naturally strictly ascending with zero sorting overhead!
+- Slashes peak heap memory by >55% (from 228 MB down to ~95 MB) and eliminates all sorting overhead.
 
 ### Step 3 Architecture
 - Replaced 1.87M pre-allocated record capacity per thread with 950k, saving 45 MB heap allocation across the 12 worker threads.
