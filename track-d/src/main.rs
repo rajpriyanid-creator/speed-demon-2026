@@ -203,6 +203,16 @@ fn main() {
     f_overflow.sort_unstable_by_key(|x| x.0);
     b_overflow.sort_unstable_by_key(|x| x.0);
 
+    // The query phase only needs to know whether a node has any outgoing or
+    // incoming edges. Keep that information in compact byte flags, then
+    // release the atomic degree/write arrays before allocating query state.
+    let has_out: Vec<u8> = f_deg.iter().map(|d| (d.load(Relaxed) != 0) as u8).collect();
+    let has_in: Vec<u8> = b_deg.iter().map(|d| (d.load(Relaxed) != 0) as u8).collect();
+    drop(f_deg);
+    drop(b_deg);
+    drop(f_write);
+    drop(b_write);
+
     // Compute DSU components from CSR in ~10ms
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -268,8 +278,8 @@ fn main() {
         let b_edges_ref = &b_edges;
         let f_overflow_ref = &f_overflow;
         let b_overflow_ref = &b_overflow;
-        let f_deg_ref = &f_deg;
-        let b_deg_ref = &b_deg;
+        let has_out_ref = &has_out;
+        let has_in_ref = &has_in;
         let comp_ref = &comp;
         let query_cursor_ref = &query_cursor;
         let queries_ref = &queries;
@@ -298,8 +308,8 @@ fn main() {
                         if s_idx >= n || t_idx >= n { unsafe { *res_raw.add(q_idx) = -1; } continue; }
 
                         // Instant pruning: degree or component mismatch
-                        if f_deg_ref[s_idx].load(Relaxed) == 0
-                            || b_deg_ref[t_idx].load(Relaxed) == 0
+                        if has_out_ref[s_idx] == 0
+                            || has_in_ref[t_idx] == 0
                             || comp_ref[s_idx] != comp_ref[t_idx]
                         {
                             unsafe { *res_raw.add(q_idx) = -1; }
