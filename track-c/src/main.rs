@@ -8,7 +8,6 @@ use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -239,7 +238,6 @@ fn main() {
 
                 let p = data.as_ptr();
                 let mut pos = start;
-                let mut last_madv_pos = start;
 
                 while pos < end {
                     unsafe {
@@ -385,17 +383,6 @@ fn main() {
 
                         country_crcs[c_id as usize].push(name_crc);
 
-                        if pos - last_madv_pos >= 2 * 1024 * 1024 {
-                            let madv_len = (pos - last_madv_pos) & !4095;
-                            madvise(p.add(last_madv_pos) as *mut _, madv_len, 4);
-                            last_madv_pos += madv_len;
-                        }
-                    }
-                }
-
-                unsafe {
-                    if end > last_madv_pos {
-                        madvise(p.add(last_madv_pos) as *mut _, end - last_madv_pos, 4);
                     }
                 }
 
