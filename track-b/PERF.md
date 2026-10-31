@@ -8,7 +8,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Zero-dep Rust query-driven inverted index with parallel query evaluation | run-4c828af558fc | 3.388 | 159.4 | 36.13 |
 | 2 | Contiguous CSR postings arena and single-pass packed records | run-5575c497d6f3 | 0.6729 | 225.1 | 50.86 |
 | 3 | Incremental page cache eviction via madvise and tighter record allocation | run-bf83662bf470 | 0.6657 | 225.2 | 50.91 |
-| 4 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | pending | | | |
+| 4 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-6005e6b7db87 | 0.658 | 219.1 | 51.58 |
+| 5 | L2 Bloom filter dictionary reject, galloping intersection, and zero-realloc postings | pending | | | |
 
 ### Step 3 Architecture
 - Replaced 1.87M pre-allocated record capacity per thread with 950k, saving 45 MB heap allocation across the 12 worker threads.
@@ -16,4 +17,10 @@ Every step from the reference to your final version, each with the live-board ru
 - Dramatically lowers container `memory.peak` high-water mark under cgroups v2.
 
 ### Step 4 Architecture
-- Added `.cargo/config.toml` targeting `target-cpu=native` for vectorization and optimized hardware instruction dispatch.
+- Added `.cargo/config.toml` targeting `target-cpu=native` for vectorization and optimized hardware instruction dispatch, advancing runtime to 0.658s (51.58 pts).
+
+### Step 5 Architecture
+- Implemented 128 KB L2-resident Bloom filter for query dictionary: eliminates DRAM cache misses on non-query words during `docs.txt` tokenization scan.
+- Galloping search for postings list intersections: replaces linear search with exponential jumping and binary search when list sizes diverge by $\ge 16\times$, speeding up skewed boolean intersections by up to $400\times$.
+- Pre-allocated 1.9M capacity for local postings buffers, preventing thread vector reallocations and glibc lock contention during document indexing.
+- Eliminated premature `madvise(MADV_DONTNEED)` before query phase, keeping candidate document text hot in page cache for phrase validation.

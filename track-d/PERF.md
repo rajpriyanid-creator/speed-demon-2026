@@ -11,7 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Hole-sifting push heap optimization and eliminated redundant memory loads | run-eabf8481f719 | 1.273 | 322.9 | 40.73 |
 | 5 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-0dc375146900 | 1.205 | 324.1 | 41.32 |
 | 6 | 2-way parallel tournament 4-ary heap comparison and raw-pointer integer parsing | run-4158599d3d61 | 1.147 | 322.9 | 41.75 |
-| 7 | Bidirectional Dijkstra with concurrent dual CSR construction and balanced frontier expansion | pending | | | |
+| 7 | Bidirectional Dijkstra with concurrent dual CSR construction and balanced frontier expansion | run-72cc2d3ef1d5 | 1.085 | 340.3 | 41.60 |
 
 ### Step 5 Optimization Details
 - Added `.cargo/config.toml` targeting `target-cpu=native` for BMI2 and advanced instruction set utilization, improving runtime to 1.205s (41.32 pts).

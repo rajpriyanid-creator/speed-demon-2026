@@ -62,6 +62,7 @@ struct DictEntry {
 
 struct Dict {
     table: Vec<DictEntry>,
+    bloom: [u64; 16384],
     mask: usize,
 }
 
@@ -70,6 +71,7 @@ impl Dict {
         let cap = capacity.next_power_of_two();
         Self {
             table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 23] }; cap],
+            bloom: [0u64; 16384],
             mask: cap - 1,
         }
     }
@@ -87,6 +89,11 @@ impl Dict {
     fn insert(&mut self, term: &[u8], term_id: u32) {
         if term.len() > 23 { return; }
         let h = Self::hash_bytes(term);
+        let b1 = (h as usize) & 0xF_FFFF;
+        let b2 = ((h.rotate_left(11) ^ (h >> 16)) as usize) & 0xF_FFFF;
+        self.bloom[b1 >> 6] |= 1u64 << (b1 & 63);
+        self.bloom[b2 >> 6] |= 1u64 << (b2 & 63);
+
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = &mut self.table[idx];
@@ -102,6 +109,16 @@ impl Dict {
             }
             idx = (idx + 1) & self.mask;
         }
+    }
+
+    #[inline(always)]
+    fn bloom_check(&self, h: u32) -> bool {
+        let b1 = (h as usize) & 0xF_FFFF;
+        if (unsafe { *self.bloom.get_unchecked(b1 >> 6) } & (1u64 << (b1 & 63))) == 0 {
+            return false;
+        }
+        let b2 = ((h.rotate_left(11) ^ (h >> 16)) as usize) & 0xF_FFFF;
+        (unsafe { *self.bloom.get_unchecked(b2 >> 6) } & (1u64 << (b2 & 63))) != 0
     }
 
     #[inline(always)]
@@ -231,12 +248,65 @@ fn phrase_matches(doc_text: &[u8], phrase: &[&[u8]]) -> bool {
 }
 
 #[inline(always)]
+fn galloping_search(slice: &[u32], target: u32) -> usize {
+    let len = slice.len();
+    if len == 0 || unsafe { *slice.get_unchecked(0) } >= target {
+        return 0;
+    }
+    let mut low = 0;
+    let mut high = 1;
+    while high < len && unsafe { *slice.get_unchecked(high) } < target {
+        low = high;
+        high <<= 1;
+    }
+    high = high.min(len);
+    while low < high {
+        let mid = low + ((high - low) >> 1);
+        if unsafe { *slice.get_unchecked(mid) } < target {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+#[inline(always)]
 fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
     let na = a.len();
     let nb = b.len();
+    if na == 0 || nb == 0 { return; }
+
+    if na * 16 < nb {
+        let mut j = 0;
+        for &va in a {
+            if j >= nb { break; }
+            let adv = galloping_search(&b[j..], va);
+            j += adv;
+            if j < nb && unsafe { *b.get_unchecked(j) } == va {
+                out.push(va);
+                j += 1;
+            }
+        }
+        return;
+    }
+    if nb * 16 < na {
+        let mut i = 0;
+        for &vb in b {
+            if i >= na { break; }
+            let adv = galloping_search(&a[i..], vb);
+            i += adv;
+            if i < na && unsafe { *a.get_unchecked(i) } == vb {
+                out.push(vb);
+                i += 1;
+            }
+        }
+        return;
+    }
+
+    let mut i = 0;
+    let mut j = 0;
     while i < na && j < nb {
         let va = unsafe { *a.get_unchecked(i) };
         let vb = unsafe { *b.get_unchecked(j) };
@@ -245,20 +315,8 @@ fn intersect(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
             i += 1;
             j += 1;
         } else if va < vb {
-            if i + 8 < na && unsafe { *a.get_unchecked(i + 8) } < vb {
-                i += 8;
-                while i + 8 < na && unsafe { *a.get_unchecked(i + 8) } < vb {
-                    i += 8;
-                }
-            }
             i += 1;
         } else {
-            if j + 8 < nb && unsafe { *b.get_unchecked(j + 8) } < va {
-                j += 8;
-                while j + 8 < nb && unsafe { *b.get_unchecked(j + 8) } < va {
-                    j += 8;
-                }
-            }
             j += 1;
         }
     }
@@ -293,10 +351,15 @@ fn union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 #[inline(always)]
 fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
-    let mut i = 0;
-    let mut j = 0;
     let na = a.len();
     let nb = b.len();
+    if na == 0 { return; }
+    if nb == 0 {
+        out.extend_from_slice(a);
+        return;
+    }
+    let mut i = 0;
+    let mut j = 0;
     while i < na && j < nb {
         let va = unsafe { *a.get_unchecked(i) };
         let vb = unsafe { *b.get_unchecked(j) };
@@ -307,7 +370,8 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
             out.push(va);
             i += 1;
         } else {
-            j += 1;
+            let adv = galloping_search(&b[j..], va);
+            j += adv;
         }
     }
     out.extend_from_slice(&a[i..]);
@@ -482,7 +546,7 @@ fn main() {
             let chunk = &docs_data[start_byte..end_byte];
 
             s.spawn(move || {
-                let est_records = 950_000;
+                let est_records = 1_900_000;
                 let mut local_records: Vec<u32> = Vec::with_capacity(est_records);
                 let mut last_seen = vec![u32::MAX; num_terms as usize];
                 let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
@@ -531,11 +595,13 @@ fn main() {
                         let tok_len = p - tok_start;
                         if tok_len <= 23 {
                             if h == 0 { h = 1; }
-                            if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
-                                let tid = term_id as usize;
-                                if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
-                                    unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
-                                    local_records.push((term_id << 15) | local_doc_id);
+                            if dict_ref.bloom_check(h) {
+                                if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
+                                    let tid = term_id as usize;
+                                    if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
+                                        unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
+                                        local_records.push((term_id << 15) | local_doc_id);
+                                    }
                                 }
                             }
                         }
@@ -645,11 +711,6 @@ fn main() {
     drop(thread_data);
     drop(thread_write_bases);
     drop(thread_start_docs);
-    if docs_mmap.len > 0 {
-        unsafe {
-            madvise(docs_mmap.ptr, docs_mmap.len, 4); // MADV_DONTNEED: evict docs page cache before query phase
-        }
-    }
     unsafe { malloc_trim(0); }
 
     // Parallel query execution
