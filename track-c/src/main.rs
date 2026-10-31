@@ -117,6 +117,38 @@ fn write_u64(mut n: u64, out: &mut Vec<u8>) {
     }
 }
 
+struct FastSeenTable {
+    table: Vec<u64>,
+    mask: usize,
+}
+
+impl FastSeenTable {
+    fn new(cap: usize) -> Self {
+        let size = cap.next_power_of_two();
+        Self {
+            table: vec![0u64; size],
+            mask: size - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn check_and_add(&mut self, val: u64) -> bool {
+        let mut idx = ((val ^ (val >> 33)).wrapping_mul(0xff51afd7ed558ccd) as usize) & self.mask;
+        for _ in 0..8 {
+            let slot = unsafe { *self.table.get_unchecked(idx) };
+            if slot == val {
+                return false;
+            }
+            if slot == 0 {
+                unsafe { *self.table.get_unchecked_mut(idx) = val; }
+                return true;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+        true
+    }
+}
+
 fn main() {
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
@@ -142,14 +174,52 @@ fn main() {
     };
 
     let mut seen = [false; 17576];
-    let mut region_to_code: Vec<u16> = vec![u16::MAX; 1_000_000];
-
     let mut pos = 0;
     while pos < regions_data.len() && regions_data[pos] != b'\n' {
         pos += 1;
     }
     if pos < regions_data.len() { pos += 1; }
 
+    let body_start = pos;
+    while pos < regions_data.len() {
+        while pos < regions_data.len() && regions_data[pos] != b',' {
+            pos += 1;
+        }
+        if pos >= regions_data.len() { break; }
+        pos += 1;
+        let b0 = regions_data[pos];
+        let b1 = regions_data[pos + 1];
+        let b2 = regions_data[pos + 2];
+        pos += 3;
+        while pos < regions_data.len() && regions_data[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos < regions_data.len() { pos += 1; }
+
+        if b0 >= b'A' && b0 <= b'Z' && b1 >= b'A' && b1 <= b'Z' && b2 >= b'A' && b2 <= b'Z' {
+            let code = ((b0 - b'A') as u16) * 676 + ((b1 - b'A') as u16) * 26 + ((b2 - b'A') as u16);
+            seen[code as usize] = true;
+        }
+    }
+
+    let mut country_names: Vec<Vec<u8>> = Vec::with_capacity(300);
+    let mut code_map = [u16::MAX; 17576];
+    for idx in 0..17576 {
+        if seen[idx] {
+            let c0 = b'A' + (idx / 676) as u8;
+            let c1 = b'A' + ((idx / 26) % 26) as u8;
+            let c2 = b'A' + (idx % 26) as u8;
+            let c_id = country_names.len() as u16;
+            country_names.push(vec![c0, c1, c2]);
+            code_map[idx] = c_id;
+        }
+    }
+    let unmatched_id = country_names.len() as u16;
+    country_names.push(b"_UNMATCHED".to_vec());
+    let num_countries = country_names.len();
+
+    let mut region_to_country: Vec<u16> = vec![unmatched_id; 1_000_000];
+    pos = body_start;
     while pos < regions_data.len() {
         let mut rid = 0usize;
         while pos < regions_data.len() && regions_data[pos] != b',' {
@@ -172,36 +242,12 @@ fn main() {
 
         if b0 >= b'A' && b0 <= b'Z' && b1 >= b'A' && b1 <= b'Z' && b2 >= b'A' && b2 <= b'Z' {
             let code = ((b0 - b'A') as u16) * 676 + ((b1 - b'A') as u16) * 26 + ((b2 - b'A') as u16);
-            seen[code as usize] = true;
             if rid < 1_000_000 {
-                region_to_code[rid] = code;
+                region_to_country[rid] = code_map[code as usize];
             }
         }
     }
-
-    let mut country_names: Vec<Vec<u8>> = Vec::with_capacity(300);
-    let mut code_map = [u16::MAX; 17576];
-    for idx in 0..17576 {
-        if seen[idx] {
-            let c0 = b'A' + (idx / 676) as u8;
-            let c1 = b'A' + ((idx / 26) % 26) as u8;
-            let c2 = b'A' + (idx % 26) as u8;
-            let c_id = country_names.len() as u16;
-            country_names.push(vec![c0, c1, c2]);
-            code_map[idx] = c_id;
-        }
-    }
-    let unmatched_id = country_names.len() as u16;
-    country_names.push(b"_UNMATCHED".to_vec());
-    let num_countries = country_names.len();
-
-    let mut region_to_country: Vec<u16> = vec![unmatched_id; 1_000_000];
-    for rid in 0..1_000_000 {
-        let code = region_to_code[rid];
-        if code != u16::MAX {
-            region_to_country[rid] = code_map[code as usize];
-        }
-    }
+    drop(regions_data);
 
     // 2. Mmap records.csv
     let records_path = format!("{}/records.csv", data_dir);
@@ -266,7 +312,8 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_names: Vec<u64> = Vec::with_capacity(180_000);
+                let mut seen_table = FastSeenTable::new(131072);
+                let mut local_names: Vec<u64> = Vec::with_capacity(105_000);
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -460,9 +507,12 @@ fn main() {
                         agg.note_bytes += note_len;
 
                         let packed = ((c_id as u64) << 48) | (n_hash_combined & 0x0000_FFFF_FFFF_FFFF);
-                        local_names.push(packed);
+                        if seen_table.check_and_add(packed) {
+                            local_names.push(packed);
+                        }
                     }
                 }
+                drop(seen_table);
                 local_names.sort_unstable();
                 local_names.dedup();
                 local_names.shrink_to_fit();
