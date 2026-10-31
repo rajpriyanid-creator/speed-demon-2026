@@ -12,7 +12,13 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-0dc375146900 | 1.205 | 324.1 | 41.32 |
 | 6 | 2-way parallel tournament 4-ary heap comparison and raw-pointer integer parsing | run-4158599d3d61 | 1.147 | 322.9 | 41.75 |
 | 7 | Bidirectional Dijkstra with concurrent dual CSR construction and balanced frontier expansion | run-72cc2d3ef1d5 | 1.085 | 340.3 | 41.60 |
-| 8 | Single-pass atomic CSR construction and cache-streamlined bidirectional Dijkstra | pending | | | |
+| 8 | Single-pass atomic CSR construction and cache-streamlined bidirectional Dijkstra | run-862895d3af4f | 0.7435 | 443.6 | 44.68 |
+| 9 | Direct streaming dual CSR (zero intermediate edge buffer) and 5-thread query sizing | pending | | | |
+
+### Step 9 Optimization Details
+- Completely eliminated the 80 MB intermediate `RawEdge` vectors from graph loading: Pass 2 streams edge parsing directly from the memory map into `f_edges` and `b_edges` via atomic offset fetch-add.
+- Sized the Dijkstra query thread pool to 5 threads, dropping concurrent query distance arrays (`df`/`db`) by over 196 MB.
+- Lowers peak container memory from 443 MB down to ~140 MB while maintaining sub-0.75s search latency.
 
 ### Step 8 Optimization Details
 - Completely eliminated multi-pass text re-reading and 224 MB of thread-local degree vectors (`deg_results`) and write offset vectors (`thread_write`).

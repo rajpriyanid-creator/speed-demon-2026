@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -127,14 +127,6 @@ unsafe fn parse_u32_fast(p: *const u8, pos: &mut usize) -> u32 {
     val
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RawEdge {
-    u: u32,
-    v: u32,
-    w: u64,
-}
-
 fn main() {
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
@@ -172,72 +164,53 @@ fn main() {
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|num| num.get())
-        .unwrap_or(8)
-        .min(12);
-
-    let mut edge_chunks = Vec::with_capacity(num_threads);
-    {
-        let total_edge_bytes = g_len - edges_start;
-        let mut cur = edges_start;
-        for t in 0..num_threads {
-            let target = edges_start + ((total_edge_bytes * (t + 1)) / num_threads);
-            let mut end = target.min(g_len);
-            while end < g_len && unsafe { *g_ptr.add(end) } != b'\n' {
-                end += 1;
-            }
-            if end < g_len {
-                end += 1;
-            }
-            edge_chunks.push((cur, end));
-            cur = end;
+    let num_load_threads = 8;
+    let mut edge_chunks = Vec::with_capacity(num_load_threads);
+    let total_edge_bytes = g_len - edges_start;
+    let mut cur = edges_start;
+    for t in 0..num_load_threads {
+        let target = edges_start + ((total_edge_bytes * (t + 1)) / num_load_threads);
+        let mut end = target.min(g_len);
+        while end < g_len && unsafe { *g_ptr.add(end) } != b'\n' {
+            end += 1;
         }
+        if end < g_len {
+            end += 1;
+        }
+        edge_chunks.push((cur, end));
+        cur = end;
     }
 
     let g_addr = g_ptr as usize;
 
-    // Single-pass text parse + atomic degree count
+    // Pass 1: Atomic degree count (14 MB peak)
     let f_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let b_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
 
-    let thread_edges: Vec<Vec<RawEdge>> = std::thread::scope(|s| {
-        let handles: Vec<_> = edge_chunks.iter().map(|&(start, end)| {
+    std::thread::scope(|s| {
+        for &(start, end) in &edge_chunks {
             let f_deg_ref = &f_deg;
             let b_deg_ref = &b_deg;
             s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
-                let est_edges = (end - start) / 18 + 1024;
-                let mut local_edges = Vec::with_capacity(est_edges);
                 let mut pos = start;
                 while pos < end {
                     let u = unsafe { parse_u32_fast(g_ptr, &mut pos) };
                     pos += 1;
                     let v = unsafe { parse_u32_fast(g_ptr, &mut pos) };
-                    pos += 1;
-                    let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
-                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
-                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
-
-                    let u_idx = u as usize;
-                    let v_idx = v as usize;
-                    if u_idx < n {
-                        f_deg_ref[u_idx].fetch_add(1, Relaxed);
+                    while pos < end && unsafe { *g_ptr.add(pos) } != b'\n' {
+                        pos += 1;
                     }
-                    if v_idx < n {
-                        b_deg_ref[v_idx].fetch_add(1, Relaxed);
+                    if pos < end {
+                        pos += 1;
                     }
-                    local_edges.push(RawEdge { u, v, w });
+                    f_deg_ref[u as usize].fetch_add(1, Relaxed);
+                    b_deg_ref[v as usize].fetch_add(1, Relaxed);
                 }
-                local_edges
-            })
-        }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        }
     });
 
-    unsafe { munmap(g_ptr, g_len); }
-
-    // Fast single prefix sum + atomic write head initialization
     let mut f_head = vec![0u32; n + 1];
     let mut b_head = vec![0u32; n + 1];
     let f_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
@@ -258,44 +231,45 @@ fn main() {
     drop(f_deg);
     drop(b_deg);
 
-    // Parallel binary scatter into CSR
     let mut f_edges = vec![0u64; m];
     let mut b_edges = vec![0u64; m];
     let f_edges_addr = f_edges.as_mut_ptr() as usize;
     let b_edges_addr = b_edges.as_mut_ptr() as usize;
 
+    // Pass 2: Stream directly from mmap into CSR with zero intermediate buffer
     std::thread::scope(|s| {
-        for edges in &thread_edges {
+        for &(start, end) in &edge_chunks {
             let f_write_ref = &f_write;
             let b_write_ref = &b_write;
-
             s.spawn(move || {
+                let g_ptr = g_addr as *const u8;
                 let f_raw = f_edges_addr as *mut u64;
                 let b_raw = b_edges_addr as *mut u64;
-                for e in edges {
-                    let u = e.u as usize;
-                    let v = e.v as usize;
-                    let w = e.w;
+                let mut pos = start;
+                while pos < end {
+                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) };
+                    pos += 1;
+                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) };
+                    pos += 1;
+                    let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
 
                     let packed_f = (v as u64) | (w << 32);
                     let packed_b = (u as u64) | (w << 32);
 
-                    if u < n {
-                        let idx = f_write_ref[u].fetch_add(1, Relaxed);
-                        unsafe { *f_raw.add(idx as usize) = packed_f; }
-                    }
-                    if v < n {
-                        let idx = b_write_ref[v].fetch_add(1, Relaxed);
-                        unsafe { *b_raw.add(idx as usize) = packed_b; }
-                    }
+                    let idx_f = f_write_ref[u as usize].fetch_add(1, Relaxed);
+                    unsafe { *f_raw.add(idx_f as usize) = packed_f; }
+                    let idx_b = b_write_ref[v as usize].fetch_add(1, Relaxed);
+                    unsafe { *b_raw.add(idx_b as usize) = packed_b; }
                 }
             });
         }
     });
 
-    drop(thread_edges);
     drop(f_write);
     drop(b_write);
+    unsafe { munmap(g_ptr, g_len); }
 
     // 2. Parse queries
     let q_file = File::open(&queries_path).expect("failed to open queries.txt");
@@ -325,9 +299,11 @@ fn main() {
 
     let num_queries = queries.len();
     let mut results: Vec<i64> = vec![-1; num_queries];
-    let query_cursor = std::sync::atomic::AtomicUsize::new(0);
+    let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
+    // Sized to exactly 5 worker threads (140 MB query footprint instead of 336 MB)
+    let q_threads = 5;
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
         let f_edges_ref = &f_edges;
@@ -336,7 +312,7 @@ fn main() {
         let query_cursor_ref = &query_cursor;
         let queries_ref = &queries;
 
-        for _ in 0..num_threads {
+        for _ in 0..q_threads {
             s.spawn(move || {
                 let mut qf = FastHeap::new(2048);
                 let mut qb = FastHeap::new(2048);
@@ -348,7 +324,7 @@ fn main() {
 
                 const BATCH_SIZE: usize = 16;
                 loop {
-                    let start_idx = query_cursor_ref.fetch_add(BATCH_SIZE, std::sync::atomic::Ordering::Relaxed);
+                    let start_idx = query_cursor_ref.fetch_add(BATCH_SIZE, Relaxed);
                     if start_idx >= num_queries {
                         break;
                     }
@@ -470,7 +446,8 @@ fn main() {
     let out_file_path = format!("{}/distances.txt", out_dir);
     let mut out_file = File::create(&out_file_path).unwrap();
 
-    let mut out_buf = Vec::with_capacity(32 * 1024);
+    use std::io::Write;
+    let mut out_buf: Vec<u8> = Vec::with_capacity(32 * 1024);
     for d in results {
         if d == -1 {
             out_buf.extend_from_slice(b"-1\n");
@@ -494,13 +471,11 @@ fn main() {
             out_buf.push(b'\n');
         }
         if out_buf.len() > 24 * 1024 {
-            use std::io::Write;
             out_file.write_all(&out_buf).unwrap();
             out_buf.clear();
         }
     }
     if !out_buf.is_empty() {
-        use std::io::Write;
         out_file.write_all(&out_buf).unwrap();
     }
 }
