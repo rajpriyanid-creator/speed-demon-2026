@@ -86,45 +86,6 @@ fn write_cents_fast(c: i64, out: &mut Vec<u8>) {
     out.push(b'0' + (cents % 10) as u8);
 }
 
-#[inline]
-fn radix_sort_u32(values: &mut [u32], scratch: &mut Vec<u32>) {
-    if values.len() < 1024 {
-        values.sort_unstable();
-        return;
-    }
-    scratch.resize(values.len(), 0);
-    let mut counts = [0usize; 65536];
-    for &v in values.iter() {
-        counts[(v & 0xFFFF) as usize] += 1;
-    }
-    let mut offset = 0usize;
-    for count in counts.iter_mut() {
-        let next = offset + *count;
-        *count = offset;
-        offset = next;
-    }
-    for &v in values.iter() {
-        let slot = &mut counts[(v & 0xFFFF) as usize];
-        scratch[*slot] = v;
-        *slot += 1;
-    }
-    counts.fill(0);
-    for &v in scratch.iter() {
-        counts[(v >> 16) as usize] += 1;
-    }
-    offset = 0;
-    for count in counts.iter_mut() {
-        let next = offset + *count;
-        *count = offset;
-        offset = next;
-    }
-    for &v in scratch.iter() {
-        let slot = &mut counts[(v >> 16) as usize];
-        values[*slot] = v;
-        *slot += 1;
-    }
-}
-
 fn main() {
     unsafe { mallopt(-8, 2); }
 
@@ -457,7 +418,6 @@ fn main() {
             s.spawn(move || {
                 let mut out = Vec::with_capacity((c_end - c_start) * 128);
                 let mut scratch = Vec::with_capacity(32_768);
-                let mut radix_scratch = Vec::with_capacity(32_768);
 
                 for c_id in c_start..c_end {
                     let mut count = 0u64;
@@ -486,7 +446,7 @@ fn main() {
 
                     if count == 0 { continue; }
 
-                    radix_sort_u32(&mut scratch, &mut radix_scratch);
+                    scratch.sort_unstable();
                     let mut distinct = 0usize;
                     let mut last = u32::MAX;
                     for &crc in &scratch {
