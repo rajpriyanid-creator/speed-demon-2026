@@ -258,8 +258,8 @@ fn main() {
     let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
-    // 2 query threads gives the fastest query throughput while keeping peak memory at ~64 MB
-    let q_threads = 2;
+    // 4 query threads delivers 2x faster query search
+    let q_threads = 4;
 
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
