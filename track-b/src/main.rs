@@ -529,8 +529,8 @@ fn main() {
     // phases do not leave two cores idle.
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(12).min(12);
 
-    let mut thread_postings: Vec<Vec<u64>> = (0..num_threads)
-        .map(|_| Vec::with_capacity(150_000))
+    let mut thread_postings: Vec<Vec<u8>> = (0..num_threads)
+        .map(|_| Vec::with_capacity(750_000))
         .collect();
     let mut thread_counts: Vec<Vec<u32>> = (0..num_threads)
         .map(|_| vec![0u32; num_terms as usize])
@@ -634,7 +634,12 @@ fn main() {
                                             *last_seen.get_unchecked_mut(tid) = doc_offset_in_thread;
                                             *counts_buf.get_unchecked_mut(tid) += 1;
                                         }
-                                        postings_buf.push(((term_id as u64) << 16) | (doc_offset_in_thread as u64));
+                                        let packed = ((term_id as u64) << 16) | (doc_offset_in_thread as u64);
+                                        postings_buf.push(packed as u8);
+                                        postings_buf.push((packed >> 8) as u8);
+                                        postings_buf.push((packed >> 16) as u8);
+                                        postings_buf.push((packed >> 24) as u8);
+                                        postings_buf.push((packed >> 32) as u8);
                                     }
                                 }
                             }
@@ -692,9 +697,14 @@ fn main() {
 
                 s.spawn(move || {
                     let raw_ptr = base_ptr as *mut u16;
-                    for &rec in t_postings {
-                        let tid = (rec >> 16) as usize;
-                        let doc_offset = (rec & 0xFFFF) as u16;
+                    for rec in t_postings.chunks_exact(5) {
+                        let packed = (rec[0] as u64)
+                            | ((rec[1] as u64) << 8)
+                            | ((rec[2] as u64) << 16)
+                            | ((rec[3] as u64) << 24)
+                            | ((rec[4] as u64) << 32);
+                        let tid = (packed >> 16) as usize;
+                        let doc_offset = (packed & 0xFFFF) as u16;
                         let loc_id = base_loc + doc_offset;
                         let dest = unsafe { *write_ptrs.get_unchecked(tid) };
                         unsafe {
