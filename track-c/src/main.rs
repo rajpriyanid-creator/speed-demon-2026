@@ -35,17 +35,6 @@ fn find_quote_swar(w: u64) -> Option<usize> {
 }
 
 #[inline(always)]
-fn find_comma_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
-    if m != 0 {
-        Some((m.trailing_zeros() >> 3) as usize)
-    } else {
-        None
-    }
-}
-
-#[inline(always)]
 unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
     let mut c = crc as u64;
     let mut i = 0;
@@ -114,6 +103,7 @@ fn main() {
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
     let args: Vec<String> = std::env::args().collect();
+    let mut positional = Vec::new();
     let mut arg_i = 1;
     while arg_i < args.len() {
         if args[arg_i] == "--data" && arg_i + 1 < args.len() {
@@ -122,10 +112,15 @@ fn main() {
         } else if args[arg_i] == "--out" && arg_i + 1 < args.len() {
             out_dir = args[arg_i + 1].clone();
             arg_i += 2;
+        } else if !args[arg_i].starts_with("--") {
+            positional.push(args[arg_i].clone());
+            arg_i += 1;
         } else {
             arg_i += 1;
         }
     }
+    if positional.len() >= 1 && data_dir == "/data" { data_dir = positional[0].clone(); }
+    if positional.len() >= 2 && out_dir == "/out" { out_dir = positional[1].clone(); }
 
     let regions_path = format!("{}/regions.csv", data_dir);
     let regions_file = match File::open(&regions_path) {
@@ -319,18 +314,7 @@ fn main() {
                         } else {
                             let n_start = pos;
                             let mut crc: u32 = 0;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    crc = crc32_hardware(crc, p.add(pos), off);
-                                    pos += off;
-                                    break;
-                                } else {
-                                    crc = crc32_hardware(crc, p.add(pos), 8);
-                                    pos += 8;
-                                }
-                            }
-                            while pos < end && *p.add(pos) != b',' {
+                            while *p.add(pos) != b',' {
                                 crc = _mm_crc32_u8(crc, *p.add(pos));
                                 pos += 1;
                             }
@@ -382,16 +366,7 @@ fn main() {
                             if *p.add(pos) == b',' { pos += 1; }
                         } else {
                             let n_start = pos;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    pos += off;
-                                    break;
-                                } else {
-                                    pos += 8;
-                                }
-                            }
-                            while pos < end && *p.add(pos) != b',' { pos += 1; }
+                            while *p.add(pos) != b',' { pos += 1; }
                             note_len = (pos - n_start) as u64;
                             pos += 1;
                         }

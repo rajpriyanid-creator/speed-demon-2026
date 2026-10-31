@@ -312,6 +312,7 @@ fn main() {
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
     let args: Vec<String> = std::env::args().collect();
+    let mut positional = Vec::new();
     let mut arg_i = 1;
     while arg_i < args.len() {
         if args[arg_i] == "--data" && arg_i + 1 < args.len() {
@@ -320,10 +321,15 @@ fn main() {
         } else if args[arg_i] == "--out" && arg_i + 1 < args.len() {
             out_dir = args[arg_i + 1].clone();
             arg_i += 2;
+        } else if !args[arg_i].starts_with("--") {
+            positional.push(args[arg_i].clone());
+            arg_i += 1;
         } else {
             arg_i += 1;
         }
     }
+    if positional.len() >= 1 && data_dir == "/data" { data_dir = positional[0].clone(); }
+    if positional.len() >= 2 && out_dir == "/out" { out_dir = positional[1].clone(); }
 
     let queries_path = format!("{}/queries.txt", data_dir);
     let docs_path = format!("{}/docs.txt", data_dir);
@@ -458,7 +464,7 @@ fn main() {
         }
 
         // Pass 1 on this segment: Count term frequencies and collect starts/lens (zero big allocations!)
-        let pass1: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+        let pass1: Vec<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u16>, Vec<u32>)> = std::thread::scope(|s| {
             let handles: Vec<_> = sub_chunks.iter().map(|&(sb, eb)| {
                 let dict_ref = &dict;
                 let chunk = &seg_slice[sb..eb];
@@ -468,6 +474,8 @@ fn main() {
                     let est_docs = ((eb - sb) / 1000 + 512).max(4000);
                     let mut local_starts = Vec::with_capacity(est_docs);
                     let mut local_lens = Vec::with_capacity(est_docs);
+                    let mut doc_hits: Vec<u16> = Vec::with_capacity(65_536);
+                    let mut term_hits: Vec<u32> = Vec::with_capacity(65_536);
                     let mut i = 0;
                     let clen = chunk.len();
                     let mut loc_doc: u16 = 0;
@@ -501,6 +509,8 @@ fn main() {
                                         unsafe {
                                             *last_seen.get_unchecked_mut(tid) = loc_doc;
                                             *local_counts.get_unchecked_mut(tid) += 1;
+                                            doc_hits.push(loc_doc);
+                                            term_hits.push(term_id);
                                         }
                                     }
                                 }
@@ -508,7 +518,7 @@ fn main() {
                         }
                         loc_doc += 1;
                     }
-                    (local_counts, local_starts, local_lens)
+                    (local_counts, local_starts, local_lens, doc_hits, term_hits)
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -547,45 +557,22 @@ fn main() {
         let mut all_postings: Vec<u16> = vec![0u16; total_postings as usize];
         let base_postings_ptr = all_postings.as_mut_ptr() as usize;
 
-        // Pass 2 on this segment: populate u16 postings sequentially
+        // Pass 2 on this segment: INSTANT IN-MEMORY SCATTER (zero text scanning, zero hashing!)
         std::thread::scope(|s| {
             for (t, r) in pass1.into_iter().enumerate() {
-                let dict_ref = &dict;
-                let seg_slice_ref = seg_slice;
-                let starts = r.1;
-                let lens = r.2;
                 let s_doc = t_start_doc[t];
                 let mut write_pos = t_write_bases[t].clone();
+                let doc_hits = r.3;
+                let term_hits = r.4;
                 s.spawn(move || {
                     let raw_p = base_postings_ptr as *mut u16;
-                    let mut last_seen = vec![u16::MAX; num_terms as usize];
-                    for (loc_idx, (&start, &len)) in starts.iter().zip(lens.iter()).enumerate() {
-                        let d_id = s_doc + loc_idx as u16;
-                        let text = &seg_slice_ref[start as usize..(start + len) as usize];
-                        let base_ptr = text.as_ptr();
-                        let mut p = 0;
-                        let tlen = text.len();
-                        while p < tlen {
-                            while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } { p += 1; }
-                            if p >= tlen { break; }
-                            let tok_start = p;
-                            while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } { p += 1; }
-                            let tok_len = p - tok_start;
-                            if tok_len <= 23 {
-                                let ptr_tok = unsafe { base_ptr.add(tok_start) };
-                                let h = unsafe { hash_bytes_fast(ptr_tok, tok_len) };
-                                if let Some(term_id) = dict_ref.get_with_hash(ptr_tok, tok_len, h) {
-                                    let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != d_id {
-                                        unsafe {
-                                            *last_seen.get_unchecked_mut(tid) = d_id;
-                                            let slot = *write_pos.get_unchecked(tid) as usize;
-                                            *write_pos.get_unchecked_mut(tid) += 1;
-                                            *raw_p.add(slot) = d_id;
-                                        }
-                                    }
-                                }
-                            }
+                    for i in 0..doc_hits.len() {
+                        let d_id = s_doc + unsafe { *doc_hits.get_unchecked(i) };
+                        let tid = unsafe { *term_hits.get_unchecked(i) } as usize;
+                        unsafe {
+                            let slot = *write_pos.get_unchecked(tid) as usize;
+                            *write_pos.get_unchecked_mut(tid) += 1;
+                            *raw_p.add(slot) = d_id;
                         }
                     }
                 });
