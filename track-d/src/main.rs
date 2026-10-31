@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -72,7 +73,6 @@ impl FastHeap {
                     break;
                 }
                 let (best_val, best_child) = if first_child + 3 < len {
-                    // 2-way parallel tournament tree comparison
                     let c1 = first_child;
                     let c2 = first_child + 1;
                     let c3 = first_child + 2;
@@ -127,6 +127,14 @@ unsafe fn parse_u32_fast(p: *const u8, pos: &mut usize) -> u32 {
     val
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawEdge {
+    u: u32,
+    v: u32,
+    w: u64,
+}
+
 fn main() {
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
@@ -164,17 +172,17 @@ fn main() {
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
-    let num_load_threads = std::thread::available_parallelism()
+    let num_threads = std::thread::available_parallelism()
         .map(|num| num.get())
-        .unwrap_or(6)
-        .min(8);
+        .unwrap_or(8)
+        .min(12);
 
-    let mut edge_chunks = Vec::with_capacity(num_load_threads);
+    let mut edge_chunks = Vec::with_capacity(num_threads);
     {
         let total_edge_bytes = g_len - edges_start;
         let mut cur = edges_start;
-        for t in 0..num_load_threads {
-            let target = edges_start + ((total_edge_bytes * (t + 1)) / num_load_threads);
+        for t in 0..num_threads {
+            let target = edges_start + ((total_edge_bytes * (t + 1)) / num_threads);
             let mut end = target.min(g_len);
             while end < g_len && unsafe { *g_ptr.add(end) } != b'\n' {
                 end += 1;
@@ -188,113 +196,106 @@ fn main() {
     }
 
     let g_addr = g_ptr as usize;
-    let deg_results: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+
+    // Single-pass text parse + atomic degree count
+    let f_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let b_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+
+    let thread_edges: Vec<Vec<RawEdge>> = std::thread::scope(|s| {
         let handles: Vec<_> = edge_chunks.iter().map(|&(start, end)| {
+            let f_deg_ref = &f_deg;
+            let b_deg_ref = &b_deg;
             s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
-                let mut local_f_deg = vec![0u32; n];
-                let mut local_b_deg = vec![0u32; n];
+                let est_edges = (end - start) / 18 + 1024;
+                let mut local_edges = Vec::with_capacity(est_edges);
                 let mut pos = start;
                 while pos < end {
-                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
+                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) };
                     pos += 1;
-                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
-                    while pos < end && unsafe { *g_ptr.add(pos) } != b'\n' {
-                        pos += 1;
-                    }
-                    if pos < end {
-                        pos += 1;
-                    }
+                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) };
+                    pos += 1;
+                    let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
 
-                    if u < n {
-                        unsafe { *local_f_deg.get_unchecked_mut(u) += 1; }
+                    let u_idx = u as usize;
+                    let v_idx = v as usize;
+                    if u_idx < n {
+                        f_deg_ref[u_idx].fetch_add(1, Relaxed);
                     }
-                    if v < n {
-                        unsafe { *local_b_deg.get_unchecked_mut(v) += 1; }
+                    if v_idx < n {
+                        b_deg_ref[v_idx].fetch_add(1, Relaxed);
                     }
+                    local_edges.push(RawEdge { u, v, w });
                 }
-                (local_f_deg, local_b_deg)
+                local_edges
             })
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    unsafe { munmap(g_ptr, g_len); }
+
+    // Fast single prefix sum + atomic write head initialization
     let mut f_head = vec![0u32; n + 1];
     let mut b_head = vec![0u32; n + 1];
-    let mut thread_f_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
-    let mut thread_b_write: Vec<Vec<u32>> = (0..num_load_threads).map(|_| vec![0u32; n]).collect();
+    let f_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let b_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
 
     let mut cur_f = 0u32;
     let mut cur_b = 0u32;
     for i in 0..n {
         f_head[i] = cur_f;
         b_head[i] = cur_b;
-        let mut f_sum = cur_f;
-        let mut b_sum = cur_b;
-        for t in 0..num_load_threads {
-            thread_f_write[t][i] = f_sum;
-            thread_b_write[t][i] = b_sum;
-            f_sum += deg_results[t].0[i];
-            b_sum += deg_results[t].1[i];
-        }
-        cur_f = f_sum;
-        cur_b = b_sum;
+        f_write[i].store(cur_f, Relaxed);
+        b_write[i].store(cur_b, Relaxed);
+        cur_f += f_deg[i].load(Relaxed);
+        cur_b += b_deg[i].load(Relaxed);
     }
     f_head[n] = cur_f;
     b_head[n] = cur_b;
-    drop(deg_results);
+    drop(f_deg);
+    drop(b_deg);
 
-    // Packed edges: lower 32 bits = dest node, upper 32 bits = weight
+    // Parallel binary scatter into CSR
     let mut f_edges = vec![0u64; m];
     let mut b_edges = vec![0u64; m];
     let f_edges_addr = f_edges.as_mut_ptr() as usize;
     let b_edges_addr = b_edges.as_mut_ptr() as usize;
 
-    // Pass 2: populate forward & backward CSRs in parallel
     std::thread::scope(|s| {
-        for (t, &(start, end)) in edge_chunks.iter().enumerate() {
-            let mut f_write = thread_f_write[t].clone();
-            let mut b_write = thread_b_write[t].clone();
+        for edges in &thread_edges {
+            let f_write_ref = &f_write;
+            let b_write_ref = &b_write;
 
             s.spawn(move || {
-                let g_ptr = g_addr as *const u8;
                 let f_raw = f_edges_addr as *mut u64;
                 let b_raw = b_edges_addr as *mut u64;
-                let mut pos = start;
-                while pos < end {
-                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
-                    pos += 1;
-                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
-                    pos += 1;
-                    let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
-                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
-                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
+                for e in edges {
+                    let u = e.u as usize;
+                    let v = e.v as usize;
+                    let w = e.w;
 
                     let packed_f = (v as u64) | (w << 32);
                     let packed_b = (u as u64) | (w << 32);
 
                     if u < n {
-                        let idx = unsafe { *f_write.get_unchecked(u) };
-                        unsafe {
-                            *f_raw.add(idx as usize) = packed_f;
-                            *f_write.get_unchecked_mut(u) += 1;
-                        }
+                        let idx = f_write_ref[u].fetch_add(1, Relaxed);
+                        unsafe { *f_raw.add(idx as usize) = packed_f; }
                     }
                     if v < n {
-                        let idx = unsafe { *b_write.get_unchecked(v) };
-                        unsafe {
-                            *b_raw.add(idx as usize) = packed_b;
-                            *b_write.get_unchecked_mut(v) += 1;
-                        }
+                        let idx = b_write_ref[v].fetch_add(1, Relaxed);
+                        unsafe { *b_raw.add(idx as usize) = packed_b; }
                     }
                 }
             });
         }
     });
 
-    drop(thread_f_write);
-    drop(thread_b_write);
-    unsafe { munmap(g_ptr, g_len); }
+    drop(thread_edges);
+    drop(f_write);
+    drop(b_write);
 
     // 2. Parse queries
     let q_file = File::open(&queries_path).expect("failed to open queries.txt");
@@ -323,11 +324,6 @@ fn main() {
     unsafe { munmap(q_ptr, q_len); }
 
     let num_queries = queries.len();
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .min(8);
-
     let mut results: Vec<i64> = vec![-1; num_queries];
     let query_cursor = std::sync::atomic::AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
@@ -427,11 +423,6 @@ fn main() {
                                         }
                                         unsafe { *df.get_unchecked_mut(v_idx) = new_dist; }
                                         qf.push(new_dist, v);
-                                        let db_v = unsafe { *db.get_unchecked(v_idx) };
-                                        if db_v != u64::MAX {
-                                            let cand = new_dist + db_v;
-                                            if cand < best { best = cand; }
-                                        }
                                     }
                                 }
                             } else {
@@ -461,11 +452,6 @@ fn main() {
                                         }
                                         unsafe { *db.get_unchecked_mut(v_idx) = new_dist; }
                                         qb.push(new_dist, v);
-                                        let df_v = unsafe { *df.get_unchecked(v_idx) };
-                                        if df_v != u64::MAX {
-                                            let cand = new_dist + df_v;
-                                            if cand < best { best = cand; }
-                                        }
                                     }
                                 }
                             }

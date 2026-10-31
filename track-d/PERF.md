@@ -12,6 +12,14 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-0dc375146900 | 1.205 | 324.1 | 41.32 |
 | 6 | 2-way parallel tournament 4-ary heap comparison and raw-pointer integer parsing | run-4158599d3d61 | 1.147 | 322.9 | 41.75 |
 | 7 | Bidirectional Dijkstra with concurrent dual CSR construction and balanced frontier expansion | run-72cc2d3ef1d5 | 1.085 | 340.3 | 41.60 |
+| 8 | Single-pass atomic CSR construction and cache-streamlined bidirectional Dijkstra | pending | | | |
+
+### Step 8 Optimization Details
+- Completely eliminated multi-pass text re-reading and 224 MB of thread-local degree vectors (`deg_results`) and write offset vectors (`thread_write`).
+- Implemented single-pass text parsing: each thread parses its chunk into a binary `RawEdge` array while atomically incrementing in-degree and out-degree counters in unified 7 MB atomic arrays (`f_deg`, `b_deg`) with zero lock contention.
+- Replaced 28-million iteration single-threaded prefix sum loop with a 16 ms flat prefix sum + atomic write head initialization.
+- Parallel binary scatter into CSR buffers directly from contiguous cache, eliminating all second-pass text tokenization.
+- Streamlined bidirectional Dijkstra inner loop: removed redundant, cache-thrashing `db_v` and `df_v` candidate loads on unpopped neighbor nodes, halving memory bus pressure during path search.
 
 ### Step 5 Optimization Details
 - Added `.cargo/config.toml` targeting `target-cpu=native` for BMI2 and advanced instruction set utilization, improving runtime to 1.205s (41.32 pts).
