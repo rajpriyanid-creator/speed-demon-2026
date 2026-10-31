@@ -225,28 +225,6 @@ fn main() {
     drop(f_write);
     unsafe { munmap(g_ptr, g_len); }
 
-    // Sort edges by weight in parallel
-    std::thread::scope(|s| {
-        let chunk_size = (n + 7) / 8;
-        let f_head_ref = &f_head;
-        let f_edges_ptr = f_edges.as_mut_ptr() as usize;
-        for chunk_idx in 0..8 {
-            let u_start = chunk_idx * chunk_size;
-            let u_end = (u_start + chunk_size).min(n);
-            s.spawn(move || {
-                let f_raw = f_edges_ptr as *mut u64;
-                for u in u_start..u_end {
-                    let fs = unsafe { *f_head_ref.get_unchecked(u) } as usize;
-                    let fe = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
-                    if fe > fs + 1 {
-                        let slice = unsafe { std::slice::from_raw_parts_mut(f_raw.add(fs), fe - fs) };
-                        slice.sort_unstable_by_key(|&e| e >> 32);
-                    }
-                }
-            });
-        }
-    });
-
     // 2. Parse queries
     let q_file = match File::open(&queries_path) {
         Ok(f) => f,
@@ -282,7 +260,7 @@ fn main() {
     let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
-    let q_threads = 4;
+    let q_threads = 10;
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
         let f_edges_ref = &f_edges;
@@ -358,29 +336,27 @@ fn main() {
         Err(_) => return,
     };
     let mut out_buf: Vec<u8> = Vec::with_capacity(32 * 1024);
-    for res in results {
-        if res == -1 {
+    for dist in results {
+        let mut d = dist;
+        if d == -1 {
             out_buf.extend_from_slice(b"-1\n");
+        } else if d == 0 {
+            out_buf.extend_from_slice(b"0\n");
         } else {
-            let mut n = res as u64;
-            if n == 0 {
-                out_buf.push(b'0');
-            } else {
-                let mut digits = [0u8; 20];
-                let mut dig_i = 0;
-                while n > 0 {
-                    digits[dig_i] = b'0' + (n % 10) as u8;
-                    n /= 10;
-                    dig_i += 1;
-                }
-                while dig_i > 0 {
-                    dig_i -= 1;
-                    out_buf.push(digits[dig_i]);
-                }
+            let mut num_buf = [0u8; 20];
+            let mut i = 0;
+            while d > 0 {
+                num_buf[i] = b'0' + (d % 10) as u8;
+                d /= 10;
+                i += 1;
+            }
+            while i > 0 {
+                i -= 1;
+                out_buf.push(num_buf[i]);
             }
             out_buf.push(b'\n');
         }
-        if out_buf.len() > 24 * 1024 {
+        if out_buf.len() >= 32 * 1024 {
             let _ = out_file.write_all(&out_buf);
             out_buf.clear();
         }

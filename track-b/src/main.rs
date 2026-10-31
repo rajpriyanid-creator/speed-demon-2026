@@ -496,7 +496,7 @@ fn main() {
     }
     block_byte_boundaries[NUM_BLOCKS] = n;
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
 
     let mut block_offsets: [Vec<u32>; NUM_BLOCKS] = [
         vec![0u32; (num_terms as usize) + 1],
@@ -517,7 +517,7 @@ fn main() {
 
     // Pre-allocate persistent thread buffers for ONE-PASS indexing
     let mut thread_postings: Vec<Vec<u64>> = (0..num_threads)
-        .map(|_| Vec::with_capacity(600_000))
+        .map(|_| Vec::with_capacity(150_000))
         .collect();
     let mut thread_counts: Vec<Vec<u32>> = (0..num_threads)
         .map(|_| vec![0u32; num_terms as usize])

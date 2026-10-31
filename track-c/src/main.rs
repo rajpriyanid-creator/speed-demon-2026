@@ -8,7 +8,6 @@ use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -220,7 +219,7 @@ fn main() {
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(8);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -247,12 +246,11 @@ fn main() {
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
                 let mut local_crcs: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::with_capacity(512))
+                    .map(|_| Vec::new())
                     .collect();
 
                 let p = data.as_ptr();
                 let mut pos = start;
-                let mut last_madv_pos = start;
 
                 while pos < end {
                     unsafe {
@@ -418,18 +416,6 @@ fn main() {
                         agg.note_bytes += note_len;
 
                         local_crcs[c_id as usize].push(name_crc);
-
-                        if pos - last_madv_pos >= 2 * 1024 * 1024 {
-                            let madv_len = (pos - last_madv_pos) & !4095;
-                            madvise(p.add(last_madv_pos) as *mut _, madv_len, 4);
-                            last_madv_pos += madv_len;
-                        }
-                    }
-                }
-
-                unsafe {
-                    if end > last_madv_pos {
-                        madvise(p.add(last_madv_pos) as *mut _, end - last_madv_pos, 4);
                     }
                 }
 
