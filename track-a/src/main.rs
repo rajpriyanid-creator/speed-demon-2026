@@ -2,6 +2,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::_mm_crc32_u64;
+
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
 const NUM_HOURS: usize = 72;
@@ -9,6 +12,7 @@ const NUM_HOURS: usize = 72;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 fn hour_to_string(hour_id: usize) -> [u8; 20] {
@@ -70,6 +74,26 @@ fn find_space_swar(w: u64) -> Option<usize> {
     } else {
         None
     }
+}
+
+#[inline(always)]
+unsafe fn hash_endpoint(cptr: *const u8, ep_start: usize) -> (usize, u64) {
+    let mut curr = ep_start;
+    let mut crc = 0u64;
+    loop {
+        let w = (cptr.add(curr) as *const u64).read_unaligned();
+        if let Some(off) = find_space_swar(w) {
+            let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
+            crc = _mm_crc32_u64(crc, w & rem_mask);
+            curr += off;
+            break;
+        } else {
+            crc = _mm_crc32_u64(crc, w);
+            curr += 8;
+        }
+    }
+    let ep_len = (curr - ep_start) as u64;
+    (curr, _mm_crc32_u64(crc, ep_len))
 }
 
 struct FastCatalog<'a> {
@@ -140,6 +164,9 @@ impl<'a> FastCatalog<'a> {
 }
 
 fn main() {
+    unsafe {
+        mallopt(-8, 2);
+    }
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
     let args: Vec<String> = std::env::args().collect();
@@ -191,8 +218,8 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Phase 1: Micro-scan endpoint discovery on first 10MB
-    let mut discovery_len = 10_000_000.min(len);
+    // Phase 1: Micro-scan endpoint discovery on first 6MB
+    let mut discovery_len = 5_800_000.min(len);
     while discovery_len < len && data[discovery_len] != b'\n' { discovery_len += 1; }
     if discovery_len < len { discovery_len += 1; }
     let mut disc_boundaries = Vec::with_capacity(num_threads + 1);
@@ -214,7 +241,7 @@ fn main() {
             let chunk = &data[start..end];
 
             handles.push(s.spawn(move || {
-                let mut cat = FastCatalog::new(4096);
+                let mut cat = FastCatalog::new(8192);
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
                 let mut pos = 0;
@@ -238,23 +265,7 @@ fn main() {
                         }
                     };
 
-                    let mut curr = ep_start;
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    loop {
-                        let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
-                        if let Some(off) = find_space_swar(w) {
-                            let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                            h = (h ^ (w & rem_mask)).wrapping_mul(0x100000001b3);
-                            curr += off;
-                            break;
-                        } else {
-                            h = (h ^ w).wrapping_mul(0x100000001b3);
-                            curr += 8;
-                        }
-                    }
-                    let ep_end = curr;
-                    let ep_len = (ep_end - ep_start) as u64;
-                    let h_combined = h ^ (ep_len.rotate_left(56));
+                    let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
                     cat.get_or_insert(&chunk[ep_start..ep_end], h_combined);
 
                     let mut idx = ep_end + 5;
@@ -268,7 +279,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
     });
 
-    let mut global_cat = FastCatalog::new(4096);
+    let mut global_cat = FastCatalog::new(8192);
     for cat in &thread_catalogs {
         for (&ep, &h) in cat.endpoints.iter().zip(cat.hashes.iter()) {
             global_cat.get_or_insert(ep, h);
@@ -286,7 +297,7 @@ fn main() {
         .collect();
     sorted_endpoints.sort_unstable_by(|a, b| a.1.cmp(b.1));
 
-    let mut lookup_table = FastCatalog::new(4096);
+    let mut lookup_table = FastCatalog::new(8192);
     for (sorted_id, &(_, _, h)) in sorted_endpoints.iter().enumerate() {
         lookup_table.insert_mapping(h, sorted_id as u16);
     }
@@ -338,23 +349,7 @@ fn main() {
                         }
                     };
 
-                    let mut curr = ep_start;
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    loop {
-                        let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
-                        if let Some(off) = find_space_swar(w) {
-                            let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                            h = (h ^ (w & rem_mask)).wrapping_mul(0x100000001b3);
-                            curr += off;
-                            break;
-                        } else {
-                            h = (h ^ w).wrapping_mul(0x100000001b3);
-                            curr += 8;
-                        }
-                    }
-                    let ep_end = curr;
-                    let ep_len = (ep_end - ep_start) as u64;
-                    let h_combined = h ^ (ep_len.rotate_left(56));
+                    let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
 
                     let sorted_ep = lookup_ref.lookup(h_combined) as usize;
                     let g_id = (hour_id * num_endpoints + sorted_ep) as u64;

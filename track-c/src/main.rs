@@ -8,6 +8,7 @@ const MAP_SHARED: i32 = 1;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 #[inline(always)]
@@ -148,6 +149,9 @@ fn write_u64(mut n: u64, out: &mut Vec<u8>) {
 }
 
 fn main() {
+    unsafe {
+        mallopt(-8, 2);
+    }
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
     let args: Vec<String> = std::env::args().collect();
@@ -295,8 +299,7 @@ fn main() {
     boundaries[num_threads] = len;
 
     // 3. Fast parallel records parse with SWAR quote & delimiter jumping and hardware CRC32
-    // Storing u32 CRC with length seed per country achieves ~11.8MB target memory
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u64>, Vec<(u32, u32)>);
     let thread_outputs: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -306,9 +309,8 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_names_by_country: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::with_capacity(2048))
-                    .collect();
+                let est_records = (end - start) / 54 + 4096;
+                let mut local_names: Vec<u64> = Vec::with_capacity(est_records);
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -479,16 +481,24 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        local_names_by_country[c_id as usize].push(name_crc);
+                        let packed = ((c_id as u64) << 32) | (name_crc as u64);
+                        local_names.push(packed);
                     }
                 }
 
-                for list in &mut local_names_by_country {
-                    list.sort_unstable();
-                    list.dedup();
+                local_names.sort_unstable();
+                local_names.dedup();
+
+                let mut offsets = vec![(0u32, 0u32); num_countries];
+                let mut cur_idx = 0;
+                for c_id in 0..num_countries {
+                    let target_prefix = ((c_id as u64) + 1) << 32;
+                    let next_idx = local_names[cur_idx..].partition_point(|&x| x < target_prefix) + cur_idx;
+                    offsets[c_id] = (cur_idx as u32, next_idx as u32);
+                    cur_idx = next_idx;
                 }
 
-                (local_aggs, local_names_by_country)
+                (local_aggs, local_names, offsets)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -498,7 +508,7 @@ fn main() {
 
     // Merge scalar aggregates
     let mut country_aggs = vec![CountryScalarAgg::default(); num_countries];
-    for (thread_agg, _) in &thread_outputs {
+    for (thread_agg, _, _) in &thread_outputs {
         for c_id in 0..num_countries {
             let t = &thread_agg[c_id];
             if t.count == 0 { continue; }
@@ -528,9 +538,10 @@ fn main() {
                 for c_id in start..end {
                     let mut has_any = false;
                     for t in 0..num_threads {
-                        cursors[t] = 0;
-                        ends[t] = thread_outputs_ref[t].1[c_id].len();
-                        if ends[t] > 0 { has_any = true; }
+                        let (s_off, e_off) = thread_outputs_ref[t].2[c_id];
+                        cursors[t] = s_off as usize;
+                        ends[t] = e_off as usize;
+                        if s_off < e_off { has_any = true; }
                     }
                     if !has_any {
                         local_distincts.push(0);
@@ -545,7 +556,7 @@ fn main() {
                         for t in 0..num_threads {
                             let cur = cursors[t];
                             if cur < ends[t] {
-                                let val = unsafe { *thread_outputs_ref[t].1[c_id].get_unchecked(cur) };
+                                let val = unsafe { *thread_outputs_ref[t].1.get_unchecked(cur) } as u32;
                                 if val < min_val {
                                     min_val = val;
                                     min_t = t;
@@ -562,7 +573,7 @@ fn main() {
                         // Advance all cursors matching min_val
                         for t in 0..num_threads {
                             let cur = cursors[t];
-                            if cur < ends[t] && unsafe { *thread_outputs_ref[t].1[c_id].get_unchecked(cur) } == min_val {
+                            if cur < ends[t] && (unsafe { *thread_outputs_ref[t].1.get_unchecked(cur) } as u32) == min_val {
                                 cursors[t] = cur + 1;
                             }
                         }
