@@ -13,23 +13,6 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
-#[inline(always)]
-fn parse_hour_id(line: &[u8]) -> usize {
-    if line.len() < 13 {
-        return 0;
-    }
-    let p = line.as_ptr();
-    let day = unsafe { (*p.add(8) - b'0') as usize * 10 + (*p.add(9) - b'0') as usize };
-    let hr = unsafe { (*p.add(11) - b'0') as usize * 10 + (*p.add(12) - b'0') as usize };
-    let day_offset = match day {
-        30 => 0,
-        31 => 24,
-        1 => 48,
-        _ => 72,
-    };
-    day_offset + hr - 18
-}
-
 fn hour_to_string(hour_id: usize) -> [u8; 20] {
     let mut s = [0u8; 20];
     let total_hr = hour_id + 18;
@@ -198,60 +181,57 @@ fn main() {
 
                 let mut pos = 0;
                 let chunk_len = chunk.len();
-                while pos < chunk_len {
-                    let line_len = match chunk[pos..].iter().position(|&b| b == b'\n') {
-                        Some(p) => p,
-                        None => chunk_len - pos,
+                let cptr = chunk.as_ptr();
+
+                while pos + 35 <= chunk_len {
+                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
+                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
+                    let day_offset = match day {
+                        30 => 0,
+                        31 => 24,
+                        1 => 48,
+                        _ => 72,
                     };
-                    let line = &chunk[pos..pos + line_len];
-                    pos += line_len + 1;
+                    let hour_id = day_offset + hr - 18;
 
-                    if line.len() < 35 {
-                        continue;
-                    }
-
-                    let hour_id = parse_hour_id(line);
-                    let lptr = line.as_ptr();
-                    let llen = line.len();
-
-                    let m_byte = unsafe { *lptr.add(28) };
+                    let m_byte = unsafe { *cptr.add(pos + 28) };
                     let ep_start = match m_byte {
-                        b'G' => 32,
-                        b'P' => match unsafe { *lptr.add(29) } {
-                            b'O' => 33,
-                            b'U' => 32,
-                            _ => 34,
+                        b'G' => pos + 32,
+                        b'P' => match unsafe { *cptr.add(pos + 29) } {
+                            b'O' => pos + 33,
+                            b'U' => pos + 32,
+                            _ => pos + 34,
                         },
-                        b'D' => 35,
-                        b'H' => 33,
-                        b'O' => 36,
+                        b'D' => pos + 35,
+                        b'H' => pos + 33,
+                        b'O' => pos + 36,
                         _ => {
-                            let mut idx = 28;
-                            while idx < llen && unsafe { *lptr.add(idx) } != b' ' { idx += 1; }
+                            let mut idx = pos + 28;
+                            while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
                             idx + 1
                         }
                     };
 
                     let mut h: u64 = 0xcbf29ce484222325;
                     let mut ep_end = ep_start;
-                    while ep_end < llen {
-                        let b = unsafe { *lptr.add(ep_end) };
+                    while ep_end < chunk_len {
+                        let b = unsafe { *cptr.add(ep_end) };
                         if b == b' ' { break; }
                         h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
                         ep_end += 1;
                     }
-                    if ep_end >= llen {
-                        continue;
+                    if ep_end >= chunk_len {
+                        break;
                     }
 
-                    let ep_id = catalog.get_or_insert_with_hash(&line[ep_start..ep_end], h);
+                    let ep_id = catalog.get_or_insert_with_hash(&chunk[ep_start..ep_end], h);
 
-                    let is_error = unsafe { *lptr.add(ep_end + 1) } == b'5';
+                    let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
                     let mut idx = ep_end + 5;
 
                     let mut latency: u32 = 0;
-                    while idx < llen {
-                        let b = unsafe { *lptr.add(idx) };
+                    while idx < chunk_len {
+                        let b = unsafe { *cptr.add(idx) };
                         if b >= b'0' && b <= b'9' {
                             latency = latency * 10 + (b - b'0') as u32;
                             idx += 1;
@@ -263,6 +243,10 @@ fn main() {
                     let local_group_id = (hour_id * MAX_LOCAL_EPS + ep_id as usize) as u64;
                     let packed = local_group_id | ((is_error as u64) << 20) | ((latency as u64) << 32);
                     records.push(packed);
+
+                    if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
+                    if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
+                    pos = idx;
                 }
 
                 ThreadOutput { catalog, records }

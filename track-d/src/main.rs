@@ -297,85 +297,87 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(8)
         .min(12);
-    let chunk_size = (num_queries + num_threads - 1) / num_threads;
 
     let mut results: Vec<i64> = vec![-1; num_queries];
+    let query_cursor = std::sync::atomic::AtomicUsize::new(0);
+    let results_ptr = results.as_mut_ptr() as usize;
 
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
         let f_edges_ref = &f_edges;
+        let query_cursor_ref = &query_cursor;
+        let queries_ref = &queries;
 
-        let mut chunks: Vec<&mut [i64]> = Vec::new();
-        let mut rest = results.as_mut_slice();
         for _ in 0..num_threads {
-            let take = chunk_size.min(rest.len());
-            let (head_slice, tail_slice) = rest.split_at_mut(take);
-            chunks.push(head_slice);
-            rest = tail_slice;
-        }
-
-        for (thread_idx, res_chunk) in chunks.into_iter().enumerate() {
-            let start_q = thread_idx * chunk_size;
-            let query_slice = &queries[start_q..start_q + res_chunk.len()];
-
             s.spawn(move || {
                 let mut q = FastHeap::new(4096);
                 let mut dist: Vec<u64> = vec![u64::MAX; n];
                 let mut visited: Vec<u32> = Vec::with_capacity(4096);
+                let res_raw = results_ptr as *mut i64;
 
-                for (i, &(src, dst)) in query_slice.iter().enumerate() {
-                    if src == dst {
-                        res_chunk[i] = 0;
-                        continue;
+                const BATCH_SIZE: usize = 16;
+                loop {
+                    let start_idx = query_cursor_ref.fetch_add(BATCH_SIZE, std::sync::atomic::Ordering::Relaxed);
+                    if start_idx >= num_queries {
+                        break;
                     }
-                    let s_idx = src as usize;
-                    let t_idx = dst as usize;
-                    if s_idx >= n || t_idx >= n {
-                        res_chunk[i] = -1;
-                        continue;
-                    }
+                    let end_idx = (start_idx + BATCH_SIZE).min(num_queries);
 
-                    // Reset visited nodes from previous query
-                    for &node in &visited {
-                        unsafe { *dist.get_unchecked_mut(node as usize) = u64::MAX; }
-                    }
-                    visited.clear();
-                    q.clear();
-
-                    unsafe { *dist.get_unchecked_mut(s_idx) = 0; }
-                    visited.push(src);
-                    q.push(0, src);
-
-                    let mut found = -1i64;
-                    while let Some((curr_cost, curr_node)) = q.pop() {
-                        if curr_cost > unsafe { *dist.get_unchecked(curr_node as usize) } {
+                    for q_idx in start_idx..end_idx {
+                        let (src, dst) = unsafe { *queries_ref.get_unchecked(q_idx) };
+                        if src == dst {
+                            unsafe { *res_raw.add(q_idx) = 0; }
                             continue;
                         }
-                        if curr_node == dst {
-                            found = curr_cost as i64;
-                            break;
+                        let s_idx = src as usize;
+                        let t_idx = dst as usize;
+                        if s_idx >= n || t_idx >= n {
+                            unsafe { *res_raw.add(q_idx) = -1; }
+                            continue;
                         }
-                        let u = curr_node as usize;
-                        let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
-                        let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
 
-                        for edge_idx in e_start..e_end {
-                            let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
-                            let v = (packed & 0xFFFF_FFFF) as u32;
-                            let w = packed >> 32;
-                            let new_dist = curr_cost + w;
-                            let v_idx = v as usize;
+                        // Reset visited nodes from previous query
+                        for &node in &visited {
+                            unsafe { *dist.get_unchecked_mut(node as usize) = u64::MAX; }
+                        }
+                        visited.clear();
+                        q.clear();
 
-                            if new_dist < unsafe { *dist.get_unchecked(v_idx) } {
-                                if unsafe { *dist.get_unchecked(v_idx) } == u64::MAX {
-                                    visited.push(v);
+                        unsafe { *dist.get_unchecked_mut(s_idx) = 0; }
+                        visited.push(src);
+                        q.push(0, src);
+
+                        let mut found = -1i64;
+                        while let Some((curr_cost, curr_node)) = q.pop() {
+                            if curr_cost > unsafe { *dist.get_unchecked(curr_node as usize) } {
+                                continue;
+                            }
+                            if curr_node == dst {
+                                found = curr_cost as i64;
+                                break;
+                            }
+                            let u = curr_node as usize;
+                            let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
+                            let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
+
+                            for edge_idx in e_start..e_end {
+                                let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
+                                let v = (packed & 0xFFFF_FFFF) as u32;
+                                let w = packed >> 32;
+                                let new_dist = curr_cost + w;
+                                let v_idx = v as usize;
+
+                                if new_dist < unsafe { *dist.get_unchecked(v_idx) } {
+                                    if unsafe { *dist.get_unchecked(v_idx) } == u64::MAX {
+                                        visited.push(v);
+                                    }
+                                    unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
+                                    q.push(new_dist, v);
                                 }
-                                unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
-                                q.push(new_dist, v);
                             }
                         }
+                        unsafe { *res_raw.add(q_idx) = found; }
                     }
-                    res_chunk[i] = found;
                 }
             });
         }
