@@ -540,19 +540,17 @@ fn main() {
             cur_base += cnt;
         }
 
-        // Single-Pass Parse: Parse tokens, record unique postings per doc, and accumulate term counts
-        let thread_data: Vec<(Vec<u64>, Vec<u32>)> = std::thread::scope(|s| {
+        // PASS 1: Count unique postings per term per thread (ZERO records vector!)
+        let thread_counts: Vec<Vec<u32>> = std::thread::scope(|s| {
             let handles: Vec<_> = sub_chunks.iter().enumerate().map(|(t, &(sb, eb))| {
                 let dict_ref = &dict;
                 let chunk = &docs_data[sb..eb];
                 let base_doc = sub_base_doc[t];
-                let thread_base_loc = (base_doc % BLOCK_CAP) as u16;
 
                 s.spawn(move || {
                     let raw_starts = doc_starts_ptr as *mut u32;
                     let raw_lens = doc_lens_ptr as *mut u32;
 
-                    let mut local_records: Vec<u64> = Vec::with_capacity(500_000);
                     let mut local_counts = vec![0u32; num_terms as usize];
                     let mut last_seen = vec![u32::MAX; num_terms as usize];
 
@@ -575,6 +573,91 @@ fn main() {
                             *raw_starts.add(doc_id as usize) = (sb + text_start_rel) as u32;
                             *raw_lens.add(doc_id as usize) = text_len as u32;
                         }
+
+                        let text = &chunk[text_start_rel..text_end_rel];
+                        let mut p = 0;
+                        let tlen = text.len();
+                        while p < tlen {
+                            while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                                p += 1;
+                            }
+                            if p >= tlen { break; }
+                            let tok_start = p;
+                            let mut h = 0x811c9dc5u32;
+                            while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
+                                let b = unsafe { *text.get_unchecked(p) };
+                                h ^= (b | 0x20) as u32;
+                                h = h.wrapping_mul(0x01000193);
+                                p += 1;
+                            }
+                            let tok_len = p - tok_start;
+                            if tok_len <= 23 {
+                                if h == 0 { h = 1; }
+                                if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
+                                    let tid = term_id as usize;
+                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_offset as u32 {
+                                        unsafe { *last_seen.get_unchecked_mut(tid) = doc_offset as u32; }
+                                        unsafe { *local_counts.get_unchecked_mut(tid) += 1; }
+                                    }
+                                }
+                            }
+                        }
+                        doc_offset += 1;
+                    }
+
+                    local_counts
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Compute term offsets and thread write pointers
+        let mut thread_write_ptrs: Vec<Vec<u32>> = (0..num_threads)
+            .map(|_| vec![0u32; num_terms as usize])
+            .collect();
+
+        let mut total_postings = 0u32;
+        for term in 0..(num_terms as usize) {
+            block_offsets[b][term] = total_postings;
+            let mut cur = total_postings;
+            for t in 0..num_threads {
+                thread_write_ptrs[t][term] = cur;
+                cur += thread_counts[t][term];
+            }
+            total_postings = cur;
+        }
+        block_offsets[b][num_terms as usize] = total_postings;
+
+        drop(thread_counts);
+
+        // PASS 2: Write directly to b_postings (ZERO records vector!)
+        let mut b_postings = vec![0u16; total_postings as usize];
+        let base_ptr = b_postings.as_mut_ptr() as usize;
+
+        std::thread::scope(|s| {
+            for (t, &(sb, eb)) in sub_chunks.iter().enumerate() {
+                let dict_ref = &dict;
+                let chunk = &docs_data[sb..eb];
+                let base_doc = sub_base_doc[t];
+                let thread_base_loc = (base_doc % BLOCK_CAP) as u16;
+                let mut write_ptrs = std::mem::take(&mut thread_write_ptrs[t]);
+
+                s.spawn(move || {
+                    let raw_ptr = base_ptr as *mut u16;
+                    let mut last_seen = vec![u32::MAX; num_terms as usize];
+
+                    let mut i = 0;
+                    let clen = chunk.len();
+                    let mut doc_offset = 0u16;
+
+                    while i < clen {
+                        while i < clen && chunk[i] != b'\t' { i += 1; }
+                        if i >= clen { break; }
+                        i += 1;
+                        let text_start_rel = i;
+                        while i < clen && chunk[i] != b'\n' { i += 1; }
+                        let text_end_rel = i;
+                        i += 1;
 
                         let loc_id = thread_base_loc + doc_offset;
                         let text = &chunk[text_start_rel..text_end_rel];
@@ -600,60 +683,20 @@ fn main() {
                                     let tid = term_id as usize;
                                     if unsafe { *last_seen.get_unchecked(tid) } != doc_offset as u32 {
                                         unsafe { *last_seen.get_unchecked_mut(tid) = doc_offset as u32; }
-                                        unsafe { *local_counts.get_unchecked_mut(tid) += 1; }
-                                        local_records.push(((term_id as u64) << 16) | (loc_id as u64));
+                                        let dest = unsafe { *write_ptrs.get_unchecked(tid) };
+                                        unsafe {
+                                            *write_ptrs.get_unchecked_mut(tid) += 1;
+                                            *raw_ptr.add(dest as usize) = loc_id;
+                                        }
                                     }
                                 }
                             }
                         }
                         doc_offset += 1;
                     }
-
-                    (local_records, local_counts)
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        // Compute term offsets and thread write pointers
-        let mut thread_write_ptrs: Vec<Vec<u32>> = (0..num_threads)
-            .map(|_| vec![0u32; num_terms as usize])
-            .collect();
-
-        let mut total_postings = 0u32;
-        for term in 0..(num_terms as usize) {
-            block_offsets[b][term] = total_postings;
-            let mut cur = total_postings;
-            for t in 0..num_threads {
-                thread_write_ptrs[t][term] = cur;
-                cur += thread_data[t].1[term];
-            }
-            total_postings = cur;
-        }
-        block_offsets[b][num_terms as usize] = total_postings;
-
-        // Counting-sort scatter into b_postings (ZERO sort_unstable calls!)
-        let mut b_postings = vec![0u16; total_postings as usize];
-        let base_ptr = b_postings.as_mut_ptr() as usize;
-
-        std::thread::scope(|s| {
-            for (t, (local_records, _)) in thread_data.iter().enumerate() {
-                let mut write_ptrs = thread_write_ptrs[t].clone();
-                s.spawn(move || {
-                    let raw_ptr = base_ptr as *mut u16;
-                    for &entry in local_records {
-                        let term_id = (entry >> 16) as usize;
-                        let loc_id = (entry & 0xFFFF) as u16;
-                        let dest = unsafe { *write_ptrs.get_unchecked(term_id) };
-                        unsafe {
-                            *write_ptrs.get_unchecked_mut(term_id) += 1;
-                            *raw_ptr.add(dest as usize) = loc_id;
-                        }
-                    }
                 });
             }
         });
-
         block_postings[b] = b_postings;
         unsafe {
             madvise(docs_data.as_ptr().add(b_start_byte) as *mut _, b_end_byte - b_start_byte, 4);
