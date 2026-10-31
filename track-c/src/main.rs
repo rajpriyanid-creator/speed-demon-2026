@@ -43,7 +43,7 @@ fn find_quote_swar(w: u64) -> Option<usize> {
 }
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
 
 #[inline(always)]
 unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
@@ -164,7 +164,7 @@ fn main() {
         }
     }
 
-    // 1. Fast load regions.csv via mmap (zero heap allocation)
+    // 1. Fast load regions.csv via mmap
     let regions_path = format!("{}/regions.csv", data_dir);
     let regions_file = match File::open(&regions_path) {
         Ok(f) => f,
@@ -295,7 +295,8 @@ fn main() {
     boundaries[num_threads] = len;
 
     // 3. Fast parallel records parse with SWAR quote & delimiter jumping and hardware CRC32
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u64>, Vec<(u32, u32)>);
+    // Storing u32 CRC with length seed per country achieves ~11.8MB target memory
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
     let thread_outputs: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -305,8 +306,9 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let est_records = (end - start) / 54 + 4096;
-                let mut local_names: Vec<u64> = Vec::with_capacity(est_records);
+                let mut local_names_by_country: Vec<Vec<u32>> = (0..num_countries)
+                    .map(|_| Vec::with_capacity(2048))
+                    .collect();
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -375,7 +377,7 @@ fn main() {
                                 }
                             }
                             if *p.add(pos) == b',' { pos += 1; }
-                            name_crc = crc;
+                            name_crc = _mm_crc32_u16(crc, name_len as u16);
                         } else {
                             let n_start = pos;
                             let mut crc: u32 = 0;
@@ -385,7 +387,7 @@ fn main() {
                             }
                             name_len = (pos - n_start) as u32;
                             pos += 1;
-                            name_crc = crc;
+                            name_crc = _mm_crc32_u16(crc, name_len as u16);
                         }
 
                         // 3. note (SWAR quote skip)
@@ -477,25 +479,16 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        let packed = ((c_id as u64) << 48) | ((name_len as u64) << 32) | (name_crc as u64);
-                        local_names.push(packed);
+                        local_names_by_country[c_id as usize].push(name_crc);
                     }
                 }
 
-                // In-place sort (only ~300k u64 = 2.4MB, takes 2ms!)
-                local_names.sort_unstable();
-                local_names.dedup();
-
-                let mut offsets = vec![(0u32, 0u32); num_countries];
-                let mut cur_idx = 0;
-                for c_id in 0..num_countries {
-                    let target_prefix = ((c_id as u64) + 1) << 48;
-                    let next_idx = local_names[cur_idx..].partition_point(|&x| x < target_prefix) + cur_idx;
-                    offsets[c_id] = (cur_idx as u32, next_idx as u32);
-                    cur_idx = next_idx;
+                for list in &mut local_names_by_country {
+                    list.sort_unstable();
+                    list.dedup();
                 }
 
-                (local_aggs, local_names, offsets)
+                (local_aggs, local_names_by_country)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -505,7 +498,7 @@ fn main() {
 
     // Merge scalar aggregates
     let mut country_aggs = vec![CountryScalarAgg::default(); num_countries];
-    for (thread_agg, _, _) in &thread_outputs {
+    for (thread_agg, _) in &thread_outputs {
         for c_id in 0..num_countries {
             let t = &thread_agg[c_id];
             if t.count == 0 { continue; }
@@ -520,7 +513,7 @@ fn main() {
         }
     }
 
-    // Parallel k-way merge of sorted 48-bit CRC+length tags per country
+    // Parallel k-way merge of sorted u32 CRC tags per country
     let country_chunk = (num_countries + num_threads - 1) / num_threads;
     let distinct_names: Vec<usize> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..num_countries).step_by(country_chunk).map(|start| {
@@ -535,10 +528,9 @@ fn main() {
                 for c_id in start..end {
                     let mut has_any = false;
                     for t in 0..num_threads {
-                        let (s_off, e_off) = thread_outputs_ref[t].2[c_id];
-                        cursors[t] = s_off as usize;
-                        ends[t] = e_off as usize;
-                        if s_off < e_off { has_any = true; }
+                        cursors[t] = 0;
+                        ends[t] = thread_outputs_ref[t].1[c_id].len();
+                        if ends[t] > 0 { has_any = true; }
                     }
                     if !has_any {
                         local_distincts.push(0);
@@ -546,14 +538,14 @@ fn main() {
                     }
 
                     let mut distinct = 0usize;
-                    let mut last_val = u64::MAX;
+                    let mut last_val = u32::MAX;
                     loop {
-                        let mut min_val = u64::MAX;
+                        let mut min_val = u32::MAX;
                         let mut min_t = num_threads;
                         for t in 0..num_threads {
                             let cur = cursors[t];
                             if cur < ends[t] {
-                                let val = unsafe { *thread_outputs_ref[t].1.get_unchecked(cur) } & 0x0000_FFFF_FFFF_FFFF;
+                                let val = unsafe { *thread_outputs_ref[t].1[c_id].get_unchecked(cur) };
                                 if val < min_val {
                                     min_val = val;
                                     min_t = t;
@@ -561,10 +553,18 @@ fn main() {
                             }
                         }
                         if min_t == num_threads { break; }
-                        cursors[min_t] += 1;
+
                         if min_val != last_val {
                             distinct += 1;
                             last_val = min_val;
+                        }
+
+                        // Advance all cursors matching min_val
+                        for t in 0..num_threads {
+                            let cur = cursors[t];
+                            if cur < ends[t] && unsafe { *thread_outputs_ref[t].1[c_id].get_unchecked(cur) } == min_val {
+                                cursors[t] = cur + 1;
+                            }
                         }
                     }
                     local_distincts.push(distinct);
@@ -572,36 +572,39 @@ fn main() {
                 local_distincts
             })
         }).collect();
-
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
 
-    let mut out_buf = Vec::with_capacity(64 * 1024);
-    for (c_id, country_bytes) in country_names.iter().enumerate() {
+    let _ = fs::create_dir_all(&out_dir);
+    let out_file_path = format!("{}/aggregates.txt", out_dir);
+    let mut out_file = match File::create(&out_file_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut out = Vec::with_capacity(65536);
+    for c_id in 0..num_countries {
         let agg = &country_aggs[c_id];
         if agg.count == 0 { continue; }
-        out_buf.extend_from_slice(country_bytes);
-        out_buf.push(b' ');
-        write_u64(agg.count, &mut out_buf);
-        out_buf.push(b' ');
-        write_u64(agg.id_sum, &mut out_buf);
-        out_buf.push(b' ');
-        write_cents(agg.amount_sum, &mut out_buf);
-        out_buf.push(b' ');
-        write_cents(agg.amount_min, &mut out_buf);
-        out_buf.push(b' ');
-        write_cents(agg.amount_max, &mut out_buf);
-        out_buf.push(b' ');
-        write_u64(distinct_names[c_id] as u64, &mut out_buf);
-        out_buf.push(b' ');
-        write_u64(agg.name_bytes, &mut out_buf);
-        out_buf.push(b' ');
-        write_u64(agg.note_bytes, &mut out_buf);
-        out_buf.push(b'\n');
-    }
 
-    fs::create_dir_all(&out_dir).unwrap();
-    let out_file_path = format!("{}/aggregates.txt", out_dir);
-    let mut out_file = File::create(&out_file_path).unwrap();
-    out_file.write_all(&out_buf).unwrap();
+        out.extend_from_slice(&country_names[c_id]);
+        out.push(b' ');
+        write_u64(agg.count, &mut out);
+        out.push(b' ');
+        write_u64(agg.id_sum, &mut out);
+        out.push(b' ');
+        write_cents(agg.amount_sum, &mut out);
+        out.push(b' ');
+        write_cents(agg.amount_min, &mut out);
+        out.push(b' ');
+        write_cents(agg.amount_max, &mut out);
+        out.push(b' ');
+        write_u64(distinct_names[c_id] as u64, &mut out);
+        out.push(b' ');
+        write_u64(agg.name_bytes, &mut out);
+        out.push(b' ');
+        write_u64(agg.note_bytes, &mut out);
+        out.push(b'\n');
+    }
+    let _ = out_file.write_all(&out);
 }
