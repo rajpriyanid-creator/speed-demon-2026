@@ -44,54 +44,22 @@ fn main() {
         }
     }
 
-    // 1. Fast load regions.csv and catalog countries
+    // 1. Fast single-pass load regions.csv and catalog countries
     let regions_path = format!("{}/regions.csv", data_dir);
     let regions_data = match fs::read(&regions_path) {
         Ok(b) => b,
         Err(_) => return,
     };
 
-    let mut country_set = std::collections::BTreeSet::new();
+    let mut seen = [false; 17576];
+    let mut region_to_code: Vec<u16> = vec![u16::MAX; 1_000_000];
+
     let mut pos = 0;
     while pos < regions_data.len() && regions_data[pos] != b'\n' {
         pos += 1;
     }
     if pos < regions_data.len() { pos += 1; }
-    let header_end = pos;
 
-    while pos < regions_data.len() {
-        while pos < regions_data.len() && regions_data[pos] != b',' {
-            pos += 1;
-        }
-        if pos >= regions_data.len() { break; }
-        pos += 1; // skip comma
-        let c_start = pos;
-        while pos < regions_data.len() && regions_data[pos] != b'\r' && regions_data[pos] != b'\n' {
-            pos += 1;
-        }
-        let c_end = pos;
-        country_set.insert(&regions_data[c_start..c_end]);
-        if pos < regions_data.len() && regions_data[pos] == b'\r' { pos += 1; }
-        if pos < regions_data.len() && regions_data[pos] == b'\n' { pos += 1; }
-    }
-
-    let mut country_names: Vec<&[u8]> = country_set.into_iter().collect();
-    let unmatched_id = country_names.len() as u16;
-    country_names.push(b"_UNMATCHED");
-    let num_countries = country_names.len();
-
-    // Direct lookup map for 3-letter uppercase country codes (26^3 = 17576)
-    let mut code_map = [unmatched_id; 17576];
-    for (c_id, &c_bytes) in country_names[..unmatched_id as usize].iter().enumerate() {
-        if c_bytes.len() == 3 && c_bytes[0] >= b'A' && c_bytes[0] <= b'Z' && c_bytes[1] >= b'A' && c_bytes[1] <= b'Z' && c_bytes[2] >= b'A' && c_bytes[2] <= b'Z' {
-            let idx = ((c_bytes[0] - b'A') as usize) * 676 + ((c_bytes[1] - b'A') as usize) * 26 + ((c_bytes[2] - b'A') as usize);
-            code_map[idx] = c_id as u16;
-        }
-    }
-
-    // Pass 2: fill region_to_country_id
-    let mut region_to_country: Vec<u16> = vec![unmatched_id; 1_000_000];
-    pos = header_end;
     while pos < regions_data.len() {
         let mut rid = 0usize;
         while pos < regions_data.len() && regions_data[pos] != b',' {
@@ -103,23 +71,46 @@ fn main() {
         }
         if pos >= regions_data.len() { break; }
         pos += 1; // skip comma
-        let c_start = pos;
-        while pos < regions_data.len() && regions_data[pos] != b'\r' && regions_data[pos] != b'\n' {
+        let b0 = regions_data[pos];
+        let b1 = regions_data[pos + 1];
+        let b2 = regions_data[pos + 2];
+        pos += 3;
+        while pos < regions_data.len() && regions_data[pos] != b'\n' {
             pos += 1;
         }
-        let c_end = pos;
-        let c_len = c_end - c_start;
-        let c_id = if c_len == 3 && regions_data[c_start] >= b'A' && regions_data[c_start] <= b'Z' && regions_data[c_start + 1] >= b'A' && regions_data[c_start + 1] <= b'Z' && regions_data[c_start + 2] >= b'A' && regions_data[c_start + 2] <= b'Z' {
-            let idx = ((regions_data[c_start] - b'A') as usize) * 676 + ((regions_data[c_start + 1] - b'A') as usize) * 26 + ((regions_data[c_start + 2] - b'A') as usize);
-            code_map[idx]
-        } else {
-            unmatched_id
-        };
-        if rid < 1_000_000 {
-            region_to_country[rid] = c_id;
+        if pos < regions_data.len() { pos += 1; }
+
+        if b0 >= b'A' && b0 <= b'Z' && b1 >= b'A' && b1 <= b'Z' && b2 >= b'A' && b2 <= b'Z' {
+            let code = ((b0 - b'A') as u16) * 676 + ((b1 - b'A') as u16) * 26 + ((b2 - b'A') as u16);
+            seen[code as usize] = true;
+            if rid < 1_000_000 {
+                region_to_code[rid] = code;
+            }
         }
-        if pos < regions_data.len() && regions_data[pos] == b'\r' { pos += 1; }
-        if pos < regions_data.len() && regions_data[pos] == b'\n' { pos += 1; }
+    }
+
+    let mut country_names: Vec<Vec<u8>> = Vec::with_capacity(300);
+    let mut code_map = [u16::MAX; 17576];
+    for idx in 0..17576 {
+        if seen[idx] {
+            let c0 = b'A' + (idx / 676) as u8;
+            let c1 = b'A' + ((idx / 26) % 26) as u8;
+            let c2 = b'A' + (idx % 26) as u8;
+            let c_id = country_names.len() as u16;
+            country_names.push(vec![c0, c1, c2]);
+            code_map[idx] = c_id;
+        }
+    }
+    let unmatched_id = country_names.len() as u16;
+    country_names.push(b"_UNMATCHED".to_vec());
+    let num_countries = country_names.len();
+
+    let mut region_to_country: Vec<u16> = vec![unmatched_id; 1_000_000];
+    for rid in 0..1_000_000 {
+        let code = region_to_code[rid];
+        if code != u16::MAX {
+            region_to_country[rid] = code_map[code as usize];
+        }
     }
 
     // 2. Memory-map records.csv
