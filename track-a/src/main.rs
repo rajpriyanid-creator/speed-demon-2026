@@ -218,74 +218,45 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Phase 1: Micro-scan endpoint discovery on first 6MB
+    // Phase 1: Sequential micro-scan endpoint discovery on first 5.8MB (zero thread overhead)
     let mut discovery_len = 5_800_000.min(len);
     while discovery_len < len && data[discovery_len] != b'\n' { discovery_len += 1; }
     if discovery_len < len { discovery_len += 1; }
-    let mut disc_boundaries = Vec::with_capacity(num_threads + 1);
-    disc_boundaries.push(0);
-    for i in 1..num_threads {
-        let mut pos = (discovery_len * i) / num_threads;
-        while pos < discovery_len && data[pos] != b'\n' { pos += 1; }
-        if pos < discovery_len { pos += 1; }
-        disc_boundaries.push(pos.min(discovery_len));
-    }
-    disc_boundaries.push(discovery_len);
-
-    let thread_catalogs = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for i in 0..num_threads {
-            let start = disc_boundaries[i];
-            let end = disc_boundaries[i + 1];
-            if start >= end { continue; }
-            let chunk = &data[start..end];
-
-            handles.push(s.spawn(move || {
-                let mut cat = FastCatalog::new(8192);
-                let cptr = chunk.as_ptr();
-                let chunk_len = chunk.len();
-                let mut pos = 0;
-
-                while pos + 35 <= chunk_len {
-                    let m_byte = unsafe { *cptr.add(pos + 28) };
-                    let ep_start = match m_byte {
-                        b'G' => pos + 32,
-                        b'P' => match unsafe { *cptr.add(pos + 29) } {
-                            b'O' => pos + 33,
-                            b'U' => pos + 32,
-                            _ => pos + 34,
-                        },
-                        b'D' => pos + 35,
-                        b'H' => pos + 33,
-                        b'O' => pos + 36,
-                        _ => {
-                            let mut idx = pos + 28;
-                            while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
-                            idx + 1
-                        }
-                    };
-
-                    let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
-                    cat.get_or_insert(&chunk[ep_start..ep_end], h_combined);
-
-                    let mut idx = ep_end + 5;
-                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
-                    if idx < chunk_len { idx += 1; }
-                    pos = idx;
-                }
-                cat
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
-    });
 
     let mut global_cat = FastCatalog::new(8192);
-    for cat in &thread_catalogs {
-        for (&ep, &h) in cat.endpoints.iter().zip(cat.hashes.iter()) {
-            global_cat.get_or_insert(ep, h);
+    {
+        let cptr = data.as_ptr();
+        let chunk_len = discovery_len;
+        let mut pos = 0;
+
+        while pos + 35 <= chunk_len {
+            let m_byte = unsafe { *cptr.add(pos + 28) };
+            let ep_start = match m_byte {
+                b'G' => pos + 32,
+                b'P' => match unsafe { *cptr.add(pos + 29) } {
+                    b'O' => pos + 33,
+                    b'U' => pos + 32,
+                    _ => pos + 34,
+                },
+                b'D' => pos + 35,
+                b'H' => pos + 33,
+                b'O' => pos + 36,
+                _ => {
+                    let mut idx = pos + 28;
+                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
+                    idx + 1
+                }
+            };
+
+            let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
+            global_cat.get_or_insert(&data[ep_start..ep_end], h_combined);
+
+            let mut idx = ep_end + 5;
+            while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
+            if idx < chunk_len { idx += 1; }
+            pos = idx;
         }
     }
-    drop(thread_catalogs);
 
     let num_endpoints = global_cat.endpoints.len();
     let mut sorted_endpoints: Vec<(usize, &[u8], u64)> = global_cat
