@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -286,8 +287,13 @@ fn main() {
 
         for _ in 0..q_threads {
             s.spawn(move || {
-                let mut df = vec![u64::MAX; n];
-                let mut db = vec![u64::MAX; n];
+                // Almost every shortest-path label fits in u32. Keep the rare
+                // >u32 labels in a sparse side map so the hot distance arrays
+                // stay half-sized without changing exact answers.
+                let mut df = vec![u32::MAX; n];
+                let mut db = vec![u32::MAX; n];
+                let mut of: HashMap<u32, u64> = HashMap::new();
+                let mut ob: HashMap<u32, u64> = HashMap::new();
                 let mut visited_f = Vec::with_capacity(2048);
                 let mut visited_b = Vec::with_capacity(2048);
                 let mut qf: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
@@ -316,8 +322,10 @@ fn main() {
                             continue;
                         }
 
-                        for &v in &visited_f { df[v as usize] = u64::MAX; }
-                        for &v in &visited_b { db[v as usize] = u64::MAX; }
+                        for &v in &visited_f { df[v as usize] = u32::MAX; }
+                        for &v in &visited_b { db[v as usize] = u32::MAX; }
+                        of.clear();
+                        ob.clear();
                         visited_f.clear();
                         visited_b.clear();
                         qf.clear();
@@ -336,7 +344,12 @@ fn main() {
                             if top_f.cost.saturating_add(top_b.cost) >= best { break; }
                             if top_f.cost <= top_b.cost {
                                 let State { cost, node } = qf.pop().unwrap();
-                                if cost > df[node as usize] { continue; }
+                                let node_dist = if df[node as usize] == u32::MAX {
+                                    of.get(&node).copied().unwrap_or(u64::MAX)
+                                } else {
+                                    df[node as usize] as u64
+                                };
+                                if cost > node_dist { continue; }
                                 let u = node as usize;
                                 let es = f_head_ref[u] as usize;
                                 let ee = f_head_ref[u + 1] as usize;
@@ -352,11 +365,26 @@ fn main() {
                                     };
                                     let new_cost = cost + w;
                                     let v_idx = v as usize;
-                                    if new_cost < df[v_idx] {
-                                        if df[v_idx] == u64::MAX { visited_f.push(v); }
-                                        df[v_idx] = new_cost;
+                                    let old = if df[v_idx] == u32::MAX {
+                                        of.get(&v).copied().unwrap_or(u64::MAX)
+                                    } else {
+                                        df[v_idx] as u64
+                                    };
+                                    if new_cost < old {
+                                        if old == u64::MAX { visited_f.push(v); }
+                                        if new_cost >= u32::MAX as u64 {
+                                            df[v_idx] = u32::MAX;
+                                            of.insert(v, new_cost);
+                                        } else {
+                                            df[v_idx] = new_cost as u32;
+                                            of.remove(&v);
+                                        }
                                         qf.push(State { cost: new_cost, node: v });
-                                        let db_val = db[v_idx];
+                                        let db_val = if db[v_idx] == u32::MAX {
+                                            ob.get(&v).copied().unwrap_or(u64::MAX)
+                                        } else {
+                                            db[v_idx] as u64
+                                        };
                                         if db_val != u64::MAX {
                                             let total = new_cost + db_val;
                                             if total < best { best = total; }
@@ -365,7 +393,12 @@ fn main() {
                                 }
                             } else {
                                 let State { cost, node } = qb.pop().unwrap();
-                                if cost > db[node as usize] { continue; }
+                                let node_dist = if db[node as usize] == u32::MAX {
+                                    ob.get(&node).copied().unwrap_or(u64::MAX)
+                                } else {
+                                    db[node as usize] as u64
+                                };
+                                if cost > node_dist { continue; }
                                 let u = node as usize;
                                 let es = b_head_ref[u] as usize;
                                 let ee = b_head_ref[u + 1] as usize;
@@ -381,11 +414,26 @@ fn main() {
                                     };
                                     let new_cost = cost + w;
                                     let v_idx = v as usize;
-                                    if new_cost < db[v_idx] {
-                                        if db[v_idx] == u64::MAX { visited_b.push(v); }
-                                        db[v_idx] = new_cost;
+                                    let old = if db[v_idx] == u32::MAX {
+                                        ob.get(&v).copied().unwrap_or(u64::MAX)
+                                    } else {
+                                        db[v_idx] as u64
+                                    };
+                                    if new_cost < old {
+                                        if old == u64::MAX { visited_b.push(v); }
+                                        if new_cost >= u32::MAX as u64 {
+                                            db[v_idx] = u32::MAX;
+                                            ob.insert(v, new_cost);
+                                        } else {
+                                            db[v_idx] = new_cost as u32;
+                                            ob.remove(&v);
+                                        }
                                         qb.push(State { cost: new_cost, node: v });
-                                        let df_val = df[v_idx];
+                                        let df_val = if df[v_idx] == u32::MAX {
+                                            of.get(&v).copied().unwrap_or(u64::MAX)
+                                        } else {
+                                            df[v_idx] as u64
+                                        };
                                         if df_val != u64::MAX {
                                             let total = new_cost + df_val;
                                             if total < best { best = total; }
