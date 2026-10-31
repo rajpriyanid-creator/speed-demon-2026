@@ -12,6 +12,7 @@ const NUM_HOURS: usize = 72;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -218,7 +219,7 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Phase 1: Sequential micro-scan endpoint discovery on first 5.8MB (zero thread overhead)
+    // Phase 1: Sequential micro-scan endpoint discovery on first 5.8MB
     let mut discovery_len = 5_800_000.min(len);
     while discovery_len < len && data[discovery_len] != b'\n' { discovery_len += 1; }
     if discovery_len < len { discovery_len += 1; }
@@ -275,9 +276,9 @@ fn main() {
 
     let num_buckets = NUM_HOURS * num_endpoints;
 
-    // Single-Pass Parse: Parse lines, accumulate counts & errors per bucket, pack records
-    type ParseResult = (Vec<u64>, Vec<u32>, Vec<u32>);
-    let parse_results: Vec<ParseResult> = std::thread::scope(|s| {
+    // PASS 1: Count records and errors per bucket per thread (ZERO records vector!)
+    type Pass1Counts = (Vec<u32>, Vec<u32>);
+    let thread_counts: Vec<Pass1Counts> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -287,11 +288,8 @@ fn main() {
             let lookup_ref = &lookup_table;
 
             handles.push(s.spawn(move || {
-                let est_records = (end - start) / 72 + 1024;
-                let mut records: Vec<u64> = Vec::with_capacity(est_records);
                 let mut local_counts = vec![0u32; num_buckets];
                 let mut local_errors = vec![0u32; num_buckets];
-
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
                 let mut pos = 0;
@@ -334,32 +332,16 @@ fn main() {
                     local_errors[g_id] += is_error;
 
                     let mut idx = ep_end + 5;
-                    let mut latency: u32 = 0;
-                    while idx < chunk_len {
-                        let b = unsafe { *cptr.add(idx) };
-                        if b >= b'0' && b <= b'9' {
-                            latency = latency * 10 + (b - b'0') as u32;
-                            idx += 1;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let packed = ((g_id as u64) << 32) | (latency as u64);
-                    records.push(packed);
-
                     while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
                     if idx < chunk_len { idx += 1; }
                     pos = idx;
                 }
 
-                (records, local_counts, local_errors)
+                (local_counts, local_errors)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-
-    unsafe { munmap(ptr, len); }
 
     // Consolidate bucket offsets, total counts, and total errors
     let mut bucket_offsets = vec![0u32; num_buckets + 1];
@@ -374,38 +356,96 @@ fn main() {
         let mut cur = total_records;
         for t in 0..num_threads {
             thread_write_ptrs[t][g_id] = cur;
-            let cnt = parse_results[t].1[g_id];
+            let cnt = thread_counts[t].0[g_id];
             cur += cnt;
-            total_errors[g_id] += parse_results[t].2[g_id];
+            total_errors[g_id] += thread_counts[t].1[g_id];
         }
         total_records = cur;
     }
     bucket_offsets[num_buckets] = total_records;
 
-    // Direct O(N) Counting-Sort Scatter into all_latencies
+    drop(thread_counts);
+
+    // Direct O(N) Counting-Sort Scatter into all_latencies (12.4 MB)
     let mut all_latencies = vec![0u32; total_records as usize];
     let raw_lats_ptr = all_latencies.as_mut_ptr() as usize;
 
+    // PASS 2: Parse latencies and write directly to all_latencies
     std::thread::scope(|s| {
-        for (i, res) in parse_results.iter().enumerate() {
-            let mut write_ptrs = std::mem::take(&mut thread_write_ptrs[i]);
-            let records = &res.0;
+        for (i, mut write_ptrs) in thread_write_ptrs.into_iter().enumerate() {
+            let start = boundaries[i];
+            let end = boundaries[i + 1];
+            if start >= end { continue; }
+            let chunk = &data[start..end];
+            let lookup_ref = &lookup_table;
 
             s.spawn(move || {
                 let raw_lats = raw_lats_ptr as *mut u32;
-                for &packed in records {
-                    let g_id = (packed >> 32) as usize;
-                    let lat = (packed & 0xFFFF_FFFF) as u32;
+                let cptr = chunk.as_ptr();
+                let chunk_len = chunk.len();
+                let mut pos = 0;
+
+                while pos + 35 <= chunk_len {
+                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
+                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
+                    let hour_id = match day {
+                        30 => hr - 18,
+                        31 => hr + 6,
+                        1 => hr + 30,
+                        _ => hr + 54,
+                    };
+
+                    let m_byte = unsafe { *cptr.add(pos + 28) };
+                    let ep_start = match m_byte {
+                        b'G' => pos + 32,
+                        b'P' => match unsafe { *cptr.add(pos + 29) } {
+                            b'O' => pos + 33,
+                            b'U' => pos + 32,
+                            _ => pos + 34,
+                        },
+                        b'D' => pos + 35,
+                        b'H' => pos + 33,
+                        b'O' => pos + 36,
+                        _ => {
+                            let mut idx = pos + 28;
+                            while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
+                            idx + 1
+                        }
+                    };
+
+                    let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
+                    let sorted_ep = lookup_ref.lookup(h_combined) as usize;
+                    let g_id = hour_id * num_endpoints + sorted_ep;
+
+                    let mut idx = ep_end + 5;
+                    let mut latency: u32 = 0;
+                    while idx < chunk_len {
+                        let b = unsafe { *cptr.add(idx) };
+                        if b >= b'0' && b <= b'9' {
+                            latency = latency * 10 + (b - b'0') as u32;
+                            idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
                     let dest = write_ptrs[g_id];
                     write_ptrs[g_id] += 1;
-                    unsafe { *raw_lats.add(dest as usize) = lat; }
+                    unsafe { *raw_lats.add(dest as usize) = latency; }
+
+                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
+                    if idx < chunk_len { idx += 1; }
+                    pos = idx;
+                }
+
+                unsafe {
+                    madvise(cptr as *mut u8, chunk_len, 4); // MADV_DONTNEED
                 }
             });
         }
     });
 
-    drop(parse_results);
-    drop(thread_write_ptrs);
+    unsafe { munmap(ptr, len); }
 
     // Parallel formatting & percentiles by hour
     let hours_per_thread = (NUM_HOURS + num_threads - 1) / num_threads;
@@ -483,7 +523,7 @@ fn main() {
         Ok(f) => f,
         Err(_) => return,
     };
-    for chunk in &formatted_chunks {
-        let _ = out_file.write_all(chunk);
+    for chunk in formatted_chunks {
+        let _ = out_file.write_all(&chunk);
     }
 }
