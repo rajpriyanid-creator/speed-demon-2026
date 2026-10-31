@@ -169,8 +169,8 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // SINGLE PASS: Parse records.csv and collect scalar aggs + name hashes per country
-    let thread_outputs: Vec<(Vec<CountryScalarAgg>, Vec<Vec<u64>>)> = std::thread::scope(|s| {
+    // 3. Fast parallel records parse with zero-allocation flat buffer per thread
+    let thread_outputs: Vec<(Vec<CountryScalarAgg>, Vec<u64>, Vec<(u32, u32)>)> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
@@ -179,163 +179,177 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_names: Vec<Vec<u64>> = (0..num_countries).map(|_| Vec::new()).collect();
+                let mut local_names: Vec<u64> = Vec::with_capacity(350_000);
+                let p = data.as_ptr();
                 let mut pos = start;
 
                 while pos < end {
-                    if pos + 3 <= len && &data[pos..pos + 3] == b"\xEF\xBB\xBF" {
-                        pos += 3;
-                    }
-                    if pos >= len {
-                        break;
-                    }
-                    if data[pos] == b'\r' || data[pos] == b'\n' {
-                        pos += 1;
-                        continue;
-                    }
+                    unsafe {
+                        if pos + 3 <= len && *p.add(pos) == 0xEF && *p.add(pos + 1) == 0xBB && *p.add(pos + 2) == 0xBF {
+                            pos += 3;
+                        }
+                        if pos >= len {
+                            break;
+                        }
+                        let b_lead = *p.add(pos);
+                        if b_lead == b'\r' || b_lead == b'\n' {
+                            pos += 1;
+                            continue;
+                        }
 
-                    // 1. id
-                    let mut id: u64 = 0;
-                    while pos < len && data[pos] != b',' {
-                        id = id * 10 + (data[pos] - b'0') as u64;
-                        pos += 1;
-                    }
-                    if pos < len && data[pos] == b',' {
-                        pos += 1;
-                    }
+                        // 1. id
+                        let mut id: u64 = 0;
+                        while *p.add(pos) != b',' {
+                            id = id * 10 + (*p.add(pos) - b'0') as u64;
+                            pos += 1;
+                        }
+                        pos += 1; // skip comma
 
-                    // 2. name
-                    let mut n_hash: u64 = 0xcbf29ce484222325;
-                    let mut name_len: u64 = 0;
-                    if pos < len && data[pos] == b'"' {
-                        pos += 1;
-                        while pos < len {
-                            let b = data[pos];
-                            if b == b'"' {
-                                if pos + 1 < len && data[pos + 1] == b'"' {
-                                    n_hash = (n_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
-                                    name_len += 1;
-                                    pos += 2;
+                        // 2. name
+                        let mut n_hash: u64 = 0xcbf29ce484222325;
+                        let mut name_len: u64 = 0;
+                        if *p.add(pos) == b'"' {
+                            pos += 1;
+                            loop {
+                                let b = *p.add(pos);
+                                if b == b'"' {
+                                    if *p.add(pos + 1) == b'"' {
+                                        n_hash = (n_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
+                                        name_len += 1;
+                                        pos += 2;
+                                    } else {
+                                        pos += 1;
+                                        break;
+                                    }
                                 } else {
+                                    n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                                    name_len += 1;
                                     pos += 1;
-                                    break;
                                 }
-                            } else {
+                            }
+                            if *p.add(pos) == b',' {
+                                pos += 1;
+                            }
+                        } else {
+                            while *p.add(pos) != b',' {
+                                let b = *p.add(pos);
                                 n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
                                 name_len += 1;
                                 pos += 1;
                             }
+                            pos += 1; // skip comma
                         }
-                        if pos < len && data[pos] == b',' {
-                            pos += 1;
-                        }
-                    } else {
-                        while pos < len && data[pos] != b',' {
-                            let b = data[pos];
-                            n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
-                            name_len += 1;
-                            pos += 1;
-                        }
-                        if pos < len && data[pos] == b',' {
-                            pos += 1;
-                        }
-                    }
-                    let n_hash = n_hash ^ (name_len << 48);
+                        let n_hash = n_hash ^ (name_len << 48);
 
-                    // 3. note
-                    let mut note_len: u64 = 0;
-                    if pos < len && data[pos] == b'"' {
-                        pos += 1;
-                        while pos < len {
-                            let b = data[pos];
-                            if b == b'"' {
-                                if pos + 1 < len && data[pos + 1] == b'"' {
-                                    note_len += 1;
-                                    pos += 2;
+                        // 3. note (fast skip & length computation)
+                        let note_len: u64;
+                        if *p.add(pos) == b'"' {
+                            pos += 1;
+                            let n_start = pos;
+                            let mut escaped_quotes = 0u64;
+                            loop {
+                                let b = *p.add(pos);
+                                if b == b'"' {
+                                    if *p.add(pos + 1) == b'"' {
+                                        escaped_quotes += 1;
+                                        pos += 2;
+                                    } else {
+                                        note_len = (pos - n_start) as u64 - escaped_quotes;
+                                        pos += 1;
+                                        break;
+                                    }
                                 } else {
                                     pos += 1;
-                                    break;
                                 }
-                            } else {
-                                note_len += 1;
+                            }
+                            if *p.add(pos) == b',' {
                                 pos += 1;
                             }
+                        } else {
+                            let n_start = pos;
+                            while *p.add(pos) != b',' {
+                                pos += 1;
+                            }
+                            note_len = (pos - n_start) as u64;
+                            pos += 1; // skip comma
                         }
-                        if pos < len && data[pos] == b',' {
+
+                        // 4. region_id
+                        let mut has_region = false;
+                        let mut region_id: usize = 0;
+                        while *p.add(pos) != b',' {
+                            let b = *p.add(pos);
+                            if b >= b'0' && b <= b'9' {
+                                has_region = true;
+                                region_id = region_id * 10 + (b - b'0') as usize;
+                            }
                             pos += 1;
                         }
-                    } else {
-                        while pos < len && data[pos] != b',' {
-                            note_len += 1;
+                        pos += 1; // skip comma
+
+                        // 5. amount
+                        let mut is_neg = false;
+                        if *p.add(pos) == b'-' {
+                            is_neg = true;
                             pos += 1;
                         }
-                        if pos < len && data[pos] == b',' {
+                        let mut cents: i64 = 0;
+                        while *p.add(pos) != b'\r' && *p.add(pos) != b'\n' {
+                            let b = *p.add(pos);
+                            if b >= b'0' && b <= b'9' {
+                                cents = cents * 10 + (b - b'0') as i64;
+                            }
                             pos += 1;
                         }
-                    }
-
-                    // 4. region_id
-                    let mut has_region = false;
-                    let mut region_id: usize = 0;
-                    while pos < len && data[pos] != b',' {
-                        if data[pos] >= b'0' && data[pos] <= b'9' {
-                            has_region = true;
-                            region_id = region_id * 10 + (data[pos] - b'0') as usize;
+                        if is_neg {
+                            cents = -cents;
                         }
-                        pos += 1;
-                    }
-                    if pos < len && data[pos] == b',' {
-                        pos += 1;
-                    }
-
-                    // 5. amount (-?[0-9]+\.[0-9]{2})
-                    let mut is_neg = false;
-                    if pos < len && data[pos] == b'-' {
-                        is_neg = true;
-                        pos += 1;
-                    }
-                    let mut cents: i64 = 0;
-                    while pos < len && data[pos] != b'\r' && data[pos] != b'\n' {
-                        let b = data[pos];
-                        if b >= b'0' && b <= b'9' {
-                            cents = cents * 10 + (b - b'0') as i64;
+                        if *p.add(pos) == b'\r' {
+                            pos += 1;
                         }
-                        pos += 1;
-                    }
-                    if is_neg {
-                        cents = -cents;
-                    }
-                    if pos < len && data[pos] == b'\r' {
-                        pos += 1;
-                    }
-                    if pos < len && data[pos] == b'\n' {
-                        pos += 1;
-                    }
+                        if pos < len && *p.add(pos) == b'\n' {
+                            pos += 1;
+                        }
 
-                    let c_id = if has_region && region_id < region_to_country_ref.len() {
-                        region_to_country_ref[region_id]
-                    } else {
-                        unmatched_id
-                    };
+                        let c_id = if has_region && region_id < region_to_country_ref.len() {
+                            region_to_country_ref[region_id]
+                        } else {
+                            unmatched_id
+                        };
 
-                    let agg = &mut local_aggs[c_id as usize];
-                    agg.count += 1;
-                    agg.id_sum += id;
-                    agg.amount_sum += cents;
-                    agg.amount_min = Some(match agg.amount_min {
-                        Some(cur) => cur.min(cents),
-                        None => cents,
-                    });
-                    agg.amount_max = Some(match agg.amount_max {
-                        Some(cur) => cur.max(cents),
-                        None => cents,
-                    });
-                    agg.name_bytes += name_len;
-                    agg.note_bytes += note_len;
+                        let agg = &mut local_aggs[c_id as usize];
+                        agg.count += 1;
+                        agg.id_sum += id;
+                        agg.amount_sum += cents;
+                        agg.amount_min = Some(match agg.amount_min {
+                            Some(cur) => cur.min(cents),
+                            None => cents,
+                        });
+                        agg.amount_max = Some(match agg.amount_max {
+                            Some(cur) => cur.max(cents),
+                            None => cents,
+                        });
+                        agg.name_bytes += name_len;
+                        agg.note_bytes += note_len;
 
-                    local_names[c_id as usize].push(n_hash);
+                        let packed = ((c_id as u64) << 48) | (n_hash & 0x0000_FFFF_FFFF_FFFF);
+                        local_names.push(packed);
+                    }
                 }
-                (local_aggs, local_names)
+                local_names.sort_unstable();
+                local_names.dedup();
+
+                // Compute binary slice boundaries per country
+                let mut offsets = vec![(0u32, 0u32); num_countries];
+                let mut cur_idx = 0;
+                for c_id in 0..num_countries {
+                    let target_prefix = ((c_id as u64) + 1) << 48;
+                    let next_idx = local_names[cur_idx..].partition_point(|&x| x < target_prefix) + cur_idx;
+                    offsets[c_id] = (cur_idx as u32, next_idx as u32);
+                    cur_idx = next_idx;
+                }
+
+                (local_aggs, local_names, offsets)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -347,7 +361,7 @@ fn main() {
 
     // Merge scalar aggregates
     let mut country_aggs = vec![CountryScalarAgg::default(); num_countries];
-    for (thread_agg, _) in &thread_outputs {
+    for (thread_agg, _, _) in &thread_outputs {
         for c_id in 0..num_countries {
             let t = &thread_agg[c_id];
             if t.count == 0 { continue; }
@@ -383,18 +397,17 @@ fn main() {
 
             s.spawn(move || {
                 let mut local_distincts = Vec::with_capacity(end - start);
+                let mut merged = Vec::with_capacity(30_000);
                 for c_id in start..end {
-                    let mut total_len = 0;
+                    merged.clear();
                     for t in 0..num_threads {
-                        total_len += thread_outputs_ref[t].1[c_id].len();
+                        let (s_off, e_off) = thread_outputs_ref[t].2[c_id];
+                        let slice = &thread_outputs_ref[t].1[s_off as usize..e_off as usize];
+                        merged.extend_from_slice(slice);
                     }
-                    if total_len == 0 {
+                    if merged.is_empty() {
                         local_distincts.push(0);
                         continue;
-                    }
-                    let mut merged = Vec::with_capacity(total_len);
-                    for t in 0..num_threads {
-                        merged.extend_from_slice(&thread_outputs_ref[t].1[c_id]);
                     }
                     merged.sort_unstable();
                     let distinct = 1 + merged.windows(2).filter(|w| w[0] != w[1]).count();

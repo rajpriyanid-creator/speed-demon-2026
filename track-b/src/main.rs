@@ -482,7 +482,7 @@ fn main() {
             let chunk = &docs_data[start_byte..end_byte];
 
             s.spawn(move || {
-                let est_records = 1_870_000;
+                let est_records = 950_000;
                 let mut local_records: Vec<u32> = Vec::with_capacity(est_records);
                 let mut last_seen = vec![u32::MAX; num_terms as usize];
                 let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
@@ -490,6 +490,7 @@ fn main() {
                 let mut local_lens = Vec::with_capacity(est_docs);
 
                 let mut i = 0;
+                let mut last_evicted = 0usize;
                 let clen = chunk.len();
                 let mut local_doc_id = 0u32;
 
@@ -540,6 +541,21 @@ fn main() {
                         }
                     }
                     local_doc_id += 1;
+
+                    if i - last_evicted >= 2 * 1024 * 1024 {
+                        let evict_len = (i - last_evicted) & !4095;
+                        if evict_len > 0 {
+                            let evict_ptr = (chunk.as_ptr() as usize + last_evicted) as *mut u8;
+                            unsafe { madvise(evict_ptr, evict_len, 4); }
+                            last_evicted += evict_len;
+                        }
+                    }
+                }
+
+                let remaining = clen - last_evicted;
+                if remaining > 0 {
+                    let evict_ptr = (chunk.as_ptr() as usize + last_evicted) as *mut u8;
+                    unsafe { madvise(evict_ptr, remaining, 4); }
                 }
 
                 local_records.sort_unstable();

@@ -39,13 +39,13 @@ impl FastHeap {
             if val < parent_val {
                 unsafe {
                     *self.data.get_unchecked_mut(i) = parent_val;
-                    *self.data.get_unchecked_mut(p) = val;
                 }
                 i = p;
             } else {
                 break;
             }
         }
+        unsafe { *self.data.get_unchecked_mut(i) = val; }
     }
 
     #[inline(always)]
@@ -367,8 +367,9 @@ fn main() {
                                 let new_dist = curr_cost + w;
                                 let v_idx = v as usize;
 
-                                if new_dist < unsafe { *dist.get_unchecked(v_idx) } {
-                                    if unsafe { *dist.get_unchecked(v_idx) } == u64::MAX {
+                                let old_dist = unsafe { *dist.get_unchecked(v_idx) };
+                                if new_dist < old_dist {
+                                    if old_dist == u64::MAX {
                                         visited.push(v);
                                     }
                                     unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
