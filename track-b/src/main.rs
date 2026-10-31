@@ -747,7 +747,51 @@ fn main() {
                                     None => &[],
                                 };
 
-                                if steps.is_empty() {
+                                let all_and = steps.iter().all(|(op, _)| matches!(op, Op::And));
+                                if all_and {
+                                    let mut min_term = *first_term;
+                                    let mut min_len = min_term.map(|t| {
+                                        let tid = t as usize;
+                                        (b_offsets_ref[tid + 1] - b_offsets_ref[tid]) as usize
+                                    }).unwrap_or(0);
+                                    for &(_, maybe_term) in steps {
+                                        match maybe_term {
+                                            Some(t) => {
+                                                let tid = t as usize;
+                                                let len = (b_offsets_ref[tid + 1] - b_offsets_ref[tid]) as usize;
+                                                if min_term.is_some() && len < min_len {
+                                                    min_term = Some(t);
+                                                    min_len = len;
+                                                }
+                                            }
+                                            None => { min_term = None; break; }
+                                        }
+                                    }
+                                    buf_a.clear();
+                                    if let Some(t) = min_term {
+                                        buf_a.extend_from_slice(get_postings(t));
+                                        if *first_term != min_term {
+                                            intersect_u16(&buf_a, r_slice, &mut buf_b);
+                                            std::mem::swap(&mut buf_a, &mut buf_b);
+                                        }
+                                        for &(_, maybe_term) in steps {
+                                            if let Some(tid) = maybe_term {
+                                                if Some(tid) == min_term { continue; }
+                                                intersect_u16(&buf_a, get_postings(tid), &mut buf_b);
+                                                std::mem::swap(&mut buf_a, &mut buf_b);
+                                                if buf_a.is_empty() { break; }
+                                            }
+                                        }
+                                    }
+                                    let count = buf_a.len();
+                                    res.count += count as u32;
+                                    let loc_sum: u64 = buf_a.iter().map(|&x| x as u64).sum();
+                                    res.id_sum += base_doc_id * (count as u64) + loc_sum;
+                                    for &loc_id in buf_a.iter().take(10 - res.top_k_len as usize) {
+                                        res.top_k[res.top_k_len as usize] = (base_doc_id as u32) + (loc_id as u32);
+                                        res.top_k_len += 1;
+                                    }
+                                } else if steps.is_empty() {
                                     let count = r_slice.len();
                                     res.count += count as u32;
                                     let loc_sum: u64 = r_slice.iter().map(|&x| x as u64).sum();
