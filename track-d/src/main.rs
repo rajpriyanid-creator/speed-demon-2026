@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::collections::BinaryHeap;
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -12,73 +13,23 @@ extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
-struct FastHeap {
-    data: Vec<u64>,
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct State {
+    cost: u64,
+    node: u32,
 }
 
-impl FastHeap {
+impl Ord for State {
     #[inline(always)]
-    fn new(cap: usize) -> Self { Self { data: Vec::with_capacity(cap) } }
-    #[inline(always)]
-    fn clear(&mut self) { self.data.clear(); }
-    #[inline(always)]
-    fn push(&mut self, cost: u64, node: u32) {
-        let val = (cost << 21) | (node as u64);
-        let mut i = self.data.len();
-        self.data.push(val);
-        while i > 0 {
-            let p = (i - 1) >> 2;
-            let parent_val = unsafe { *self.data.get_unchecked(p) };
-            if val < parent_val {
-                unsafe { *self.data.get_unchecked_mut(i) = parent_val; }
-                i = p;
-            } else { break; }
-        }
-        unsafe { *self.data.get_unchecked_mut(i) = val; }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.cost.cmp(&self.cost)
     }
+}
+
+impl PartialOrd for State {
     #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        if self.data.is_empty() { return None; }
-        let top = self.data[0];
-        let last = self.data.pop().unwrap();
-        if !self.data.is_empty() {
-            let len = self.data.len();
-            let mut i = 0;
-            loop {
-                let first_child = (i << 2) + 1;
-                if first_child >= len { break; }
-                let (best_val, best_child) = if first_child + 3 < len {
-                    let c1 = first_child;
-                    let c2 = first_child + 1;
-                    let c3 = first_child + 2;
-                    let c4 = first_child + 3;
-                    let v1 = unsafe { *self.data.get_unchecked(c1) };
-                    let v2 = unsafe { *self.data.get_unchecked(c2) };
-                    let v3 = unsafe { *self.data.get_unchecked(c3) };
-                    let v4 = unsafe { *self.data.get_unchecked(c4) };
-                    let (b12_val, b12_idx) = if v2 < v1 { (v2, c2) } else { (v1, c1) };
-                    let (b34_val, b34_idx) = if v4 < v3 { (v4, c4) } else { (v3, c3) };
-                    if b34_val < b12_val { (b34_val, b34_idx) } else { (b12_val, b12_idx) }
-                } else {
-                    let mut b_child = first_child;
-                    let mut b_val = unsafe { *self.data.get_unchecked(first_child) };
-                    for child_idx in (first_child + 1)..len {
-                        let c_val = unsafe { *self.data.get_unchecked(child_idx) };
-                        if c_val < b_val {
-                            b_val = c_val;
-                            b_child = child_idx;
-                        }
-                    }
-                    (b_val, b_child)
-                };
-                if best_val < last {
-                    unsafe { *self.data.get_unchecked_mut(i) = best_val; }
-                    i = best_child;
-                } else { break; }
-            }
-            unsafe { *self.data.get_unchecked_mut(i) = last; }
-        }
-        Some((top >> 21, (top & 0x1F_FFFF) as u32))
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -116,6 +67,7 @@ fn main() {
 
     let graph_path = format!("{}/graph.txt", data_dir);
     let queries_path = format!("{}/queries.txt", data_dir);
+    let results_path = format!("{}/distances.txt", out_dir);
 
     let g_file = match File::open(&graph_path) {
         Ok(f) => f,
@@ -125,12 +77,8 @@ fn main() {
         Ok(m) => m.len() as usize,
         Err(_) => return,
     };
-    if g_len == 0 { return; }
-    let g_fd = g_file.as_raw_fd();
-    let g_ptr = unsafe { mmap(std::ptr::null_mut(), g_len, PROT_READ, MAP_SHARED, g_fd, 0) };
-    if g_ptr == usize::MAX as *mut u8 {
-        return;
-    }
+    let g_ptr = unsafe { mmap(std::ptr::null_mut(), g_len, PROT_READ, MAP_SHARED, g_file.as_raw_fd(), 0) };
+    if g_ptr == usize::MAX as *mut u8 || g_ptr.is_null() { return; }
 
     let mut g_pos = 0;
     let n = unsafe { parse_u32_fast(g_ptr, &mut g_pos) } as usize;
@@ -140,7 +88,11 @@ fn main() {
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
-    let num_load_threads = 8;
+    let f_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let b_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let g_addr = g_ptr as usize;
+
+    let num_load_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
     let mut edge_chunks = Vec::with_capacity(num_load_threads);
     let total_edge_bytes = g_len - edges_start;
     let mut cur = edges_start;
@@ -153,54 +105,58 @@ fn main() {
         cur = end;
     }
 
-    let g_addr = g_ptr as usize;
-
-    // Pass 1: Atomic degree count (only 4 MB memory!)
-    let f_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-
     std::thread::scope(|s| {
         for &(start, end) in &edge_chunks {
             let f_deg_ref = &f_deg;
+            let b_deg_ref = &b_deg;
             s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
                 let mut pos = start;
                 while pos < end {
                     let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
                     pos += 1;
-                    let _v = unsafe { parse_u32_fast(g_ptr, &mut pos) };
+                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
                     while pos < end && unsafe { *g_ptr.add(pos) } != b'\n' { pos += 1; }
                     if pos < end { pos += 1; }
-
-                    if u < n {
-                        f_deg_ref[u].fetch_add(1, Relaxed);
-                    }
+                    if u < n { f_deg_ref[u].fetch_add(1, Relaxed); }
+                    if v < n { b_deg_ref[v].fetch_add(1, Relaxed); }
                 }
             });
         }
     });
 
     let mut f_head = vec![0u32; n + 1];
+    let mut b_head = vec![0u32; n + 1];
     let f_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-
+    let b_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let mut cur_f = 0u32;
+    let mut cur_b = 0u32;
     for i in 0..n {
         f_head[i] = cur_f;
+        b_head[i] = cur_b;
         f_write[i].store(cur_f, Relaxed);
+        b_write[i].store(cur_b, Relaxed);
         cur_f += f_deg[i].load(Relaxed);
+        cur_b += b_deg[i].load(Relaxed);
     }
     f_head[n] = cur_f;
+    b_head[n] = cur_b;
     drop(f_deg);
+    drop(b_deg);
 
-    // Pass 2: Atomic CSR scatter directly into f_edges (40 MB)
     let mut f_edges = vec![0u64; m];
+    let mut b_edges = vec![0u64; m];
     let f_edges_addr = f_edges.as_mut_ptr() as usize;
+    let b_edges_addr = b_edges.as_mut_ptr() as usize;
 
     std::thread::scope(|s| {
         for &(start, end) in &edge_chunks {
             let f_write_ref = &f_write;
+            let b_write_ref = &b_write;
             s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
                 let f_raw = f_edges_addr as *mut u64;
+                let b_raw = b_edges_addr as *mut u64;
                 let mut pos = start;
                 while pos < end {
                     let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
@@ -210,12 +166,15 @@ fn main() {
                     let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
                     if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
                     if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
-
                     let packed_f = (v as u64) | (w << 32);
-
+                    let packed_b = (u as u64) | (w << 32);
                     if u < n {
                         let idx = f_write_ref[u].fetch_add(1, Relaxed);
                         unsafe { *f_raw.add(idx as usize) = packed_f; }
+                    }
+                    if v < n {
+                        let idx = b_write_ref[v].fetch_add(1, Relaxed);
+                        unsafe { *b_raw.add(idx as usize) = packed_b; }
                     }
                 }
             });
@@ -223,9 +182,9 @@ fn main() {
     });
 
     drop(f_write);
+    drop(b_write);
     unsafe { munmap(g_ptr, g_len); }
 
-    // 2. Parse queries
     let q_file = match File::open(&queries_path) {
         Ok(f) => f,
         Err(_) => return,
@@ -234,14 +193,10 @@ fn main() {
         Ok(m) => m.len() as usize,
         Err(_) => return,
     };
-    if q_len == 0 { return; }
-    let q_fd = q_file.as_raw_fd();
-    let q_ptr = unsafe { mmap(std::ptr::null_mut(), q_len, PROT_READ, MAP_SHARED, q_fd, 0) };
-    if q_ptr == usize::MAX as *mut u8 {
-        return;
-    }
+    let q_ptr = unsafe { mmap(std::ptr::null_mut(), q_len, PROT_READ, MAP_SHARED, q_file.as_raw_fd(), 0) };
+    if q_ptr == usize::MAX as *mut u8 || q_ptr.is_null() { return; }
 
-    let mut queries: Vec<(u32, u32)> = Vec::with_capacity(10_000);
+    let mut queries = Vec::new();
     let mut q_pos = 0;
     while q_pos < q_len {
         let b = unsafe { *q_ptr.add(q_pos) };
@@ -260,18 +215,25 @@ fn main() {
     let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
-    let q_threads = 10;
+    // Use 3 query threads for optimal balance of speed and memory
+    let q_threads = 3;
+
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
+        let b_head_ref = &b_head;
         let f_edges_ref = &f_edges;
+        let b_edges_ref = &b_edges;
         let query_cursor_ref = &query_cursor;
         let queries_ref = &queries;
 
         for _ in 0..q_threads {
             s.spawn(move || {
-                let mut q = FastHeap::new(4096);
-                let mut d: Vec<u64> = vec![u64::MAX; n];
-                let mut visited: Vec<u32> = Vec::with_capacity(4096);
+                let mut qf: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
+                let mut qb: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
+                let mut df: Vec<u64> = vec![u64::MAX; n];
+                let mut db: Vec<u64> = vec![u64::MAX; n];
+                let mut visited_f: Vec<u32> = Vec::with_capacity(2048);
+                let mut visited_b: Vec<u32> = Vec::with_capacity(2048);
                 let res_raw = results_ptr as *mut i64;
 
                 const BATCH_SIZE: usize = 16;
@@ -287,43 +249,80 @@ fn main() {
                         let t_idx = dst as usize;
                         if s_idx >= n || t_idx >= n { unsafe { *res_raw.add(q_idx) = -1; } continue; }
 
-                        for &node in &visited { unsafe { *d.get_unchecked_mut(node as usize) = u64::MAX; } }
-                        visited.clear();
-                        q.clear();
+                        for &node in &visited_f { unsafe { *df.get_unchecked_mut(node as usize) = u64::MAX; } }
+                        for &node in &visited_b { unsafe { *db.get_unchecked_mut(node as usize) = u64::MAX; } }
+                        visited_f.clear();
+                        visited_b.clear();
+                        qf.clear();
+                        qb.clear();
 
-                        unsafe { *d.get_unchecked_mut(s_idx) = 0; }
-                        visited.push(src);
-                        q.push(0, src);
+                        unsafe { *df.get_unchecked_mut(s_idx) = 0; }
+                        visited_f.push(src);
+                        qf.push(State { cost: 0, node: src });
 
-                        let mut found_dist = -1i64;
+                        unsafe { *db.get_unchecked_mut(t_idx) = 0; }
+                        visited_b.push(dst);
+                        qb.push(State { cost: 0, node: dst });
 
-                        while let Some((curr_cost, curr_node)) = q.pop() {
-                            if curr_node == dst {
-                                found_dist = curr_cost as i64;
-                                break;
-                            }
-                            if curr_cost > unsafe { *d.get_unchecked(curr_node as usize) } {
-                                continue;
-                            }
-                            let u = curr_node as usize;
-                            let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
-                            let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
-                            for edge_idx in e_start..e_end {
-                                let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
-                                let v = (packed & 0xFFFF_FFFF) as u32;
-                                let w = packed >> 32;
-                                let new_dist = curr_cost + w;
-                                let v_idx = v as usize;
-                                let old_dist = unsafe { *d.get_unchecked(v_idx) };
-                                if new_dist < old_dist {
-                                    if old_dist == u64::MAX { visited.push(v); }
-                                    unsafe { *d.get_unchecked_mut(v_idx) = new_dist; }
-                                    q.push(new_dist, v);
+                        let mut best = u64::MAX;
+
+                        while let (Some(&top_f), Some(&top_b)) = (qf.peek(), qb.peek()) {
+                            if top_f.cost.saturating_add(top_b.cost) >= best { break; }
+
+                            if top_f.cost <= top_b.cost {
+                                let State { cost: curr_cost, node: curr_node } = qf.pop().unwrap();
+                                if curr_cost > unsafe { *df.get_unchecked(curr_node as usize) } { continue; }
+                                let u = curr_node as usize;
+                                let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
+                                let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
+                                for edge_idx in e_start..e_end {
+                                    let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
+                                    let v = (packed & 0xFFFF_FFFF) as u32;
+                                    let w = packed >> 32;
+                                    let new_dist = curr_cost + w;
+                                    let v_idx = v as usize;
+                                    let old_dist = unsafe { *df.get_unchecked(v_idx) };
+                                    if new_dist < old_dist {
+                                        if old_dist == u64::MAX { visited_f.push(v); }
+                                        unsafe { *df.get_unchecked_mut(v_idx) = new_dist; }
+                                        qf.push(State { cost: new_dist, node: v });
+
+                                        let db_val = unsafe { *db.get_unchecked(v_idx) };
+                                        if db_val != u64::MAX {
+                                            let total_cost = new_dist.saturating_add(db_val);
+                                            if total_cost < best { best = total_cost; }
+                                        }
+                                    }
+                                }
+                            } else {
+                                let State { cost: curr_cost, node: curr_node } = qb.pop().unwrap();
+                                if curr_cost > unsafe { *db.get_unchecked(curr_node as usize) } { continue; }
+                                let u = curr_node as usize;
+                                let e_start = unsafe { *b_head_ref.get_unchecked(u) } as usize;
+                                let e_end = unsafe { *b_head_ref.get_unchecked(u + 1) } as usize;
+                                for edge_idx in e_start..e_end {
+                                    let packed = unsafe { *b_edges_ref.get_unchecked(edge_idx) };
+                                    let v = (packed & 0xFFFF_FFFF) as u32;
+                                    let w = packed >> 32;
+                                    let new_dist = curr_cost + w;
+                                    let v_idx = v as usize;
+                                    let old_dist = unsafe { *db.get_unchecked(v_idx) };
+                                    if new_dist < old_dist {
+                                        if old_dist == u64::MAX { visited_b.push(v); }
+                                        unsafe { *db.get_unchecked_mut(v_idx) = new_dist; }
+                                        qb.push(State { cost: new_dist, node: v });
+
+                                        let df_val = unsafe { *df.get_unchecked(v_idx) };
+                                        if df_val != u64::MAX {
+                                            let total_cost = new_dist.saturating_add(df_val);
+                                            if total_cost < best { best = total_cost; }
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        unsafe { *res_raw.add(q_idx) = found_dist; }
+                        unsafe { *res_raw.add(q_idx) = if best == u64::MAX { -1 } else { best as i64 }; }
                     }
                 }
             });
@@ -331,11 +330,11 @@ fn main() {
     });
 
     let _ = std::fs::create_dir_all(&out_dir);
-    let mut out_file = match File::create(format!("{}/distances.txt", out_dir)) {
+    let mut out_file = match File::create(&results_path) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let mut out_buf: Vec<u8> = Vec::with_capacity(32 * 1024);
+    let mut out_buf = Vec::with_capacity(32 * 1024);
     for dist in results {
         let mut d = dist;
         if d == -1 {

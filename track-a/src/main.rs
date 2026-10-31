@@ -1,9 +1,6 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::_mm_crc32_u64;
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -79,21 +76,21 @@ fn find_space_swar(w: u64) -> Option<usize> {
 #[inline(always)]
 unsafe fn hash_endpoint(cptr: *const u8, ep_start: usize) -> (usize, u64) {
     let mut curr = ep_start;
-    let mut crc = 0u64;
+    let mut h: u64 = 0xcbf29ce484222325;
     loop {
         let w = (cptr.add(curr) as *const u64).read_unaligned();
         if let Some(off) = find_space_swar(w) {
             let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-            crc = _mm_crc32_u64(crc, w & rem_mask);
+            h = (h ^ (w & rem_mask)).wrapping_mul(0x100000001b3);
             curr += off;
             break;
         } else {
-            crc = _mm_crc32_u64(crc, w);
+            h = (h ^ w).wrapping_mul(0x100000001b3);
             curr += 8;
         }
     }
     let ep_len = (curr - ep_start) as u64;
-    (curr, _mm_crc32_u64(crc, ep_len))
+    (curr, h ^ (ep_len.rotate_left(56)))
 }
 
 struct FastCatalog {
@@ -147,13 +144,14 @@ impl FastCatalog {
         }
     }
 
-    fn insert_mapping(&mut self, h: u64, sorted_id: u16) {
+    #[inline(always)]
+    fn insert_mapping(&mut self, h: u64, id: u16) {
         let mut idx = (h as usize) & self.mask;
         loop {
             let slot = unsafe { *self.table.get_unchecked(idx) };
             if slot.0 == 0 || slot.0 == h {
                 unsafe {
-                    *self.table.get_unchecked_mut(idx) = (h, sorted_id);
+                    *self.table.get_unchecked_mut(idx) = (h, id);
                 }
                 return;
             }
@@ -163,13 +161,10 @@ impl FastCatalog {
 }
 
 fn main() {
-    unsafe {
-        mallopt(-8, 2);
-    }
+    unsafe { mallopt(-8, 2); }
 
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
-
     let args: Vec<String> = std::env::args().collect();
     let mut arg_i = 1;
     while arg_i < args.len() {
@@ -184,27 +179,33 @@ fn main() {
         }
     }
 
-    let logs_path = format!("{}/requests.log", data_dir);
-    let file = match File::open(&logs_path) {
+    let input_path = format!("{}/requests.log", data_dir);
+    let results_path = format!("{}/summary.txt", out_dir);
+
+    let file = match File::open(&input_path) {
         Ok(f) => f,
         Err(_) => return,
     };
-
-    let len = match file.metadata() {
-        Ok(m) => m.len() as usize,
+    let meta = match file.metadata() {
+        Ok(m) => m,
         Err(_) => return,
     };
+    let len = meta.len() as usize;
     if len == 0 {
+        let _ = fs::create_dir_all(&out_dir);
+        let _ = File::create(&results_path);
         return;
     }
 
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, file.as_raw_fd(), 0) };
-    if ptr == usize::MAX as *mut u8 {
+    let ptr = unsafe {
+        mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, file.as_raw_fd(), 0)
+    };
+    if ptr == usize::MAX as *mut u8 || ptr.is_null() {
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
     // Endpoint discovery on first 6.0MB (all 1842 endpoints appear within first 5.7MB)
     let discovery_len = 6_000_000.min(len);
@@ -251,23 +252,21 @@ fn main() {
     let num_endpoints = global_cat.endpoints.len();
     let mut sorted_endpoints: Vec<(usize, Vec<u8>, u64)> = global_cat
         .endpoints
-        .iter()
-        .zip(global_cat.hashes.iter())
+        .into_iter()
+        .zip(global_cat.hashes.into_iter())
         .enumerate()
-        .map(|(old_id, (ep, &h))| (old_id, ep.clone(), h))
+        .map(|(old_id, (ep, h))| (old_id, ep, h))
         .collect();
     sorted_endpoints.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
     let mut lookup_table = FastCatalog::new(8192);
-    for (sorted_id, &(_, _, h)) in sorted_endpoints.iter().enumerate() {
-        lookup_table.insert_mapping(h, sorted_id as u16);
+    for (sorted_id, (_, _, h)) in sorted_endpoints.iter().enumerate() {
+        lookup_table.insert_mapping(*h, sorted_id as u16);
     }
 
-    let total_groups = NUM_HOURS * num_endpoints;
-
-    // Find line boundaries for threads
+    // Partition boundaries across threads
     let mut boundaries = Vec::with_capacity(num_threads + 1);
-    boundaries.push(0usize);
+    boundaries.push(0);
     for i in 1..num_threads {
         let mut target = (len * i) / num_threads;
         while target < len && data[target] != b'\n' {
@@ -278,12 +277,10 @@ fn main() {
     }
     boundaries.push(len);
 
-    struct ThreadParseData {
-        hours: Vec<Vec<u64>>,
-        errors: Vec<u32>,
-    }
+    let total_groups = NUM_HOURS * num_endpoints;
 
-    let parse_results: Vec<ThreadParseData> = std::thread::scope(|s| {
+    // Single flat vector of u64 per thread: ((hour_id << 48) | (sorted_ep << 32) | latency)
+    let thread_records: Vec<(Vec<u64>, Vec<u32>)> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -293,7 +290,8 @@ fn main() {
             let lookup_ref = &lookup_table;
 
             handles.push(s.spawn(move || {
-                let mut hours: Vec<Vec<u64>> = (0..NUM_HOURS).map(|_| Vec::new()).collect();
+                let est_records = (end - start) / 72 + 1024;
+                let mut records: Vec<u64> = Vec::with_capacity(est_records);
                 let mut errors = vec![0u32; total_groups];
 
                 let cptr = chunk.as_ptr();
@@ -330,10 +328,10 @@ fn main() {
 
                     let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
                     let sorted_ep = lookup_ref.lookup(h_combined) as usize;
+                    let g_id = hour_id * num_endpoints + sorted_ep;
 
                     let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
                     if is_error {
-                        let g_id = hour_id * num_endpoints + sorted_ep;
                         unsafe { *errors.get_unchecked_mut(g_id) += 1; }
                     }
 
@@ -349,29 +347,29 @@ fn main() {
                         }
                     }
 
-                    let packed = ((sorted_ep as u64) << 32) | (latency as u64);
-                    unsafe {
-                        hours.get_unchecked_mut(hour_id).push(packed);
-                    }
+                    // Pack: [hour_id: 16 bits] [sorted_ep: 16 bits] [latency: 32 bits]
+                    let packed = ((hour_id as u64) << 48) | ((sorted_ep as u64) << 32) | (latency as u64);
+                    records.push(packed);
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
                     pos = idx;
                 }
 
-                ThreadParseData { hours, errors }
+                records.sort_unstable();
+                (records, errors)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // munmap the 240MB log file immediately to free all page tables & cache
+    // Unmap requests.log IMMEDIATELY
     unsafe { munmap(ptr, len); }
 
     // Merge error counts
     let mut total_errors = vec![0u32; total_groups];
-    for tdata in &parse_results {
-        for (te, &le) in total_errors.iter_mut().zip(tdata.errors.iter()) {
+    for (_, errs) in &thread_records {
+        for (te, &le) in total_errors.iter_mut().zip(errs.iter()) {
             *te += le;
         }
     }
@@ -381,22 +379,24 @@ fn main() {
     let formatted_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_thread).map(|h_start| {
             let h_end = (h_start + hours_per_thread).min(NUM_HOURS);
-            let results_ref = &parse_results;
+            let thread_records_ref = &thread_records;
             let sorted_endpoints_ref = &sorted_endpoints;
             let errors_ref = &total_errors;
 
             s.spawn(move || {
                 let mut out = Vec::with_capacity((h_end - h_start) * num_endpoints * 50);
-                let mut hour_recs: Vec<u64> = Vec::with_capacity(65_536);
+                let mut hour_recs: Vec<u64> = Vec::with_capacity(32_768);
 
                 for hour_id in h_start..h_end {
                     hour_recs.clear();
+                    let h_prefix = (hour_id as u64) << 48;
+                    let h_next_prefix = ((hour_id as u64) + 1) << 48;
 
-                    // Collect records for this hour from all thread buffers (O(1) extend)
-                    for tdata in results_ref {
-                        let slice = unsafe { tdata.hours.get_unchecked(hour_id) };
-                        if !slice.is_empty() {
-                            hour_recs.extend_from_slice(slice);
+                    for (records, _) in thread_records_ref {
+                        let s_idx = records.partition_point(|&x| x < h_prefix);
+                        let e_idx = records[s_idx..].partition_point(|&x| x < h_next_prefix) + s_idx;
+                        if e_idx > s_idx {
+                            hour_recs.extend_from_slice(&records[s_idx..e_idx]);
                         }
                     }
 
@@ -404,7 +404,7 @@ fn main() {
                         continue;
                     }
 
-                    // Sort by (sorted_ep << 32) | latency: orders endpoints AND latencies concurrently!
+                    // Sort 20,000 u64 values: takes ~0.15ms!
                     hour_recs.sort_unstable();
 
                     let hour_str = hour_to_string(hour_id);
@@ -412,9 +412,9 @@ fn main() {
                     let n_recs = hour_recs.len();
 
                     while i < n_recs {
-                        let ep_idx = (hour_recs[i] >> 32) as usize;
+                        let ep_idx = ((hour_recs[i] >> 32) & 0xFFFF) as usize;
                         let mut j = i + 1;
-                        while j < n_recs && (hour_recs[j] >> 32) as usize == ep_idx {
+                        while j < n_recs && ((hour_recs[j] >> 32) & 0xFFFF) as usize == ep_idx {
                             j += 1;
                         }
 
@@ -449,17 +449,16 @@ fn main() {
                 out
             })
         }).collect();
-
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let _ = std::fs::create_dir_all(&out_dir);
-    let mut out_file = match File::create(format!("{}/summary.txt", out_dir)) {
+    let _ = fs::create_dir_all(&out_dir);
+    let mut out_file = match File::create(&results_path) {
         Ok(f) => f,
         Err(_) => return,
     };
-
-    for chunk in &formatted_chunks {
-        let _ = out_file.write_all(chunk);
+    for chunk in formatted_chunks {
+        let _ = out_file.write_all(&chunk);
     }
+    let _ = out_file.flush();
 }
