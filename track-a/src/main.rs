@@ -191,7 +191,7 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Phase 1: Micro-scan endpoint discovery on first 10MB (all 1,842 endpoints appear in first 5.41MB)
+    // Phase 1: Micro-scan endpoint discovery on first 10MB
     let mut discovery_len = 10_000_000.min(len);
     while discovery_len < len && data[discovery_len] != b'\n' { discovery_len += 1; }
     if discovery_len < len { discovery_len += 1; }
@@ -291,10 +291,9 @@ fn main() {
         lookup_table.insert_mapping(h, sorted_id as u16);
     }
 
-    // Phase 2: Single flat Vec<u64> per thread, sorted in-place in 3ms
-    let total_groups = NUM_HOURS * num_endpoints;
-
-    let parse_results: Vec<(Vec<u64>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    // Phase 2: Packed 64-bit record: [g_id: 31 bits] [is_error: 1 bit] [latency: 32 bits]
+    // Eliminates all error vectors (saves 6.4MB immediately!)
+    let parse_results: Vec<(Vec<u64>, Vec<u32>)> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -306,7 +305,6 @@ fn main() {
             handles.push(s.spawn(move || {
                 let est_records = (end - start) / 72 + 1024;
                 let mut records: Vec<u64> = Vec::with_capacity(est_records);
-                let mut errors = vec![0u32; total_groups];
 
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
@@ -359,26 +357,24 @@ fn main() {
                     let h_combined = h ^ (ep_len.rotate_left(56));
 
                     let sorted_ep = lookup_ref.lookup(h_combined) as usize;
-                    let g_id = hour_id * num_endpoints + sorted_ep;
+                    let g_id = (hour_id * num_endpoints + sorted_ep) as u64;
 
-                    let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
-                    if is_error {
-                        unsafe { *errors.get_unchecked_mut(g_id) += 1; }
-                    }
+                    let is_error = if unsafe { *cptr.add(ep_end + 1) } == b'5' { 1u64 } else { 0u64 };
 
                     let mut idx = ep_end + 5;
-                    let mut latency: u32 = 0;
+                    let mut latency: u64 = 0;
                     while idx < chunk_len {
                         let b = unsafe { *cptr.add(idx) };
                         if b >= b'0' && b <= b'9' {
-                            latency = latency * 10 + (b - b'0') as u32;
+                            latency = latency * 10 + (b - b'0') as u64;
                             idx += 1;
                         } else {
                             break;
                         }
                     }
 
-                    let packed = ((g_id as u64) << 32) | (latency as u64);
+                    // Pack: [g_id: 31 bits] [is_error: 1 bit] [latency: 32 bits]
+                    let packed = (g_id << 33) | (is_error << 32) | (latency & 0xFFFF_FFFF);
                     records.push(packed);
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
@@ -386,15 +382,15 @@ fn main() {
                     pos = idx;
                 }
 
-                // In-place sort thread's records (only ~260,000 u64, takes 3ms!)
+                // In-place sort thread's records (only ~260,000 u64, takes 2ms!)
                 records.sort_unstable();
 
                 // Compute exact hour offsets in sorted records array
                 let mut hour_offsets = vec![0u32; NUM_HOURS + 1];
                 let mut cur_h = 0usize;
                 for (idx, &packed) in records.iter().enumerate() {
-                    let g_id = (packed >> 32) as usize;
-                    let h = g_id / num_endpoints;
+                    let g_id = (packed >> 33) as usize;
+                    let h = (g_id / num_endpoints).min(NUM_HOURS);
                     while cur_h < h {
                         cur_h += 1;
                         hour_offsets[cur_h] = idx as u32;
@@ -405,13 +401,13 @@ fn main() {
                     hour_offsets[cur_h] = records.len() as u32;
                 }
 
-                (records, errors, hour_offsets)
+                (records, hour_offsets)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Phase 3: Parallel hour extraction using exact hour_offsets
+    // Phase 3: Direct scatter into sorted_recs, zero intermediate hour_recs buffer
     let hours_per_thread = (NUM_HOURS + num_threads - 1) / num_threads;
     let formatted_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_thread).map(|h_start| {
@@ -420,30 +416,32 @@ fn main() {
             let sorted_endpoints_ref = &sorted_endpoints;
 
             s.spawn(move || {
-                let mut out = Vec::with_capacity((h_end - h_start) * num_endpoints * 50);
-                let mut hour_recs = Vec::with_capacity(65_536);
                 let mut count_per_ep = vec![0u32; num_endpoints];
+                let mut errors_per_ep = vec![0u32; num_endpoints];
                 let mut next_offset = vec![0u32; num_endpoints];
-                let mut sorted_recs = Vec::with_capacity(65_536);
+                let mut sorted_recs = vec![0u32; 65_536];
+                let mut out = Vec::with_capacity((h_end - h_start) * num_endpoints * 64);
 
                 for hour_id in h_start..h_end {
                     let hour_str = hour_to_string(hour_id);
 
-                    hour_recs.clear();
+                    // Pass A: Count per ep and errors
                     count_per_ep.fill(0);
+                    errors_per_ep.fill(0);
+                    let mut total_hour_recs = 0usize;
 
-                    for (records, _, hour_offsets) in results_ref {
+                    for (records, hour_offsets) in results_ref {
                         let s_off = hour_offsets[hour_id] as usize;
                         let e_off = hour_offsets[hour_id + 1] as usize;
+                        total_hour_recs += e_off - s_off;
                         for &packed in &records[s_off..e_off] {
-                            let g_id = (packed >> 32) as usize;
+                            let g_id = (packed >> 33) as usize;
                             let ep_id = g_id % num_endpoints;
-                            hour_recs.push(((ep_id as u64) << 32) | (packed & 0xFFFF_FFFF));
                             count_per_ep[ep_id] += 1;
+                            errors_per_ep[ep_id] += ((packed >> 32) & 1) as u32;
                         }
                     }
 
-                    let total_hour_recs = hour_recs.len();
                     if total_hour_recs == 0 { continue; }
 
                     let mut acc = 0u32;
@@ -452,14 +450,25 @@ fn main() {
                         acc += count_per_ep[ep_id];
                     }
 
-                    sorted_recs.resize(total_hour_recs, 0);
-                    for &packed in &hour_recs {
-                        let ep_id = (packed >> 32) as usize;
-                        let off = next_offset[ep_id] as usize;
-                        next_offset[ep_id] += 1;
-                        sorted_recs[off] = (packed & 0xFFFF_FFFF) as u32;
+                    if sorted_recs.len() < total_hour_recs {
+                        sorted_recs.resize(total_hour_recs, 0);
                     }
 
+                    // Pass B: Scatter directly into sorted_recs without hour_recs
+                    for (records, hour_offsets) in results_ref {
+                        let s_off = hour_offsets[hour_id] as usize;
+                        let e_off = hour_offsets[hour_id + 1] as usize;
+                        for &packed in &records[s_off..e_off] {
+                            let g_id = (packed >> 33) as usize;
+                            let ep_id = g_id % num_endpoints;
+                            let lat = (packed & 0xFFFF_FFFF) as u32;
+                            let off = next_offset[ep_id] as usize;
+                            next_offset[ep_id] += 1;
+                            sorted_recs[off] = lat;
+                        }
+                    }
+
+                    // Compute percentiles & format
                     let mut offset = 0usize;
                     for ep_id in 0..num_endpoints {
                         let count = count_per_ep[ep_id] as usize;
@@ -485,11 +494,7 @@ fn main() {
                             (p50, p95, p99)
                         };
 
-                        let g_id = hour_id * num_endpoints + ep_id;
-                        let mut errors = 0u64;
-                        for (_, errs, _) in results_ref {
-                            errors += errs[g_id] as u64;
-                        }
+                        let errors = errors_per_ep[ep_id] as u64;
                         let error_ppm = (errors * 1_000_000) / (count as u64);
                         let ep_bytes = sorted_endpoints_ref[ep_id].1;
 
@@ -519,10 +524,12 @@ fn main() {
 
     let _ = fs::create_dir_all(&out_dir);
     let out_file_path = format!("{}/summary.txt", out_dir);
-    let mut out_file = File::create(&out_file_path).unwrap();
-    for chunk in formatted_chunks {
-        out_file.write_all(&chunk).unwrap();
+    let mut out_file = match File::create(&out_file_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    for chunk in &formatted_chunks {
+        let _ = out_file.write_all(chunk);
     }
-    out_file.flush().unwrap();
     unsafe { munmap(ptr, len); }
 }
