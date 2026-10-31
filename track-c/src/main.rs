@@ -166,12 +166,22 @@ fn main() {
         }
     }
 
-    // 1. Fast load regions.csv
+    // 1. Fast load regions.csv via mmap (zero heap allocation)
     let regions_path = format!("{}/regions.csv", data_dir);
-    let regions_data = match fs::read(&regions_path) {
-        Ok(b) => b,
+    let regions_file = match File::open(&regions_path) {
+        Ok(f) => f,
         Err(_) => return,
     };
+    let r_len = match regions_file.metadata() {
+        Ok(m) => m.len() as usize,
+        Err(_) => return,
+    };
+    if r_len == 0 { return; }
+    let r_ptr = unsafe {
+        mmap(std::ptr::null_mut(), r_len, PROT_READ, MAP_SHARED, regions_file.as_raw_fd(), 0)
+    };
+    if r_ptr == usize::MAX as *mut u8 { return; }
+    let regions_data = unsafe { std::slice::from_raw_parts(r_ptr, r_len) };
 
     let mut seen = [false; 17576];
     let mut pos = 0;
@@ -203,22 +213,22 @@ fn main() {
     }
 
     let mut country_names: Vec<Vec<u8>> = Vec::with_capacity(300);
-    let mut code_map = [u16::MAX; 17576];
+    let mut code_map = [u8::MAX; 17576];
     for idx in 0..17576 {
         if seen[idx] {
             let c0 = b'A' + (idx / 676) as u8;
             let c1 = b'A' + ((idx / 26) % 26) as u8;
             let c2 = b'A' + (idx % 26) as u8;
-            let c_id = country_names.len() as u16;
+            let c_id = country_names.len() as u8;
             country_names.push(vec![c0, c1, c2]);
             code_map[idx] = c_id;
         }
     }
-    let unmatched_id = country_names.len() as u16;
+    let unmatched_id = country_names.len() as u8;
     country_names.push(b"_UNMATCHED".to_vec());
     let num_countries = country_names.len();
 
-    let mut region_to_country: Vec<u16> = vec![unmatched_id; 1_000_000];
+    let mut region_to_country: Vec<u8> = vec![unmatched_id; 1_000_000];
     pos = body_start;
     while pos < regions_data.len() {
         let mut rid = 0usize;
@@ -247,7 +257,7 @@ fn main() {
             }
         }
     }
-    drop(regions_data);
+    unsafe { munmap(r_ptr, r_len); }
 
     // 2. Mmap records.csv
     let records_path = format!("{}/records.csv", data_dir);
@@ -285,7 +295,7 @@ fn main() {
         header_end += 1;
     }
 
-    let num_threads = 8;
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -312,8 +322,8 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut seen_table = FastSeenTable::new(131072);
-                let mut local_names: Vec<u64> = Vec::with_capacity(105_000);
+                let mut seen_table = FastSeenTable::new(65536);
+                let mut local_names: Vec<u64> = Vec::with_capacity(75_000);
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -562,12 +572,12 @@ fn main() {
 
             s.spawn(move || {
                 let mut local_distincts = Vec::with_capacity(end - start);
-                let mut cursors = [0usize; 8];
-                let mut ends = [0usize; 8];
+                let mut cursors = [0usize; 16];
+                let mut ends = [0usize; 16];
 
                 for c_id in start..end {
                     let mut has_any = false;
-                    for t in 0..8 {
+                    for t in 0..num_threads {
                         let (s_off, e_off) = thread_outputs_ref[t].2[c_id];
                         cursors[t] = s_off as usize;
                         ends[t] = e_off as usize;
@@ -584,8 +594,8 @@ fn main() {
                     let mut last_val = u64::MAX;
                     loop {
                         let mut min_val = u64::MAX;
-                        let mut min_t = 8;
-                        for t in 0..8 {
+                        let mut min_t = num_threads;
+                        for t in 0..num_threads {
                             let cur = cursors[t];
                             if cur < ends[t] {
                                 let val = unsafe { *thread_outputs_ref[t].1.get_unchecked(cur) };
@@ -595,7 +605,7 @@ fn main() {
                                 }
                             }
                         }
-                        if min_t == 8 {
+                        if min_t == num_threads {
                             break;
                         }
                         cursors[min_t] += 1;
