@@ -210,8 +210,7 @@ fn main() {
     if ptr == usize::MAX as *mut u8 || ptr.is_null() { return; }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    // 6 worker threads matches Hetzner 6 physical P-cores with zero hyperthread cache contention
-    let num_threads = 6;
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
     // Parallel Endpoint Discovery across 6 threads over first 6.0MB (takes ~3ms)
     let disc_threads = 6.min(num_threads);

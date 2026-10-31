@@ -232,7 +232,7 @@ fn main() {
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
-    let num_threads = 6;
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -319,7 +319,18 @@ fn main() {
                         } else {
                             let n_start = pos;
                             let mut crc: u32 = 0;
-                            while *p.add(pos) != b',' {
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    crc = crc32_hardware(crc, p.add(pos), off);
+                                    pos += off;
+                                    break;
+                                } else {
+                                    crc = crc32_hardware(crc, p.add(pos), 8);
+                                    pos += 8;
+                                }
+                            }
+                            while pos < end && *p.add(pos) != b',' {
                                 crc = _mm_crc32_u8(crc, *p.add(pos));
                                 pos += 1;
                             }
