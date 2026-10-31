@@ -6,7 +6,7 @@ use std::thread;
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
 const NUM_HOURS: usize = 72;
-const MAX_LOCAL_EPS: usize = 4096;
+const MAX_LOCAL_EPS: usize = 2048;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -89,11 +89,6 @@ impl<'a> LocalCatalog<'a> {
     }
 
     #[inline(always)]
-    fn get_or_insert(&mut self, ep: &'a [u8]) -> u16 {
-        self.get_or_insert_with_hash(ep, hash_bytes(ep))
-    }
-
-    #[inline(always)]
     fn get_or_insert_with_hash(&mut self, ep: &'a [u8], h: u64) -> u16 {
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -112,11 +107,33 @@ impl<'a> LocalCatalog<'a> {
             idx = (idx + 1) & self.mask;
         }
     }
-}
 
-struct ThreadOutput<'a> {
-    catalog: LocalCatalog<'a>,
-    records: Vec<u64>,
+    #[inline(always)]
+    fn get_id_with_hash(&self, h: u64) -> u16 {
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let slot = unsafe { *self.table.get_unchecked(idx) };
+            if slot.0 == h {
+                return slot.1;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn set_mapped_id(&mut self, h: u64, new_id: u16) {
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let slot = unsafe { *self.table.get_unchecked(idx) };
+            if slot.0 == h {
+                unsafe {
+                    self.table.get_unchecked_mut(idx).1 = new_id;
+                }
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
 }
 
 fn main() {
@@ -159,9 +176,16 @@ fn main() {
     }
     boundaries.push(len);
 
-    let mut thread_outputs: Vec<ThreadOutput> = Vec::with_capacity(num_threads);
+    // =========================================================================
+    // PASS 1: Parse lines, discover local endpoints, count (hour, local_ep)
+    // =========================================================================
+    struct Pass1Result<'a> {
+        catalog: LocalCatalog<'a>,
+        counts: Vec<u32>,
+        errors: Vec<u32>,
+    }
 
-    thread::scope(|s| {
+    let pass1_results: Vec<Pass1Result> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -172,9 +196,9 @@ fn main() {
             let chunk = &data[start..end];
 
             handles.push(s.spawn(move || {
-                let est_records = (end - start) / 75 + 1024;
                 let mut catalog = LocalCatalog::new(4096);
-                let mut records = Vec::with_capacity(est_records);
+                let mut counts = vec![0u32; NUM_HOURS * MAX_LOCAL_EPS];
+                let mut errors = vec![0u32; NUM_HOURS * MAX_LOCAL_EPS];
 
                 let mut pos = 0;
                 let chunk_len = chunk.len();
@@ -223,56 +247,48 @@ fn main() {
                     let ep_len = (ep_end - ep_start) as u64;
                     let h_combined = (ep_len << 32) | (h as u64);
 
-                    let ep_id = catalog.get_or_insert_with_hash(&chunk[ep_start..ep_end], h_combined);
-
+                    let ep_id = catalog.get_or_insert_with_hash(&chunk[ep_start..ep_end], h_combined) as usize;
                     let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
-                    let mut idx = ep_end + 5;
 
-                    let mut latency: u32 = 0;
-                    while idx < chunk_len {
-                        let b = unsafe { *cptr.add(idx) };
-                        if b >= b'0' && b <= b'9' {
-                            latency = latency * 10 + (b - b'0') as u32;
-                            idx += 1;
-                        } else {
-                            break;
-                        }
+                    let cell = hour_id * MAX_LOCAL_EPS + ep_id;
+                    counts[cell] += 1;
+                    if is_error {
+                        errors[cell] += 1;
                     }
 
-                    let local_group_id = (hour_id * MAX_LOCAL_EPS + ep_id as usize) as u64;
-                    let packed = local_group_id | ((is_error as u64) << 20) | ((latency as u64) << 32);
-                    records.push(packed);
-
+                    // Seek past latency to newline
+                    let mut idx = ep_end + 5;
+                    while idx < chunk_len && unsafe { *cptr.add(idx) } >= b'0' {
+                        idx += 1;
+                    }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
                     pos = idx;
                 }
 
-                ThreadOutput { catalog, records }
+                Pass1Result { catalog, counts, errors }
             }));
         }
 
-        for h in handles {
-            thread_outputs.push(h.join().unwrap());
-        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 1. Unify all endpoints across threads
+    // =========================================================================
+    // UNIFY ENDPOINTS & COMPUTE OFFSETS
+    // =========================================================================
     let mut global_catalog = LocalCatalog::new(4096);
-    let mut thread_ep_remap: Vec<Vec<u16>> = Vec::with_capacity(thread_outputs.len());
+    let mut thread_ep_remap: Vec<Vec<u16>> = Vec::with_capacity(pass1_results.len());
 
-    for th in &thread_outputs {
-        let mut remap = Vec::with_capacity(th.catalog.endpoints.len());
-        for &ep in &th.catalog.endpoints {
-            let global_id = global_catalog.get_or_insert(ep);
+    for res in &pass1_results {
+        let mut remap = Vec::with_capacity(res.catalog.endpoints.len());
+        for &ep in &res.catalog.endpoints {
+            let global_id = global_catalog.get_or_insert_with_hash(ep, hash_bytes(ep));
             remap.push(global_id);
         }
         thread_ep_remap.push(remap);
     }
 
     let num_endpoints = global_catalog.endpoints.len();
-
-    // Sort endpoints alphabetically to get canonical ranks
     let mut sorted_endpoints: Vec<(usize, &[u8])> = global_catalog
         .endpoints
         .iter()
@@ -286,107 +302,163 @@ fn main() {
         global_to_sorted[old_id] = sorted_rank;
     }
 
+    let thread_local_to_sorted: Vec<Vec<u16>> = thread_ep_remap
+        .iter()
+        .map(|remap| {
+            remap.iter().map(|&g_id| global_to_sorted[g_id as usize] as u16).collect()
+        })
+        .collect();
+
     let total_groups = NUM_HOURS * num_endpoints;
-    let num_worker_threads = thread_outputs.len();
+    let num_worker_threads = pass1_results.len();
 
-    // Parallel Pass A: Count records and errors per global group
-    let (thread_counts, thread_errors): (Vec<Vec<u32>>, Vec<Vec<u32>>) = thread::scope(|s| {
-        let handles: Vec<_> = thread_outputs
-            .iter()
-            .enumerate()
-            .map(|(th_idx, th)| {
-                let remap = &thread_ep_remap[th_idx];
-                let global_to_sorted_ref = &global_to_sorted;
-
-                s.spawn(move || {
-                    let mut local_counts = vec![0u32; total_groups];
-                    let mut local_errors = vec![0u32; total_groups];
-                    for &packed in &th.records {
-                        let local_group_id = (packed & 0xFFFFF) as usize;
-                        let hour_id = local_group_id / MAX_LOCAL_EPS;
-                        let local_ep = local_group_id % MAX_LOCAL_EPS;
-                        let is_error = ((packed >> 20) & 1) != 0;
-                        let global_ep = remap[local_ep] as usize;
-                        let sorted_ep = global_to_sorted_ref[global_ep];
-                        let g_id = hour_id * num_endpoints + sorted_ep;
-                        local_counts[g_id] += 1;
-                        if is_error {
-                            local_errors[g_id] += 1;
-                        }
-                    }
-                    (local_counts, local_errors)
-                })
-            })
-            .collect();
-
-        let mut tc = Vec::with_capacity(handles.len());
-        let mut te = Vec::with_capacity(handles.len());
-        for h in handles {
-            let (c, e) = h.join().unwrap();
-            tc.push(c);
-            te.push(e);
-        }
-        (tc, te)
-    });
-
-    // Compute prefix sums and thread write bases
     let mut group_counts = vec![0u32; total_groups];
     let mut group_errors = vec![0u32; total_groups];
     let mut thread_dest_offsets: Vec<Vec<u32>> = (0..num_worker_threads).map(|_| vec![0u32; total_groups]).collect();
     let mut group_offsets = vec![0usize; total_groups + 1];
 
+    let mut thread_canonical_counts: Vec<Vec<u32>> = (0..num_worker_threads).map(|_| vec![0u32; total_groups]).collect();
+    for (t, res) in pass1_results.iter().enumerate() {
+        let map = &thread_local_to_sorted[t];
+        for hr in 0..NUM_HOURS {
+            for (local_ep, &sorted_ep) in map.iter().enumerate() {
+                let cell = hr * MAX_LOCAL_EPS + local_ep;
+                let c = res.counts[cell];
+                if c > 0 {
+                    let g_id = hr * num_endpoints + sorted_ep as usize;
+                    thread_canonical_counts[t][g_id] = c;
+                    group_errors[g_id] += res.errors[cell];
+                }
+            }
+        }
+    }
+
     let mut cur_total = 0usize;
     for g in 0..total_groups {
         group_offsets[g] = cur_total;
         let mut g_cnt = 0u32;
-        let mut g_err = 0u32;
         let mut cur_slot = cur_total as u32;
         for t in 0..num_worker_threads {
             thread_dest_offsets[t][g] = cur_slot;
-            let c = thread_counts[t][g];
+            let c = thread_canonical_counts[t][g];
             cur_slot += c;
             g_cnt += c;
-            g_err += thread_errors[t][g];
         }
         group_counts[g] = g_cnt;
-        group_errors[g] = g_err;
         cur_total = cur_slot as usize;
     }
     group_offsets[total_groups] = cur_total;
-    drop(thread_counts);
-    drop(thread_errors);
+    drop(thread_canonical_counts);
+
+    // Overwrite local catalogs with sorted_ep directly for O(1) Pass 2 lookups
+    let mut catalogs: Vec<LocalCatalog> = Vec::with_capacity(pass1_results.len());
+    for (t, mut res) in pass1_results.into_iter().enumerate() {
+        let map = &thread_local_to_sorted[t];
+        for (local_ep, &sorted_ep) in map.iter().enumerate() {
+            let ep = res.catalog.endpoints[local_ep];
+            let h = hash_bytes(ep);
+            res.catalog.set_mapped_id(h, sorted_ep);
+        }
+        catalogs.push(res.catalog);
+    }
+    drop(thread_local_to_sorted);
 
     let mut flat_latencies = vec![0u32; cur_total];
     let flat_ptr = flat_latencies.as_mut_ptr() as usize;
 
-    // Parallel Pass B: Scatter latencies into contiguous group slices
+    // =========================================================================
+    // PASS 2: Parse raw lines second time, scatter directly to flat_latencies!
+    // =========================================================================
     thread::scope(|s| {
-        for (th_idx, (th, mut dest_offsets)) in thread_outputs.into_iter().zip(thread_dest_offsets.into_iter()).enumerate() {
-            let remap = &thread_ep_remap[th_idx];
-            let global_to_sorted_ref = &global_to_sorted;
+        for (i, (catalog, mut dest_offsets)) in catalogs.into_iter().zip(thread_dest_offsets.into_iter()).enumerate() {
+            let start = boundaries[i];
+            let end = boundaries[i + 1];
+            if start >= end {
+                continue;
+            }
+            let chunk = &data[start..end];
 
             s.spawn(move || {
                 let raw_ptr = flat_ptr as *mut u32;
-                for &packed in &th.records {
-                    let local_group_id = (packed & 0xFFFFF) as usize;
-                    let hour_id = local_group_id / MAX_LOCAL_EPS;
-                    let local_ep = local_group_id % MAX_LOCAL_EPS;
-                    let latency = (packed >> 32) as u32;
-                    let global_ep = remap[local_ep] as usize;
-                    let sorted_ep = global_to_sorted_ref[global_ep];
+                let mut pos = 0;
+                let chunk_len = chunk.len();
+                let cptr = chunk.as_ptr();
+
+                while pos + 35 <= chunk_len {
+                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
+                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
+                    let day_offset = match day {
+                        30 => 0,
+                        31 => 24,
+                        1 => 48,
+                        _ => 72,
+                    };
+                    let hour_id = day_offset + hr - 18;
+
+                    let m_byte = unsafe { *cptr.add(pos + 28) };
+                    let ep_start = match m_byte {
+                        b'G' => pos + 32,
+                        b'P' => match unsafe { *cptr.add(pos + 29) } {
+                            b'O' => pos + 33,
+                            b'U' => pos + 32,
+                            _ => pos + 34,
+                        },
+                        b'D' => pos + 35,
+                        b'H' => pos + 33,
+                        b'O' => pos + 36,
+                        _ => {
+                            let mut idx = pos + 28;
+                            while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
+                            idx + 1
+                        }
+                    };
+
+                    let mut h: u32 = 0x811c9dc5;
+                    let mut ep_end = ep_start;
+                    while ep_end < chunk_len {
+                        let b = unsafe { *cptr.add(ep_end) };
+                        if b == b' ' { break; }
+                        h = (h ^ (b as u32)).wrapping_mul(0x01000193);
+                        ep_end += 1;
+                    }
+                    if ep_end >= chunk_len {
+                        break;
+                    }
+                    let ep_len = (ep_end - ep_start) as u64;
+                    let h_combined = (ep_len << 32) | (h as u64);
+
+                    let sorted_ep = catalog.get_id_with_hash(h_combined) as usize;
                     let g_id = hour_id * num_endpoints + sorted_ep;
+
+                    let mut idx = ep_end + 5;
+                    let mut latency: u32 = 0;
+                    while idx < chunk_len {
+                        let b = unsafe { *cptr.add(idx) };
+                        if b >= b'0' && b <= b'9' {
+                            latency = latency * 10 + (b - b'0') as u32;
+                            idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
                     let slot = dest_offsets[g_id] as usize;
                     dest_offsets[g_id] += 1;
                     unsafe {
                         *raw_ptr.add(slot) = latency;
                     }
+
+                    if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
+                    if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
+                    pos = idx;
                 }
             });
         }
     });
-    drop(thread_ep_remap);
 
-    // Parallel percentiles computation & output formatting
+    // =========================================================================
+    // PASS 3: Sort group latencies & format output
+    // =========================================================================
     let hours_per_chunk = (NUM_HOURS + num_threads - 1) / num_threads;
     let formatted_chunks: Vec<Vec<u8>> = thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_chunk).map(|h_start| {
@@ -449,7 +521,6 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Write formatted chunks sequentially
     let _ = fs::create_dir_all("/out");
     let mut out_file = File::create("/out/summary.txt").unwrap();
     for chunk in formatted_chunks {

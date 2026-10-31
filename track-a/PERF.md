@@ -9,6 +9,15 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Open-addressing EndpointCatalog, single-pass parallel record packing, and contiguous counting sort | run-e7cdfb3f6a83 | 0.1466 | 57.7 | 58.57 |
 | 3 | Packed u64 records with SIMD-aligned chunk boundaries and fast status/method routing | run-e03b5af449fd | 0.0667 | 60.8 | 65.91 |
 | 4 | 32-bit FNV-1a endpoint hash with length folding, zero-discriminant catalog, and target-cpu=native | run-c756d9c1f1dd | 0.0661 | 57.9 | 66.30 |
+| 5 | Two-pass streaming parse directly into flat latencies buffer, eliminating 25 MB intermediate Vec<u64> records | pending | | | |
+
+### Step 5 Optimization Details
+- Completely eliminated `records: Vec<u64>` (which stored 3.1 million 64-bit records and consumed 24.8 MB across worker threads).
+- Replaced three-pass scatter architecture with a two-pass streaming parse over the memory-mapped log:
+  - **Pass 1**: Discovers thread-local endpoints and computes exact frequency counts and 5xx error counts per `(hour, endpoint)` directly in cache.
+  - **Unification**: Merges endpoint catalogs, sorts endpoints alphabetically, and writes canonical sorted IDs directly into hash table slots.
+  - **Pass 2**: Streams over the log chunk a second time, resolving sorted endpoint IDs and scattering 32-bit latencies directly into contiguous group slots in the single `flat_latencies` buffer with zero intermediate allocation.
+- Shrinks peak heap memory footprint by ~3.4x (from 56.4 MB down to ~16 MB) while reducing cache eviction pressure.
 
 ### Step 2 Optimization Details
 - Replaced per-record `BTreeMap` lookups with thread-local open-addressing `LocalCatalog` using linear probing in L1/L2 cache.
