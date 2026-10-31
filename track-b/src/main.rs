@@ -8,7 +8,6 @@ use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn malloc_trim(pad: usize) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
@@ -55,20 +54,28 @@ struct DictEntry {
 struct Dict {
     table: Vec<DictEntry>,
     mask: usize,
+    bloom: Vec<u64>,
+    bloom_mask: usize,
 }
 
 impl Dict {
     fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two();
+        let b_size = 65536; // 64K u64 = 512 KB
         Self {
             table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 23] }; cap],
             mask: cap - 1,
+            bloom: vec![0u64; b_size],
+            bloom_mask: b_size - 1,
         }
     }
 
     fn insert(&mut self, term: &[u8], term_id: u32) {
         if term.len() > 23 { return; }
         let h = unsafe { hash_bytes_fast(term.as_ptr(), term.len()) };
+        let b_idx = (h as usize) & self.bloom_mask;
+        self.bloom[b_idx] |= 1u64 << ((h >> 16) & 63);
+
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = &mut self.table[idx];
@@ -99,27 +106,18 @@ impl Dict {
     fn get(&self, term: &[u8]) -> Option<u32> {
         if term.len() > 23 { return None; }
         let h = unsafe { hash_bytes_fast(term.as_ptr(), term.len()) };
-        let mut idx = (h as usize) & self.mask;
-        loop {
-            let e = unsafe { self.table.get_unchecked(idx) };
-            if e.hash == 0 { return None; }
-            if e.hash == h && e.len as usize == term.len() {
-                let mut match_tok = true;
-                for i in 0..term.len() {
-                    if e.bytes[i] != (term[i] | 0x20) {
-                        match_tok = false;
-                        break;
-                    }
-                }
-                if match_tok { return Some(e.term_id); }
-            }
-            idx = (idx + 1) & self.mask;
-        }
+        self.get_with_hash(term.as_ptr(), term.len(), h)
     }
 
     #[inline(always)]
     fn get_with_hash(&self, raw: *const u8, len: usize, h: u32) -> Option<u32> {
         if len > 23 { return None; }
+        let b_idx = (h as usize) & self.bloom_mask;
+        let bit = 1u64 << ((h >> 16) & 63);
+        if unsafe { *self.bloom.get_unchecked(b_idx) & bit } == 0 {
+            return None;
+        }
+
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = unsafe { self.table.get_unchecked(idx) };
@@ -155,14 +153,6 @@ enum ParsedQuery<'a> {
         terms: Vec<Option<u32>>,
         raw_tokens: Vec<&'a [u8]>,
     },
-}
-
-#[derive(Clone)]
-struct QueryAccum {
-    count: u64,
-    id_sum: u64,
-    top_k: [u32; 10],
-    top_k_len: u8,
 }
 
 #[inline(always)]
@@ -323,6 +313,14 @@ fn write_u64_fast(mut n: u64, out: &mut Vec<u8>) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct QueryAccum {
+    count: u32,
+    id_sum: u64,
+    top_k: [u32; 10],
+    top_k_len: u8,
+}
+
 const NUM_SEGMENTS: usize = 4;
 
 fn main() {
@@ -443,7 +441,7 @@ fn main() {
     }
     seg_byte_boundaries[NUM_SEGMENTS] = docs_len;
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
+    let num_threads = 6; // 6 dedicated P-cores
     let mut running_global_doc_id = 0u32;
 
     for seg in 0..NUM_SEGMENTS {
@@ -472,9 +470,11 @@ fn main() {
             cur_sb = end;
         }
 
-        // Pass 1 on this segment
-        let pass1: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = sub_chunks.iter().map(|&(sb, eb)| {
+        // Single Pass: tokenize documents, collect (term_id, doc_id) pairs directly
+        // pair = ((term_id as u64) << 16) | (d_id as u64)
+        type ThreadSegResult = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u64>);
+        let thread_results: Vec<ThreadSegResult> = std::thread::scope(|s| {
+            let handles: Vec<_> = sub_chunks.iter().enumerate().map(|(_t, &(sb, eb))| {
                 let dict_ref = &dict;
                 let chunk = &seg_slice[sb..eb];
                 s.spawn(move || {
@@ -483,6 +483,8 @@ fn main() {
                     let est_docs = ((eb - sb) / 1000 + 512).max(4000);
                     let mut local_starts = Vec::with_capacity(est_docs);
                     let mut local_lens = Vec::with_capacity(est_docs);
+                    let mut local_postings = Vec::with_capacity(est_docs * 80);
+
                     let mut i = 0;
                     let clen = chunk.len();
                     let mut loc_doc: u16 = 0;
@@ -516,6 +518,7 @@ fn main() {
                                         unsafe {
                                             *last_seen.get_unchecked_mut(tid) = loc_doc;
                                             *local_counts.get_unchecked_mut(tid) += 1;
+                                            local_postings.push(((term_id as u64) << 16) | (loc_doc as u64));
                                         }
                                     }
                                 }
@@ -523,7 +526,8 @@ fn main() {
                         }
                         loc_doc += 1;
                     }
-                    (local_counts, local_starts, local_lens)
+                    local_postings.sort_unstable();
+                    (local_counts, local_starts, local_lens, local_postings)
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -531,7 +535,7 @@ fn main() {
 
         let mut t_start_doc = Vec::with_capacity(num_threads);
         let mut cur_d = 0u16;
-        for r in &pass1 {
+        for r in &thread_results {
             t_start_doc.push(cur_d);
             cur_d += r.1.len() as u16;
         }
@@ -540,7 +544,7 @@ fn main() {
 
         let mut seg_doc_starts = Vec::with_capacity(seg_docs_count);
         let mut seg_doc_lens = Vec::with_capacity(seg_docs_count);
-        for r in &pass1 {
+        for r in &thread_results {
             seg_doc_starts.extend_from_slice(&r.1);
             seg_doc_lens.extend_from_slice(&r.2);
         }
@@ -553,7 +557,7 @@ fn main() {
             let mut cur = total_postings;
             for t in 0..num_threads {
                 t_write_bases[t][term] = cur;
-                cur += pass1[t].0[term];
+                cur += thread_results[t].0[term];
             }
             total_postings = cur;
         }
@@ -562,45 +566,20 @@ fn main() {
         let mut all_postings: Vec<u16> = vec![0u16; total_postings as usize];
         let base_postings_ptr = all_postings.as_mut_ptr() as usize;
 
-        // Pass 2 on this segment: populate u16 postings
+        // Populate all_postings directly from thread local_postings
         std::thread::scope(|s| {
-            for (t, r) in pass1.into_iter().enumerate() {
-                let dict_ref = &dict;
-                let seg_slice_ref = seg_slice;
-                let starts = r.1;
-                let lens = r.2;
+            for (t, r) in thread_results.into_iter().enumerate() {
                 let s_doc = t_start_doc[t];
                 let mut write_pos = t_write_bases[t].clone();
                 s.spawn(move || {
                     let raw_p = base_postings_ptr as *mut u16;
-                    let mut last_seen = vec![u16::MAX; num_terms as usize];
-                    for (loc_idx, (&start, &len)) in starts.iter().zip(lens.iter()).enumerate() {
-                        let d_id = s_doc + loc_idx as u16;
-                        let text = &seg_slice_ref[start as usize..(start + len) as usize];
-                        let base_ptr = text.as_ptr();
-                        let mut p = 0;
-                        let tlen = text.len();
-                        while p < tlen {
-                            while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } { p += 1; }
-                            if p >= tlen { break; }
-                            let tok_start = p;
-                            while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } { p += 1; }
-                            let tok_len = p - tok_start;
-                            if tok_len <= 23 {
-                                let ptr_tok = unsafe { base_ptr.add(tok_start) };
-                                let h = unsafe { hash_bytes_fast(ptr_tok, tok_len) };
-                                if let Some(term_id) = dict_ref.get_with_hash(ptr_tok, tok_len, h) {
-                                    let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != d_id {
-                                        unsafe {
-                                            *last_seen.get_unchecked_mut(tid) = d_id;
-                                            let slot = *write_pos.get_unchecked(tid) as usize;
-                                            *write_pos.get_unchecked_mut(tid) += 1;
-                                            *raw_p.add(slot) = d_id;
-                                        }
-                                    }
-                                }
-                            }
+                    for pair in r.3 {
+                        let tid = (pair >> 16) as usize;
+                        let loc_d = (pair as u16) + s_doc;
+                        let slot = write_pos[tid] as usize;
+                        write_pos[tid] += 1;
+                        unsafe {
+                            *raw_p.add(slot) = loc_d;
                         }
                     }
                 });
@@ -608,22 +587,24 @@ fn main() {
         });
 
         // Parallel Query Evaluation against this segment
-        let chunk_q = (num_queries + num_threads - 1) / num_threads;
-        let partials: Vec<Vec<(u32, u64, [u32; 10], u8)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..num_queries).step_by(chunk_q).map(|q_start| {
-                let q_end = (q_start + chunk_q).min(num_queries);
+        let q_chunk_size = (parsed_queries.len() + num_threads - 1) / num_threads;
+
+        let thread_accums: Vec<Vec<QueryAccum>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..num_threads).map(|t| {
+                let q_start = t * q_chunk_size;
+                let q_end = (q_start + q_chunk_size).min(parsed_queries.len());
                 let queries_ref = &parsed_queries[q_start..q_end];
                 let offsets_ref = &offsets;
                 let all_postings_ref = &all_postings;
+                let seg_slice_ref = seg_slice;
                 let doc_starts_ref = &seg_doc_starts;
                 let doc_lens_ref = &seg_doc_lens;
-                let seg_slice_ref = seg_slice;
 
                 s.spawn(move || {
-                    let mut seg_res = Vec::with_capacity(q_end - q_start);
-                    let mut buf_a = Vec::with_capacity(16_384);
-                    let mut buf_b = Vec::with_capacity(16_384);
-                    let mut matches = Vec::new();
+                    let mut local_res = Vec::with_capacity(q_end - q_start);
+                    let mut buf_a: Vec<u16> = Vec::with_capacity(8192);
+                    let mut buf_b: Vec<u16> = Vec::with_capacity(8192);
+                    let mut matches: Vec<u16> = Vec::with_capacity(1024);
 
                     let get_postings = |term_id: u32| -> &[u16] {
                         let tid = term_id as usize;
@@ -770,47 +751,47 @@ fn main() {
                                 }
                             }
                         }
-                        seg_res.push((c_count, c_sum, c_top, c_top_len));
+                        local_res.push(QueryAccum { count: c_count, id_sum: c_sum, top_k: c_top, top_k_len: c_top_len });
                     }
-                    seg_res
+                    local_res
                 })
             }).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        // Accumulate segment results into global query_accums
-        let mut idx = 0;
-        for p_chunk in partials {
-            for (c, s, top, top_len) in p_chunk {
-                let acc = &mut query_accums[idx];
-                acc.count += c as u64;
-                acc.id_sum += s;
-                let needed = (10 - acc.top_k_len as usize).min(top_len as usize);
-                for k in 0..needed {
-                    acc.top_k[acc.top_k_len as usize] = top[k];
-                    acc.top_k_len += 1;
+        for (t, res) in thread_accums.into_iter().enumerate() {
+            let q_start = t * q_chunk_size;
+            for (idx, item) in res.into_iter().enumerate() {
+                let q_id = q_start + idx;
+                let cur = &mut query_accums[q_id];
+                cur.count += item.count;
+                cur.id_sum += item.id_sum;
+                let free = 10 - cur.top_k_len as usize;
+                let take = free.min(item.top_k_len as usize);
+                for k in 0..take {
+                    cur.top_k[cur.top_k_len as usize + k] = item.top_k[k];
                 }
-                idx += 1;
+                cur.top_k_len += take as u8;
             }
         }
 
-        // Unmap segment slice immediately to release page cache
         unsafe {
-            madvise(ptr, page_len, 4); // MADV_DONTNEED
             munmap(ptr, page_len);
             malloc_trim(0);
         }
     }
 
-    // Format final results
     let _ = std::fs::create_dir_all(&out_dir);
-    let mut out_file = File::create(&results_path).expect("create results.txt");
+    let mut out_file = match File::create(&results_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
     let mut out_buf = Vec::with_capacity(num_queries * 32);
     for acc in query_accums {
         if acc.count == 0 {
             out_buf.extend_from_slice(b"0 0\n");
         } else {
-            write_u64_fast(acc.count, &mut out_buf);
+            write_u64_fast(acc.count as u64, &mut out_buf);
             out_buf.push(b' ');
             write_u64_fast(acc.id_sum, &mut out_buf);
             for i in 0..(acc.top_k_len as usize) {

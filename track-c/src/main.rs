@@ -35,6 +35,17 @@ fn find_quote_swar(w: u64) -> Option<usize> {
 }
 
 #[inline(always)]
+fn find_comma_swar(w: u64) -> Option<usize> {
+    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
+    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    if m != 0 {
+        Some((m.trailing_zeros() >> 3) as usize)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
 unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
     let mut c = crc as u64;
     let mut i = 0;
@@ -221,7 +232,7 @@ fn main() {
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
+    let num_threads = 6;
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -360,7 +371,16 @@ fn main() {
                             if *p.add(pos) == b',' { pos += 1; }
                         } else {
                             let n_start = pos;
-                            while *p.add(pos) != b',' { pos += 1; }
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    pos += off;
+                                    break;
+                                } else {
+                                    pos += 8;
+                                }
+                            }
+                            while pos < end && *p.add(pos) != b',' { pos += 1; }
                             note_len = (pos - n_start) as u64;
                             pos += 1;
                         }
