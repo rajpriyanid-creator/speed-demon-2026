@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::collections::BinaryHeap;
 
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
@@ -12,60 +13,23 @@ extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
-struct FastHeap { data: Vec<u64> }
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct State {
+    cost: u64,
+    node: u32,
+}
 
-impl FastHeap {
+impl Ord for State {
     #[inline(always)]
-    fn new() -> Self { Self { data: Vec::with_capacity(2048) } }
-
-    #[inline(always)]
-    fn clear(&mut self) { self.data.clear(); }
-
-    #[inline(always)]
-    fn push(&mut self, cost: u64, node: u32) {
-        let val = (cost << 21) | node as u64;
-        let mut i = self.data.len();
-        self.data.push(val);
-        while i > 0 {
-            let p = (i - 1) >> 2;
-            let parent = unsafe { *self.data.get_unchecked(p) };
-            if val >= parent { break; }
-            unsafe { *self.data.get_unchecked_mut(i) = parent; *self.data.get_unchecked_mut(p) = val; }
-            i = p;
-        }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.cost.cmp(&self.cost)
     }
+}
 
+impl PartialOrd for State {
     #[inline(always)]
-    fn peek(&self) -> Option<(u64, u32)> {
-        self.data.first().map(|&v| (v >> 21, (v & 0x1F_FFFF) as u32))
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        if self.data.is_empty() { return None; }
-        let top = self.data[0];
-        let last = self.data.pop().unwrap();
-        if !self.data.is_empty() {
-            let len = self.data.len();
-            let mut i = 0usize;
-            loop {
-                let first = (i << 2) + 1;
-                if first >= len { break; }
-                let count = (len - first).min(4);
-                let mut child = first;
-                let mut best = unsafe { *self.data.get_unchecked(first) };
-                for k in 1..count {
-                    let idx = first + k;
-                    let value = unsafe { *self.data.get_unchecked(idx) };
-                    if value < best { best = value; child = idx; }
-                }
-                if best >= last { break; }
-                unsafe { *self.data.get_unchecked_mut(i) = best; }
-                i = child;
-            }
-            unsafe { *self.data.get_unchecked_mut(i) = last; }
-        }
-        Some((top >> 21, (top & 0x1F_FFFF) as u32))
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -326,8 +290,8 @@ fn main() {
                 let mut db = vec![u64::MAX; n];
                 let mut visited_f = Vec::with_capacity(2048);
                 let mut visited_b = Vec::with_capacity(2048);
-                let mut qf = FastHeap::new();
-                let mut qb = FastHeap::new();
+                let mut qf: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
+                let mut qb: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
                 let res_raw = results_ptr as *mut i64;
 
                 const BATCH: usize = 16;
@@ -361,17 +325,17 @@ fn main() {
 
                         df[s_idx] = 0;
                         visited_f.push(src);
-                                qf.push(0, src);
+                        qf.push(State { cost: 0, node: src });
 
                         db[t_idx] = 0;
                         visited_b.push(dst);
-                                qb.push(0, dst);
+                        qb.push(State { cost: 0, node: dst });
 
                         let mut best = u64::MAX;
-                        while let (Some((top_f, _)), Some((top_b, _))) = (qf.peek(), qb.peek()) {
-                            if top_f.saturating_add(top_b) >= best { break; }
-                            if top_f <= top_b {
-                                let (cost, node) = qf.pop().unwrap();
+                        while let (Some(&top_f), Some(&top_b)) = (qf.peek(), qb.peek()) {
+                            if top_f.cost.saturating_add(top_b.cost) >= best { break; }
+                            if top_f.cost <= top_b.cost {
+                                let State { cost, node } = qf.pop().unwrap();
                                 if cost > df[node as usize] { continue; }
                                 let u = node as usize;
                                 let es = f_head_ref[u] as usize;
@@ -391,7 +355,7 @@ fn main() {
                                     if new_cost < df[v_idx] {
                                         if df[v_idx] == u64::MAX { visited_f.push(v); }
                                         df[v_idx] = new_cost;
-                                        qf.push(new_cost, v);
+                                        qf.push(State { cost: new_cost, node: v });
                                         let db_val = db[v_idx];
                                         if db_val != u64::MAX {
                                             let total = new_cost + db_val;
@@ -400,7 +364,7 @@ fn main() {
                                     }
                                 }
                             } else {
-                                let (cost, node) = qb.pop().unwrap();
+                                let State { cost, node } = qb.pop().unwrap();
                                 if cost > db[node as usize] { continue; }
                                 let u = node as usize;
                                 let es = b_head_ref[u] as usize;
@@ -420,7 +384,7 @@ fn main() {
                                     if new_cost < db[v_idx] {
                                         if db[v_idx] == u64::MAX { visited_b.push(v); }
                                         db[v_idx] = new_cost;
-                                        qb.push(new_cost, v);
+                                        qb.push(State { cost: new_cost, node: v });
                                         let df_val = df[v_idx];
                                         if df_val != u64::MAX {
                                             let total = new_cost + df_val;
