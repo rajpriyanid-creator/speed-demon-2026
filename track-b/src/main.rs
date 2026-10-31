@@ -523,7 +523,10 @@ fn main() {
     }
     block_byte_boundaries[NUM_BLOCKS] = docs_len;
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
+    // The scoring host exposes twelve hardware threads. Keep the same worker
+    // count for indexing and per-block query evaluation so the CPU-bound
+    // phases do not leave two cores idle.
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(12).min(12);
 
     let mut thread_postings: Vec<Vec<u64>> = (0..num_threads)
         .map(|_| Vec::with_capacity(150_000))
