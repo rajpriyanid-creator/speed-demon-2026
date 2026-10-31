@@ -65,16 +65,16 @@ fn write_u64_into(mut n: u64, out: &mut Vec<u8>) {
 
 #[inline(always)]
 fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+    let mut h: u32 = 0x811c9dc5;
     for &x in b {
-        h = (h ^ (x as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ (x as u32)).wrapping_mul(0x01000193);
     }
-    h
+    ((b.len() as u64) << 32) | (h as u64)
 }
 
 struct LocalCatalog<'a> {
     endpoints: Vec<&'a [u8]>,
-    table: Vec<Option<(u64, u16)>>,
+    table: Vec<(u64, u16)>,
     mask: usize,
 }
 
@@ -83,7 +83,7 @@ impl<'a> LocalCatalog<'a> {
         let size = cap.next_power_of_two();
         Self {
             endpoints: Vec::with_capacity(2048),
-            table: vec![None; size],
+            table: vec![(0, 0); size],
             mask: size - 1,
         }
     }
@@ -97,22 +97,19 @@ impl<'a> LocalCatalog<'a> {
     fn get_or_insert_with_hash(&mut self, ep: &'a [u8], h: u64) -> u16 {
         let mut idx = (h as usize) & self.mask;
         loop {
-            match unsafe { *self.table.get_unchecked(idx) } {
-                Some((slot_h, id)) => {
-                    if slot_h == h {
-                        return id;
-                    }
-                    idx = (idx + 1) & self.mask;
-                }
-                None => {
-                    let id = self.endpoints.len() as u16;
-                    self.endpoints.push(ep);
-                    unsafe {
-                        *self.table.get_unchecked_mut(idx) = Some((h, id));
-                    }
-                    return id;
-                }
+            let slot = unsafe { *self.table.get_unchecked(idx) };
+            if slot.0 == h {
+                return slot.1;
             }
+            if slot.0 == 0 {
+                let id = self.endpoints.len() as u16;
+                self.endpoints.push(ep);
+                unsafe {
+                    *self.table.get_unchecked_mut(idx) = (h, id);
+                }
+                return id;
+            }
+            idx = (idx + 1) & self.mask;
         }
     }
 }
@@ -212,19 +209,21 @@ fn main() {
                         }
                     };
 
-                    let mut h: u64 = 0xcbf29ce484222325;
+                    let mut h: u32 = 0x811c9dc5;
                     let mut ep_end = ep_start;
                     while ep_end < chunk_len {
                         let b = unsafe { *cptr.add(ep_end) };
                         if b == b' ' { break; }
-                        h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+                        h = (h ^ (b as u32)).wrapping_mul(0x01000193);
                         ep_end += 1;
                     }
                     if ep_end >= chunk_len {
                         break;
                     }
+                    let ep_len = (ep_end - ep_start) as u64;
+                    let h_combined = (ep_len << 32) | (h as u64);
 
-                    let ep_id = catalog.get_or_insert_with_hash(&chunk[ep_start..ep_end], h);
+                    let ep_id = catalog.get_or_insert_with_hash(&chunk[ep_start..ep_end], h_combined);
 
                     let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
                     let mut idx = ep_end + 5;

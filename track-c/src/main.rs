@@ -10,15 +10,29 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct CountryScalarAgg {
     count: u64,
     id_sum: u64,
     amount_sum: i64,
-    amount_min: Option<i64>,
-    amount_max: Option<i64>,
+    amount_min: i64,
+    amount_max: i64,
     name_bytes: u64,
     note_bytes: u64,
+}
+
+impl Default for CountryScalarAgg {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            id_sum: 0,
+            amount_sum: 0,
+            amount_min: i64::MAX,
+            amount_max: i64::MIN,
+            name_bytes: 0,
+            note_bytes: 0,
+        }
+    }
 }
 
 fn format_cents(cents: i64) -> String {
@@ -205,16 +219,16 @@ fn main() {
                         }
                         pos += 1; // skip comma
 
-                        // 2. name
-                        let mut n_hash: u64 = 0xcbf29ce484222325;
-                        let mut name_len: u64 = 0;
+                        // 2. name (32-bit FNV-1a with length folding)
+                        let mut n_hash: u32 = 0x811c9dc5;
+                        let mut name_len: u32 = 0;
                         if *p.add(pos) == b'"' {
                             pos += 1;
                             loop {
                                 let b = *p.add(pos);
                                 if b == b'"' {
                                     if *p.add(pos + 1) == b'"' {
-                                        n_hash = (n_hash ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
+                                        n_hash = (n_hash ^ (b'"' as u32)).wrapping_mul(0x01000193);
                                         name_len += 1;
                                         pos += 2;
                                     } else {
@@ -222,7 +236,7 @@ fn main() {
                                         break;
                                     }
                                 } else {
-                                    n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                                    n_hash = (n_hash ^ (b as u32)).wrapping_mul(0x01000193);
                                     name_len += 1;
                                     pos += 1;
                                 }
@@ -233,13 +247,13 @@ fn main() {
                         } else {
                             while *p.add(pos) != b',' {
                                 let b = *p.add(pos);
-                                n_hash = (n_hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+                                n_hash = (n_hash ^ (b as u32)).wrapping_mul(0x01000193);
                                 name_len += 1;
                                 pos += 1;
                             }
                             pos += 1; // skip comma
                         }
-                        let n_hash = n_hash ^ (name_len << 48);
+                        let n_hash_combined = ((name_len as u64) << 32) | (n_hash as u64);
 
                         // 3. note (fast skip & length computation)
                         let note_len: u64;
@@ -321,18 +335,12 @@ fn main() {
                         agg.count += 1;
                         agg.id_sum += id;
                         agg.amount_sum += cents;
-                        agg.amount_min = Some(match agg.amount_min {
-                            Some(cur) => cur.min(cents),
-                            None => cents,
-                        });
-                        agg.amount_max = Some(match agg.amount_max {
-                            Some(cur) => cur.max(cents),
-                            None => cents,
-                        });
-                        agg.name_bytes += name_len;
+                        agg.amount_min = agg.amount_min.min(cents);
+                        agg.amount_max = agg.amount_max.max(cents);
+                        agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        let packed = ((c_id as u64) << 48) | (n_hash & 0x0000_FFFF_FFFF_FFFF);
+                        let packed = ((c_id as u64) << 48) | (n_hash_combined & 0x0000_FFFF_FFFF_FFFF);
                         local_names.push(packed);
                     }
                 }
@@ -369,20 +377,8 @@ fn main() {
             g.count += t.count;
             g.id_sum += t.id_sum;
             g.amount_sum += t.amount_sum;
-            g.amount_min = Some(match g.amount_min {
-                Some(cur) => match t.amount_min {
-                    Some(t_min) => cur.min(t_min),
-                    None => cur,
-                },
-                None => t.amount_min.unwrap_or(0),
-            });
-            g.amount_max = Some(match g.amount_max {
-                Some(cur) => match t.amount_max {
-                    Some(t_max) => cur.max(t_max),
-                    None => cur,
-                },
-                None => t.amount_max.unwrap_or(0),
-            });
+            g.amount_min = g.amount_min.min(t.amount_min);
+            g.amount_max = g.amount_max.max(t.amount_max);
             g.name_bytes += t.name_bytes;
             g.note_bytes += t.note_bytes;
         }
@@ -429,8 +425,8 @@ fn main() {
         }
         let country_str = std::str::from_utf8(country_bytes).unwrap();
         let amt_sum = format_cents(agg.amount_sum);
-        let amt_min = format_cents(agg.amount_min.unwrap_or(0));
-        let amt_max = format_cents(agg.amount_max.unwrap_or(0));
+        let amt_min = format_cents(agg.amount_min);
+        let amt_max = format_cents(agg.amount_max);
         let distinct = distinct_names[c_id];
 
         writeln!(
