@@ -300,7 +300,7 @@ fn main() {
                             name_crc = _mm_crc32_u16(crc, name_len as u16);
                         }
 
-                        let note_len: u64;
+                        let mut note_len: u64 = 0;
                         if *p.add(pos) == b'"' {
                             pos += 1;
                             let n_start = pos;
@@ -475,21 +475,21 @@ fn main() {
                     }
 
                     out.extend_from_slice(&country_names_ref[c_id]);
-                    out.push(b',');
+                    out.push(b' ');
                     write_u64_fast(count, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_u64_fast(id_sum, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_cents_fast(amount_sum, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_cents_fast(amount_min, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_cents_fast(amount_max, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_u64_fast(distinct_names, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_u64_fast(name_bytes, &mut out);
-                    out.push(b',');
+                    out.push(b' ');
                     write_u64_fast(note_bytes, &mut out);
                     out.push(b'\n');
                 }

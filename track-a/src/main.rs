@@ -259,14 +259,15 @@ fn main() {
         }
     }
 
-    let mut sorted_endpoints: Vec<(usize, &[u8], u64)> = global_cat
+    // Own endpoint bytes as Vec<u8> so munmap is 100% safe!
+    let mut sorted_endpoints: Vec<(usize, Vec<u8>, u64)> = global_cat
         .endpoints
         .iter()
         .zip(global_cat.hashes.iter())
         .enumerate()
-        .map(|(old_id, (&ep, &h))| (old_id, ep, h))
+        .map(|(old_id, (&ep, &h))| (old_id, ep.to_vec(), h))
         .collect();
-    sorted_endpoints.sort_unstable_by(|a, b| a.1.cmp(b.1));
+    sorted_endpoints.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
     let mut lookup_table = FastCatalog::new(8192);
     for (sorted_id, &(_, _, h)) in sorted_endpoints.iter().enumerate() {
@@ -378,7 +379,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Unmap requests.log IMMEDIATELY
+    // Unmap requests.log IMMEDIATELY and safely!
     unsafe { munmap(ptr, len); }
 
     // Precompute partition indices for each hour in each thread
@@ -445,7 +446,7 @@ fn main() {
 
                         out.extend_from_slice(&hour_str);
                         out.push(b' ');
-                        out.extend_from_slice(sorted_endpoints_ref[ep_idx].1);
+                        out.extend_from_slice(&sorted_endpoints_ref[ep_idx].1);
                         out.push(b' ');
                         write_u64_into(count as u64, &mut out);
                         out.push(b' ');
