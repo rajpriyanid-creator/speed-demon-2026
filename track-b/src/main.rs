@@ -28,7 +28,7 @@ unsafe fn hash_bytes_fast(tok: *const u8, len: usize) -> u32 {
     if c32 == 0 { 1 } else { c32 }
 }
 
-const NUM_BLOCKS: usize = 4;
+const NUM_BLOCKS: usize = 12;
 
 struct MmapSlice {
     ptr: *mut u8,

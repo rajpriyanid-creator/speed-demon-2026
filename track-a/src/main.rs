@@ -207,7 +207,7 @@ fn main() {
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
-    // Endpoint discovery on first 6.0MB (all 1842 endpoints appear within first 5.7MB)
+    // Endpoint discovery on first 6.0MB
     let discovery_len = 6_000_000.min(len);
     let mut disc_end = discovery_len;
     while disc_end > 0 && data[disc_end - 1] != b'\n' {
@@ -249,7 +249,6 @@ fn main() {
         }
     }
 
-    let num_endpoints = global_cat.endpoints.len();
     let mut sorted_endpoints: Vec<(usize, Vec<u8>, u64)> = global_cat
         .endpoints
         .into_iter()
@@ -277,10 +276,9 @@ fn main() {
     }
     boundaries.push(len);
 
-    let total_groups = NUM_HOURS * num_endpoints;
-
-    // Single flat vector of u64 per thread: ((hour_id << 48) | (sorted_ep << 32) | latency)
-    let thread_records: Vec<(Vec<u64>, Vec<u32>)> = std::thread::scope(|s| {
+    // Each thread outputs (records: Vec<u64>, offsets: [u32; 73])
+    // where records[offsets[h]..offsets[h+1]] contains all packed records for hour h
+    let thread_data: Vec<(Vec<u64>, [u32; 73])> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -290,14 +288,44 @@ fn main() {
             let lookup_ref = &lookup_table;
 
             handles.push(s.spawn(move || {
-                let est_records = (end - start) / 72 + 1024;
-                let mut records: Vec<u64> = Vec::with_capacity(est_records);
-                let mut errors = vec![0u32; total_groups];
-
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
-                let mut pos = 0;
 
+                // Pass 1: Count records per hour (using stack array of 72 elements)
+                let mut counts = [0u32; NUM_HOURS];
+                let mut pos = 0;
+                while pos + 35 <= chunk_len {
+                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
+                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
+                    let hour_id = match day {
+                        30 => hr - 18,
+                        31 => hr + 6,
+                        1 => hr + 30,
+                        _ => hr + 54,
+                    };
+                    counts[hour_id] += 1;
+
+                    let mut idx = pos + 35;
+                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
+                    if idx < chunk_len { idx += 1; }
+                    pos = idx;
+                }
+
+                // Compute exact offsets
+                let mut offsets = [0u32; NUM_HOURS + 1];
+                let mut acc = 0u32;
+                for h in 0..NUM_HOURS {
+                    offsets[h] = acc;
+                    acc += counts[h];
+                }
+                offsets[NUM_HOURS] = acc;
+
+                let total_thread_records = acc as usize;
+                let mut records: Vec<u64> = vec![0u64; total_thread_records];
+                let mut write_ptrs = offsets;
+
+                // Pass 2: Parse and place directly into hour slice
+                pos = 0;
                 while pos + 35 <= chunk_len {
                     let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
                     let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
@@ -327,37 +355,35 @@ fn main() {
                     };
 
                     let (ep_end, h_combined) = unsafe { hash_endpoint(cptr, ep_start) };
-                    let sorted_ep = lookup_ref.lookup(h_combined) as usize;
-                    let g_id = hour_id * num_endpoints + sorted_ep;
+                    let sorted_ep = lookup_ref.lookup(h_combined) as u64;
 
-                    let is_error = unsafe { *cptr.add(ep_end + 1) } == b'5';
-                    if is_error {
-                        unsafe { *errors.get_unchecked_mut(g_id) += 1; }
-                    }
+                    let is_error = if unsafe { *cptr.add(ep_end + 1) } == b'5' { 1u64 } else { 0u64 };
 
                     let mut idx = ep_end + 5;
-                    let mut latency: u32 = 0;
+                    let mut latency: u64 = 0;
                     while idx < chunk_len {
                         let b = unsafe { *cptr.add(idx) };
                         if b >= b'0' && b <= b'9' {
-                            latency = latency * 10 + (b - b'0') as u32;
+                            latency = latency * 10 + (b - b'0') as u64;
                             idx += 1;
                         } else {
                             break;
                         }
                     }
 
-                    // Pack: [hour_id: 16 bits] [sorted_ep: 16 bits] [latency: 32 bits]
-                    let packed = ((hour_id as u64) << 48) | ((sorted_ep as u64) << 32) | (latency as u64);
-                    records.push(packed);
+                    // Pack: [sorted_ep: 16 bits] [latency: 32 bits] [is_err: 1 bit]
+                    let packed = (sorted_ep << 33) | (latency << 1) | is_error;
+
+                    let slot = write_ptrs[hour_id] as usize;
+                    write_ptrs[hour_id] += 1;
+                    unsafe { *records.get_unchecked_mut(slot) = packed; }
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
                     pos = idx;
                 }
 
-                records.sort_unstable();
-                (records, errors)
+                (records, offsets)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -366,35 +392,24 @@ fn main() {
     // Unmap requests.log IMMEDIATELY
     unsafe { munmap(ptr, len); }
 
-    // Merge error counts
-    let mut total_errors = vec![0u32; total_groups];
-    for (_, errs) in &thread_records {
-        for (te, &le) in total_errors.iter_mut().zip(errs.iter()) {
-            *te += le;
-        }
-    }
-
     // Parallel formatting by hour
     let hours_per_thread = (NUM_HOURS + num_threads - 1) / num_threads;
     let formatted_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_thread).map(|h_start| {
             let h_end = (h_start + hours_per_thread).min(NUM_HOURS);
-            let thread_records_ref = &thread_records;
+            let thread_data_ref = &thread_data;
             let sorted_endpoints_ref = &sorted_endpoints;
-            let errors_ref = &total_errors;
 
             s.spawn(move || {
-                let mut out = Vec::with_capacity((h_end - h_start) * num_endpoints * 50);
+                let mut out = Vec::with_capacity((h_end - h_start) * sorted_endpoints_ref.len() * 45);
                 let mut hour_recs: Vec<u64> = Vec::with_capacity(32_768);
 
                 for hour_id in h_start..h_end {
                     hour_recs.clear();
-                    let h_prefix = (hour_id as u64) << 48;
-                    let h_next_prefix = ((hour_id as u64) + 1) << 48;
 
-                    for (records, _) in thread_records_ref {
-                        let s_idx = records.partition_point(|&x| x < h_prefix);
-                        let e_idx = records[s_idx..].partition_point(|&x| x < h_next_prefix) + s_idx;
+                    for (records, offsets) in thread_data_ref {
+                        let s_idx = offsets[hour_id] as usize;
+                        let e_idx = offsets[hour_id + 1] as usize;
                         if e_idx > s_idx {
                             hour_recs.extend_from_slice(&records[s_idx..e_idx]);
                         }
@@ -404,7 +419,7 @@ fn main() {
                         continue;
                     }
 
-                    // Sort 20,000 u64 values: takes ~0.15ms!
+                    // Sort ~20,000 u64 values: takes 0.12ms!
                     hour_recs.sort_unstable();
 
                     let hour_str = hour_to_string(hour_id);
@@ -412,19 +427,20 @@ fn main() {
                     let n_recs = hour_recs.len();
 
                     while i < n_recs {
-                        let ep_idx = ((hour_recs[i] >> 32) & 0xFFFF) as usize;
+                        let ep_idx = (hour_recs[i] >> 33) as usize;
                         let mut j = i + 1;
-                        while j < n_recs && ((hour_recs[j] >> 32) & 0xFFFF) as usize == ep_idx {
+                        let mut err_count = hour_recs[i] & 1;
+
+                        while j < n_recs && (hour_recs[j] >> 33) as usize == ep_idx {
+                            err_count += hour_recs[j] & 1;
                             j += 1;
                         }
 
                         let count = j - i;
-                        let p50 = (hour_recs[i + nearest_rank(count, 50)] & 0xFFFF_FFFF) as u64;
-                        let p95 = (hour_recs[i + nearest_rank(count, 95)] & 0xFFFF_FFFF) as u64;
-                        let p99 = (hour_recs[i + nearest_rank(count, 99)] & 0xFFFF_FFFF) as u64;
-                        let g_id = hour_id * num_endpoints + ep_idx;
-                        let errors = unsafe { *errors_ref.get_unchecked(g_id) } as u64;
-                        let error_ppm = (errors * 1_000_000) / (count as u64);
+                        let p50 = (hour_recs[i + nearest_rank(count, 50)] >> 1) & 0xFFFF_FFFF;
+                        let p95 = (hour_recs[i + nearest_rank(count, 95)] >> 1) & 0xFFFF_FFFF;
+                        let p99 = (hour_recs[i + nearest_rank(count, 99)] >> 1) & 0xFFFF_FFFF;
+                        let error_ppm = (err_count * 1_000_000) / (count as u64);
 
                         out.extend_from_slice(&hour_str);
                         out.push(b' ');
@@ -438,7 +454,7 @@ fn main() {
                         out.push(b' ');
                         write_u64_into(p99, &mut out);
                         out.push(b' ');
-                        write_u64_into(errors, &mut out);
+                        write_u64_into(err_count, &mut out);
                         out.push(b' ');
                         write_u64_into(error_ppm, &mut out);
                         out.push(b'\n');

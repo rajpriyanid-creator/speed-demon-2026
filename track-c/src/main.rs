@@ -234,8 +234,8 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // ONE PASS: Each thread holds thread-local country_crcs: Vec<Vec<u32>> (4.0 MB total)
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
+    // ONE PASS: Each thread holds thread-local records: Vec<u64> (800 KB per thread)
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u64>);
     let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -245,9 +245,8 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_crcs: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::new())
-                    .collect();
+                let est_records = (end - start) / 100 + 1024;
+                let mut local_records: Vec<u64> = Vec::with_capacity(est_records);
 
                 let p = data.as_ptr();
                 let mut pos = start;
@@ -415,11 +414,13 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        local_crcs[c_id as usize].push(name_crc);
+                        let packed = ((c_id as u64) << 32) | (name_crc as u64);
+                        local_records.push(packed);
                     }
                 }
 
-                (local_aggs, local_crcs)
+                local_records.sort_unstable();
+                (local_aggs, local_records)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -453,7 +454,15 @@ fn main() {
                             total_agg.amount_max = total_agg.amount_max.max(agg.amount_max);
                             total_agg.name_bytes += agg.name_bytes;
                             total_agg.note_bytes += agg.note_bytes;
-                            scratch.extend_from_slice(&thread_results_ref[t].1[c_id]);
+
+                            let recs = &thread_results_ref[t].1;
+                            let c_prefix = (c_id as u64) << 32;
+                            let c_next_prefix = ((c_id as u64) + 1) << 32;
+                            let s_idx = recs.partition_point(|&x| x < c_prefix);
+                            let e_idx = recs[s_idx..].partition_point(|&x| x < c_next_prefix) + s_idx;
+                            for &packed in &recs[s_idx..e_idx] {
+                                scratch.push(packed as u32);
+                            }
                         }
                     }
 
