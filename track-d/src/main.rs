@@ -271,6 +271,37 @@ fn main() {
     drop(b_write);
     unsafe { munmap(g_ptr, g_len); }
 
+    // Sort adjacency lists by weight ascending in parallel
+    std::thread::scope(|s| {
+        let chunk_size = (n + 7) / 8;
+        let f_head_ref = &f_head;
+        let b_head_ref = &b_head;
+        let f_edges_ptr = f_edges.as_mut_ptr() as usize;
+        let b_edges_ptr = b_edges.as_mut_ptr() as usize;
+        for chunk_idx in 0..8 {
+            let u_start = chunk_idx * chunk_size;
+            let u_end = (u_start + chunk_size).min(n);
+            s.spawn(move || {
+                let f_raw = f_edges_ptr as *mut u64;
+                let b_raw = b_edges_ptr as *mut u64;
+                for u in u_start..u_end {
+                    let fs = unsafe { *f_head_ref.get_unchecked(u) } as usize;
+                    let fe = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
+                    if fe > fs + 1 {
+                        let slice = unsafe { std::slice::from_raw_parts_mut(f_raw.add(fs), fe - fs) };
+                        slice.sort_unstable_by_key(|&e| e >> 32);
+                    }
+                    let bs = unsafe { *b_head_ref.get_unchecked(u) } as usize;
+                    let be = unsafe { *b_head_ref.get_unchecked(u + 1) } as usize;
+                    if be > bs + 1 {
+                        let slice = unsafe { std::slice::from_raw_parts_mut(b_raw.add(bs), be - bs) };
+                        slice.sort_unstable_by_key(|&e| e >> 32);
+                    }
+                }
+            });
+        }
+    });
+
     // 2. Parse queries
     let q_file = File::open(&queries_path).expect("failed to open queries.txt");
     let q_len = q_file.metadata().expect("failed to read metadata").len() as usize;
@@ -303,7 +334,7 @@ fn main() {
     let results_ptr = results.as_mut_ptr() as usize;
 
     // Sized to 7 worker threads for optimal balance of time and memory
-    let q_threads = 7;
+    let q_threads = 4;
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
         let f_edges_ref = &f_edges;
@@ -398,6 +429,11 @@ fn main() {
                                             visited_f.push(v);
                                         }
                                         unsafe { *df.get_unchecked_mut(v_idx) = new_dist; }
+                                        let db_v = unsafe { *db.get_unchecked(v_idx) };
+                                        if db_v != u64::MAX {
+                                            let cand = new_dist + db_v;
+                                            if cand < best { best = cand; }
+                                        }
                                         qf.push(new_dist, v);
                                     }
                                 }
@@ -427,6 +463,11 @@ fn main() {
                                             visited_b.push(v);
                                         }
                                         unsafe { *db.get_unchecked_mut(v_idx) = new_dist; }
+                                        let df_v = unsafe { *df.get_unchecked(v_idx) };
+                                        if df_v != u64::MAX {
+                                            let cand = new_dist + df_v;
+                                            if cand < best { best = cand; }
+                                        }
                                         qb.push(new_dist, v);
                                     }
                                 }

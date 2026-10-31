@@ -5,6 +5,7 @@ use std::os::unix::io::AsRawFd;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn malloc_trim(pad: usize) -> i32;
 }
 
@@ -190,6 +191,41 @@ enum ParsedQuery<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
+struct QueryResult {
+    count: u64,
+    id_sum: u64,
+    top_k_len: u8,
+    top_k: [u32; 10],
+}
+
+impl Default for QueryResult {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            id_sum: 0,
+            top_k_len: 0,
+            top_k: [0; 10],
+        }
+    }
+}
+
+#[inline(always)]
+fn find_byte2_swar(w: u64, b1: u8, b2: u8) -> Option<usize> {
+    let mask1 = (b1 as u64) * 0x01010101_01010101;
+    let mask2 = (b2 as u64) * 0x01010101_01010101;
+    let x1 = w ^ mask1;
+    let x2 = w ^ mask2;
+    let m1 = (x1.wrapping_sub(0x01010101_01010101)) & !x1 & 0x80808080_80808080;
+    let m2 = (x2.wrapping_sub(0x01010101_01010101)) & !x2 & 0x80808080_80808080;
+    let m = m1 | m2;
+    if m != 0 {
+        Some((m.trailing_zeros() >> 3) as usize)
+    } else {
+        None
+    }
+}
+
 #[inline(always)]
 fn phrase_matches(doc_text: &[u8], phrase: &[&[u8]]) -> bool {
     if phrase.is_empty() { return true; }
@@ -202,6 +238,15 @@ fn phrase_matches(doc_text: &[u8], phrase: &[&[u8]]) -> bool {
 
     let mut p = 0;
     while p + l0 <= tlen {
+        if p + 8 <= tlen {
+            let w = unsafe { (doc_text.as_ptr().add(p) as *const u64).read_unaligned() };
+            if let Some(off) = find_byte2_swar(w, b0_lower, b0_upper) {
+                p += off;
+            } else {
+                p += 8;
+                continue;
+            }
+        }
         let b = unsafe { *doc_text.get_unchecked(p) };
         if b == b0_lower || b == b0_upper {
             let left_ok = p == 0 || !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p - 1) as usize) };
@@ -739,29 +784,38 @@ fn main() {
 
     drop(thread_write_offsets);
     drop(thread_base_doc);
-    unsafe { malloc_trim(0); }
+    unsafe {
+        madvise(docs_mmap.ptr, docs_mmap.len, 4);
+        malloc_trim(0);
+    }
 
-    // 3. Parallel query execution
+    // 3. Parallel query execution with atomic work-stealing and zero-alloc flat QueryResult array
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
         .min(12);
 
-    let chunk_size = (parsed_queries.len() + num_threads - 1) / num_threads;
+    let num_queries = parsed_queries.len();
+    let mut results = vec![QueryResult::default(); num_queries];
+    let results_ptr = results.as_mut_ptr() as usize;
+    let query_cursor = AtomicUsize::new(0);
 
-    let thread_outputs: Vec<Vec<u8>> = std::thread::scope(|s| {
-        let handles: Vec<_> = parsed_queries.chunks(chunk_size).map(|chunk| {
+    std::thread::scope(|s| {
+        for _ in 0..num_threads {
             let offsets_ref = &offsets;
             let all_postings_ref = &all_postings;
             let doc_starts_ref = &doc_starts;
             let doc_lens_ref = &doc_lens;
             let docs_data_ref = docs_data;
+            let cursor_ref = &query_cursor;
+            let queries_ref = &parsed_queries;
 
             s.spawn(move || {
-                let mut thread_out = Vec::with_capacity(chunk.len() * 32);
                 let mut buf_a = Vec::with_capacity(32_768);
                 let mut buf_b = Vec::with_capacity(32_768);
                 let mut matches = Vec::new();
+                let res_raw = results_ptr as *mut QueryResult;
 
                 let get_postings = |term_id: u32| -> &[u32] {
                     let tid = term_id as usize;
@@ -770,115 +824,142 @@ fn main() {
                     &all_postings_ref[start..end]
                 };
 
-                for query in chunk {
-                    match query {
-                        ParsedQuery::Bool { first_term, steps } => {
-                            buf_a.clear();
-                            match *first_term {
-                                Some(t) => buf_a.extend_from_slice(get_postings(t)),
-                                None => {}
-                            }
+                const BATCH_SIZE: usize = 32;
+                loop {
+                    let start_idx = cursor_ref.fetch_add(BATCH_SIZE, Relaxed);
+                    if start_idx >= num_queries {
+                        break;
+                    }
+                    let end_idx = (start_idx + BATCH_SIZE).min(num_queries);
 
-                            for &(op, term_opt) in steps {
-                                let term_slice: &[u32] = match term_opt {
-                                    Some(t) => get_postings(t),
-                                    None => &[],
-                                };
-
-                                match op {
-                                    Op::And => intersect(&buf_a, term_slice, &mut buf_b),
-                                    Op::Or => union(&buf_a, term_slice, &mut buf_b),
-                                    Op::Not => difference(&buf_a, term_slice, &mut buf_b),
+                    for q_idx in start_idx..end_idx {
+                        let query = &queries_ref[q_idx];
+                        match query {
+                            ParsedQuery::Bool { first_term, steps } => {
+                                buf_a.clear();
+                                match *first_term {
+                                    Some(t) => buf_a.extend_from_slice(get_postings(t)),
+                                    None => {}
                                 }
-                                std::mem::swap(&mut buf_a, &mut buf_b);
-                            }
 
-                            let count = buf_a.len();
-                            let mut id_sum: u64 = 0;
-                            for &id in &buf_a {
-                                id_sum += id as u64;
-                            }
+                                for &(op, term_opt) in steps {
+                                    let term_slice: &[u32] = match term_opt {
+                                        Some(t) => get_postings(t),
+                                        None => &[],
+                                    };
 
-                            write_u64(count as u64, &mut thread_out);
-                            thread_out.push(b' ');
-                            write_u64(id_sum, &mut thread_out);
-
-                            let top_k = count.min(10);
-                            for &id in &buf_a[..top_k] {
-                                thread_out.push(b' ');
-                                write_u64(id as u64, &mut thread_out);
-                            }
-                            thread_out.push(b'\n');
-                        }
-                        ParsedQuery::Phrase { terms, raw_tokens } => {
-                            let mut has_none = false;
-                            for t in terms {
-                                if t.is_none() {
-                                    has_none = true;
-                                    break;
+                                    match op {
+                                        Op::And => intersect(&buf_a, term_slice, &mut buf_b),
+                                        Op::Or => union(&buf_a, term_slice, &mut buf_b),
+                                        Op::Not => difference(&buf_a, term_slice, &mut buf_b),
+                                    }
+                                    std::mem::swap(&mut buf_a, &mut buf_b);
                                 }
-                            }
 
-                            if has_none || terms.is_empty() {
-                                thread_out.extend_from_slice(b"0 0\n");
-                                continue;
-                            }
+                                let count = buf_a.len();
+                                let mut id_sum: u64 = 0;
+                                for &id in &buf_a {
+                                    id_sum += id as u64;
+                                }
 
-                            buf_a.clear();
-                            buf_a.extend_from_slice(get_postings(terms[0].unwrap()));
-
-                            for &t_opt in &terms[1..] {
-                                let t_slice = get_postings(t_opt.unwrap());
-                                intersect(&buf_a, t_slice, &mut buf_b);
-                                std::mem::swap(&mut buf_a, &mut buf_b);
-                                if buf_a.is_empty() {
-                                    break;
+                                let top_k = count.min(10);
+                                let mut top_k_arr = [0u32; 10];
+                                top_k_arr[..top_k].copy_from_slice(&buf_a[..top_k]);
+                                unsafe {
+                                    *res_raw.add(q_idx) = QueryResult {
+                                        count: count as u64,
+                                        id_sum,
+                                        top_k_len: top_k as u8,
+                                        top_k: top_k_arr,
+                                    };
                                 }
                             }
-
-                            matches.clear();
-                            let mut count = 0usize;
-                            let mut id_sum: u64 = 0;
-
-                            for &doc_id in &buf_a {
-                                let doc_idx = doc_id as usize;
-                                let d_start = unsafe { *doc_starts_ref.get_unchecked(doc_idx) } as usize;
-                                let d_len = unsafe { *doc_lens_ref.get_unchecked(doc_idx) } as usize;
-                                let doc_text = &docs_data_ref[d_start..d_start + d_len];
-
-                                if phrase_matches(doc_text, raw_tokens) {
-                                    count += 1;
-                                    id_sum += doc_id as u64;
-                                    if matches.len() < 10 {
-                                        matches.push(doc_id);
+                            ParsedQuery::Phrase { terms, raw_tokens } => {
+                                let mut has_none = false;
+                                for t in terms {
+                                    if t.is_none() {
+                                        has_none = true;
+                                        break;
                                     }
                                 }
-                            }
 
-                            write_u64(count as u64, &mut thread_out);
-                            thread_out.push(b' ');
-                            write_u64(id_sum, &mut thread_out);
+                                if has_none || terms.is_empty() {
+                                    unsafe {
+                                        *res_raw.add(q_idx) = QueryResult::default();
+                                    }
+                                    continue;
+                                }
 
-                            for &id in &matches {
-                                thread_out.push(b' ');
-                                write_u64(id as u64, &mut thread_out);
+                                buf_a.clear();
+                                buf_a.extend_from_slice(get_postings(terms[0].unwrap()));
+
+                                for &t_opt in &terms[1..] {
+                                    let t_slice = get_postings(t_opt.unwrap());
+                                    intersect(&buf_a, t_slice, &mut buf_b);
+                                    std::mem::swap(&mut buf_a, &mut buf_b);
+                                    if buf_a.is_empty() {
+                                        break;
+                                    }
+                                }
+
+                                matches.clear();
+                                let mut count = 0usize;
+                                let mut id_sum: u64 = 0;
+
+                                for &doc_id in &buf_a {
+                                    let doc_idx = doc_id as usize;
+                                    let d_start = unsafe { *doc_starts_ref.get_unchecked(doc_idx) } as usize;
+                                    let d_len = unsafe { *doc_lens_ref.get_unchecked(doc_idx) } as usize;
+                                    let doc_text = &docs_data_ref[d_start..d_start + d_len];
+
+                                    if phrase_matches(doc_text, raw_tokens) {
+                                        count += 1;
+                                        id_sum += doc_id as u64;
+                                        if matches.len() < 10 {
+                                            matches.push(doc_id);
+                                        }
+                                    }
+                                }
+
+                                let top_k = matches.len().min(10);
+                                let mut top_k_arr = [0u32; 10];
+                                top_k_arr[..top_k].copy_from_slice(&matches[..top_k]);
+                                unsafe {
+                                    *res_raw.add(q_idx) = QueryResult {
+                                        count: count as u64,
+                                        id_sum,
+                                        top_k_len: top_k as u8,
+                                        top_k: top_k_arr,
+                                    };
+                                }
                             }
-                            thread_out.push(b'\n');
                         }
                     }
                 }
-
-                thread_out
-            })
-        }).collect();
-
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        }
     });
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut out_file = File::create(&results_path).expect("failed to create results.txt");
-    for out in thread_outputs {
-        out_file.write_all(&out).expect("failed to write results");
+    let mut out_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    for r in results {
+        write_u64(r.count, &mut out_buf);
+        out_buf.push(b' ');
+        write_u64(r.id_sum, &mut out_buf);
+        for i in 0..r.top_k_len as usize {
+            out_buf.push(b' ');
+            write_u64(r.top_k[i] as u64, &mut out_buf);
+        }
+        out_buf.push(b'\n');
+
+        if out_buf.len() > 48 * 1024 {
+            out_file.write_all(&out_buf).expect("failed to write results");
+            out_buf.clear();
+        }
+    }
+    if !out_buf.is_empty() {
+        out_file.write_all(&out_buf).expect("failed to write results");
     }
     out_file.flush().expect("failed to flush results");
 }

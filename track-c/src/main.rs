@@ -67,10 +67,54 @@ impl Default for CountryScalarAgg {
     }
 }
 
-fn format_cents(cents: i64) -> String {
-    let sign = if cents < 0 { "-" } else { "" };
-    let abs = cents.abs();
-    format!("{}{}.{:02}", sign, abs / 100, abs % 100)
+#[inline(always)]
+fn write_cents(cents: i64, out: &mut Vec<u8>) {
+    if cents < 0 {
+        out.push(b'-');
+    }
+    let abs = cents.unsigned_abs();
+    let dollars = abs / 100;
+    let rem = (abs % 100) as u8;
+
+    let mut buf = [0u8; 24];
+    let mut i = 0;
+    let mut d = dollars;
+    if d == 0 {
+        buf[0] = b'0';
+        i = 1;
+    } else {
+        while d > 0 {
+            buf[i] = b'0' + (d % 10) as u8;
+            d /= 10;
+            i += 1;
+        }
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
+    out.push(b'.');
+    out.push(b'0' + (rem / 10));
+    out.push(b'0' + (rem % 10));
+}
+
+#[inline(always)]
+fn write_u64(mut n: u64, out: &mut Vec<u8>) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 24];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i]);
+    }
 }
 
 fn main() {
@@ -497,25 +541,24 @@ fn main() {
         if agg.count == 0 {
             continue;
         }
-        let country_str = std::str::from_utf8(country_bytes).unwrap();
-        let amt_sum = format_cents(agg.amount_sum);
-        let amt_min = format_cents(agg.amount_min);
-        let amt_max = format_cents(agg.amount_max);
-        let distinct = distinct_names[c_id];
-
-        writeln!(
-            out_buf,
-            "{} {} {} {} {} {} {} {} {}",
-            country_str,
-            agg.count,
-            agg.id_sum,
-            amt_sum,
-            amt_min,
-            amt_max,
-            distinct,
-            agg.name_bytes,
-            agg.note_bytes
-        ).unwrap();
+        out_buf.extend_from_slice(country_bytes);
+        out_buf.push(b' ');
+        write_u64(agg.count, &mut out_buf);
+        out_buf.push(b' ');
+        write_u64(agg.id_sum, &mut out_buf);
+        out_buf.push(b' ');
+        write_cents(agg.amount_sum, &mut out_buf);
+        out_buf.push(b' ');
+        write_cents(agg.amount_min, &mut out_buf);
+        out_buf.push(b' ');
+        write_cents(agg.amount_max, &mut out_buf);
+        out_buf.push(b' ');
+        write_u64(distinct_names[c_id] as u64, &mut out_buf);
+        out_buf.push(b' ');
+        write_u64(agg.name_bytes, &mut out_buf);
+        out_buf.push(b' ');
+        write_u64(agg.note_bytes, &mut out_buf);
+        out_buf.push(b'\n');
     }
 
     fs::create_dir_all(&out_dir).unwrap();
