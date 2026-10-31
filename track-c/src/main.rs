@@ -512,20 +512,48 @@ fn main() {
 
             s.spawn(move || {
                 let mut local_distincts = Vec::with_capacity(end - start);
-                let mut merged = Vec::with_capacity(30_000);
+                let mut cursors = [0usize; 8];
+                let mut ends = [0usize; 8];
+
                 for c_id in start..end {
-                    merged.clear();
-                    for t in 0..num_threads {
+                    let mut has_any = false;
+                    for t in 0..8 {
                         let (s_off, e_off) = thread_outputs_ref[t].2[c_id];
-                        let slice = &thread_outputs_ref[t].1[s_off as usize..e_off as usize];
-                        merged.extend_from_slice(slice);
+                        cursors[t] = s_off as usize;
+                        ends[t] = e_off as usize;
+                        if s_off < e_off {
+                            has_any = true;
+                        }
                     }
-                    if merged.is_empty() {
+                    if !has_any {
                         local_distincts.push(0);
                         continue;
                     }
-                    merged.sort_unstable();
-                    let distinct = 1 + merged.windows(2).filter(|w| w[0] != w[1]).count();
+
+                    let mut distinct = 0usize;
+                    let mut last_val = u64::MAX;
+                    loop {
+                        let mut min_val = u64::MAX;
+                        let mut min_t = 8;
+                        for t in 0..8 {
+                            let cur = cursors[t];
+                            if cur < ends[t] {
+                                let val = unsafe { *thread_outputs_ref[t].1.get_unchecked(cur) };
+                                if val < min_val {
+                                    min_val = val;
+                                    min_t = t;
+                                }
+                            }
+                        }
+                        if min_t == 8 {
+                            break;
+                        }
+                        cursors[min_t] += 1;
+                        if min_val != last_val {
+                            distinct += 1;
+                            last_val = min_val;
+                        }
+                    }
                     local_distincts.push(distinct);
                 }
                 local_distincts
