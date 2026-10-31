@@ -10,17 +10,13 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
-#[derive(Copy, Clone)]
-struct State {
-    cost: u64,
-    node: u32,
+// 4-ary Min-Heap with packed u64: (cost << 21) | node
+struct FastHeap {
+    data: Vec<u64>,
 }
 
-struct MinHeap {
-    data: Vec<State>,
-}
-
-impl MinHeap {
+impl FastHeap {
+    #[inline(always)]
     fn new(cap: usize) -> Self {
         Self {
             data: Vec::with_capacity(cap),
@@ -33,13 +29,18 @@ impl MinHeap {
     }
 
     #[inline(always)]
-    fn push(&mut self, s: State) {
+    fn push(&mut self, cost: u64, node: u32) {
+        let val = (cost << 21) | (node as u64);
         let mut i = self.data.len();
-        self.data.push(s);
+        self.data.push(val);
         while i > 0 {
-            let p = (i - 1) >> 1;
-            if unsafe { self.data.get_unchecked(i).cost < self.data.get_unchecked(p).cost } {
-                self.data.swap(i, p);
+            let p = (i - 1) >> 2;
+            let parent_val = unsafe { *self.data.get_unchecked(p) };
+            if val < parent_val {
+                unsafe {
+                    *self.data.get_unchecked_mut(i) = parent_val;
+                    *self.data.get_unchecked_mut(p) = val;
+                }
                 i = p;
             } else {
                 break;
@@ -48,35 +49,43 @@ impl MinHeap {
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Option<State> {
+    fn pop(&mut self) -> Option<(u64, u32)> {
         if self.data.is_empty() {
             return None;
         }
-        let res = self.data[0];
+        let top = self.data[0];
         let last = self.data.pop().unwrap();
         if !self.data.is_empty() {
-            self.data[0] = last;
-            let mut i = 0;
             let len = self.data.len();
+            let mut i = 0;
             loop {
-                let mut smallest = i;
-                let left = 2 * i + 1;
-                let right = 2 * i + 2;
-                if left < len && unsafe { self.data.get_unchecked(left).cost < self.data.get_unchecked(smallest).cost } {
-                    smallest = left;
+                let first_child = (i << 2) + 1;
+                if first_child >= len {
+                    break;
                 }
-                if right < len && unsafe { self.data.get_unchecked(right).cost < self.data.get_unchecked(smallest).cost } {
-                    smallest = right;
+                let mut best_child = first_child;
+                let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
+
+                let num_children = (len - first_child).min(4);
+                for c in 1..num_children {
+                    let child_idx = first_child + c;
+                    let child_val = unsafe { *self.data.get_unchecked(child_idx) };
+                    if child_val < best_val {
+                        best_val = child_val;
+                        best_child = child_idx;
+                    }
                 }
-                if smallest != i {
-                    self.data.swap(i, smallest);
-                    i = smallest;
+
+                if best_val < last {
+                    unsafe { *self.data.get_unchecked_mut(i) = best_val; }
+                    i = best_child;
                 } else {
                     break;
                 }
             }
+            unsafe { *self.data.get_unchecked_mut(i) = last; }
         }
-        Some(res)
+        Some((top >> 21, (top & 0x1F_FFFF) as u32))
     }
 }
 
@@ -310,7 +319,7 @@ fn main() {
             let query_slice = &queries[start_q..start_q + res_chunk.len()];
 
             s.spawn(move || {
-                let mut q = MinHeap::new(4096);
+                let mut q = FastHeap::new(4096);
                 let mut dist: Vec<u64> = vec![u64::MAX; n];
                 let mut visited: Vec<u32> = Vec::with_capacity(4096);
 
@@ -328,25 +337,25 @@ fn main() {
 
                     // Reset visited nodes from previous query
                     for &node in &visited {
-                        dist[node as usize] = u64::MAX;
+                        unsafe { *dist.get_unchecked_mut(node as usize) = u64::MAX; }
                     }
                     visited.clear();
                     q.clear();
 
-                    dist[s_idx] = 0;
+                    unsafe { *dist.get_unchecked_mut(s_idx) = 0; }
                     visited.push(src);
-                    q.push(State { cost: 0, node: src });
+                    q.push(0, src);
 
                     let mut found = -1i64;
-                    while let Some(curr) = q.pop() {
-                        if curr.cost > dist[curr.node as usize] {
+                    while let Some((curr_cost, curr_node)) = q.pop() {
+                        if curr_cost > unsafe { *dist.get_unchecked(curr_node as usize) } {
                             continue;
                         }
-                        if curr.node == dst {
-                            found = curr.cost as i64;
+                        if curr_node == dst {
+                            found = curr_cost as i64;
                             break;
                         }
-                        let u = curr.node as usize;
+                        let u = curr_node as usize;
                         let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
                         let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
 
@@ -354,7 +363,7 @@ fn main() {
                             let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
                             let v = (packed & 0xFFFF_FFFF) as u32;
                             let w = packed >> 32;
-                            let new_dist = curr.cost + w;
+                            let new_dist = curr_cost + w;
                             let v_idx = v as usize;
 
                             if new_dist < unsafe { *dist.get_unchecked(v_idx) } {
@@ -362,7 +371,7 @@ fn main() {
                                     visited.push(v);
                                 }
                                 unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
-                                q.push(State { cost: new_dist, node: v });
+                                q.push(new_dist, v);
                             }
                         }
                     }

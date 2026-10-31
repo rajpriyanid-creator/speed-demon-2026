@@ -5,6 +5,7 @@ use std::os::unix::io::AsRawFd;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn malloc_trim(pad: usize) -> i32;
 }
 
@@ -628,6 +629,11 @@ fn main() {
     drop(thread_data);
     drop(thread_write_bases);
     drop(thread_start_docs);
+    if docs_mmap.len > 0 {
+        unsafe {
+            madvise(docs_mmap.ptr, docs_mmap.len, 4); // MADV_DONTNEED: evict docs page cache before query phase
+        }
+    }
     unsafe { malloc_trim(0); }
 
     // Parallel query execution
