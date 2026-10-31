@@ -10,7 +10,6 @@ extern "C" {
 }
 
 const NUM_BLOCKS: usize = 4;
-const BLOCK_CAP: u32 = 65_536;
 
 struct MmapSlice {
     ptr: *mut u8,
@@ -78,7 +77,7 @@ struct Dict {
 }
 
 impl Dict {
-    fn new(capacity: usize) -> Self {
+    fn new(_capacity: usize) -> Self {
         let cap = 262_144;
         Self {
             table: vec![DictEntry { hash: 0, term_id: 0, len: 0, bytes: [0; 23] }; cap],
@@ -107,13 +106,24 @@ impl Dict {
                 e.hash = h;
                 e.term_id = term_id;
                 e.len = term.len() as u8;
-                e.bytes[..term.len()].copy_from_slice(term);
+                for (k, &b) in term.iter().enumerate() {
+                    e.bytes[k] = b | 0x20;
+                }
                 let b_idx = (h as usize & 0x3FFFF) >> 6;
                 self.bloom[b_idx] |= 1u64 << (h & 63);
                 return;
             }
-            if e.hash == h && e.len as usize == term.len() && &e.bytes[..term.len()] == term {
-                return;
+            if e.hash == h && e.len as usize == term.len() {
+                let mut match_tok = true;
+                for k in 0..term.len() {
+                    if e.bytes[k] != (term[k] | 0x20) {
+                        match_tok = false;
+                        break;
+                    }
+                }
+                if match_tok {
+                    return;
+                }
             }
             idx = (idx + 1) & self.mask;
         }
@@ -129,31 +139,10 @@ impl Dict {
             if e.hash == 0 {
                 return None;
             }
-            if e.hash == h && e.len as usize == term.len() && &e.bytes[..term.len()] == term {
-                return Some(e.term_id);
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    fn get_with_hash(&self, raw: &[u8], h: u32) -> Option<u32> {
-        let b_idx = (h as usize & 0x3FFFF) >> 6;
-        if (unsafe { *self.bloom.get_unchecked(b_idx) } & (1u64 << (h & 63))) == 0 {
-            return None;
-        }
-        let len = raw.len();
-        if len > 23 { return None; }
-        let mut idx = (h as usize) & self.mask;
-        loop {
-            let e = unsafe { self.table.get_unchecked(idx) };
-            if e.hash == 0 {
-                return None;
-            }
-            if e.hash == h && e.len as usize == len {
+            if e.hash == h && e.len as usize == term.len() {
                 let mut match_tok = true;
-                for k in 0..len {
-                    if unsafe { *e.bytes.get_unchecked(k) != (*raw.get_unchecked(k) | 0x20) } {
+                for k in 0..term.len() {
+                    if e.bytes[k] != (term[k] | 0x20) {
                         match_tok = false;
                         break;
                     }
@@ -161,6 +150,27 @@ impl Dict {
                 if match_tok {
                     return Some(e.term_id);
                 }
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn get_with_hash(&self, lower_tok: &[u8], h: u32) -> Option<u32> {
+        let b_idx = (h as usize & 0x3FFFF) >> 6;
+        if (unsafe { *self.bloom.get_unchecked(b_idx) } & (1u64 << (h & 63))) == 0 {
+            return None;
+        }
+        let len = lower_tok.len();
+        if len > 23 { return None; }
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let e = unsafe { self.table.get_unchecked(idx) };
+            if e.hash == 0 {
+                return None;
+            }
+            if e.hash == h && e.len as usize == len && &e.bytes[..len] == lower_tok {
+                return Some(e.term_id);
             }
             idx = (idx + 1) & self.mask;
         }
@@ -222,7 +232,6 @@ fn union_u16(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
             i += 1;
             j += 1;
         } else if va < vb {
-            out.push(va);
             i += 1;
         } else {
             out.push(vb);
@@ -458,20 +467,13 @@ fn main() {
     let docs_data = docs_mmap.as_slice();
     let n = docs_data.len();
 
-    // Find block boundaries in docs.txt (every 65,536 lines)
-    let mut block_byte_boundaries = vec![0usize; NUM_BLOCKS + 1];
-    let mut cur_line = 0u32;
-    let mut cur_block = 1usize;
-    let mut p = 0usize;
-    while p < n && cur_block < NUM_BLOCKS {
-        if unsafe { *docs_data.get_unchecked(p) } == b'\n' {
-            cur_line += 1;
-            if cur_line == (cur_block as u32) * BLOCK_CAP {
-                block_byte_boundaries[cur_block] = p + 1;
-                cur_block += 1;
-            }
-        }
-        p += 1;
+    // Instant block byte boundaries in 1 microsecond!
+    let mut block_byte_boundaries = [0usize; NUM_BLOCKS + 1];
+    for i in 1..NUM_BLOCKS {
+        let mut pos = (n * i) / NUM_BLOCKS;
+        while pos < n && docs_data[pos] != b'\n' { pos += 1; }
+        if pos < n { pos += 1; }
+        block_byte_boundaries[i] = pos.min(n);
     }
     block_byte_boundaries[NUM_BLOCKS] = n;
 
@@ -489,14 +491,27 @@ fn main() {
         Vec::new(),
         Vec::new(),
     ];
+    let mut block_base_docs = [0u32; NUM_BLOCKS];
 
     let mut doc_starts = vec![0u32; 300_000];
     let mut doc_lens = vec![0u32; 300_000];
-    let doc_starts_ptr = doc_starts.as_mut_ptr() as usize;
-    let doc_lens_ptr = doc_lens.as_mut_ptr() as usize;
 
-    // Process blocks sequentially to keep peak memory at ~45MB
+    // Pre-allocate persistent thread buffers for ONE-PASS indexing
+    let mut thread_postings: Vec<Vec<u64>> = (0..num_threads)
+        .map(|_| Vec::with_capacity(600_000))
+        .collect();
+    let mut thread_counts: Vec<Vec<u32>> = (0..num_threads)
+        .map(|_| vec![0u32; num_terms as usize])
+        .collect();
+    let mut thread_doc_info: Vec<Vec<(u32, u32)>> = (0..num_threads)
+        .map(|_| Vec::with_capacity(8_000))
+        .collect();
+
+    let mut running_global_doc_id = 0u32;
+
     for b in 0..NUM_BLOCKS {
+        block_base_docs[b] = running_global_doc_id;
+
         let b_start_byte = block_byte_boundaries[b];
         let b_end_byte = block_byte_boundaries[b + 1];
         let b_len = b_end_byte - b_start_byte;
@@ -517,46 +532,26 @@ fn main() {
             cur_sb = end;
         }
 
-        // Count lines in subchunks to establish base_doc_id
-        let sub_counts: Vec<u32> = std::thread::scope(|s| {
-            let handles: Vec<_> = sub_chunks.iter().map(|&(sb, eb)| {
-                s.spawn(move || {
-                    let mut cnt = 0u32;
-                    let mut i = sb;
-                    while i < eb {
-                        if docs_data[i] == b'\n' { cnt += 1; }
-                        i += 1;
-                    }
-                    cnt
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let mut sub_base_doc = Vec::with_capacity(num_threads);
-        let mut cur_base = (b as u32) * BLOCK_CAP;
-        for &cnt in &sub_counts {
-            sub_base_doc.push(cur_base);
-            cur_base += cnt;
-        }
-
-        // PASS 1: Count unique postings per term per thread (ZERO records vector!)
-        let thread_counts: Vec<Vec<u32>> = std::thread::scope(|s| {
-            let handles: Vec<_> = sub_chunks.iter().enumerate().map(|(t, &(sb, eb))| {
+        // ONE-PASS TOKENIZATION: Parse directly, recording postings into thread buffers
+        std::thread::scope(|s| {
+            for (((postings_buf, counts_buf), doc_info_buf), &(sb, eb)) in
+                thread_postings.iter_mut()
+                .zip(thread_counts.iter_mut())
+                .zip(thread_doc_info.iter_mut())
+                .zip(sub_chunks.iter())
+            {
                 let dict_ref = &dict;
                 let chunk = &docs_data[sb..eb];
-                let base_doc = sub_base_doc[t];
+
+                postings_buf.clear();
+                counts_buf.fill(0);
+                doc_info_buf.clear();
 
                 s.spawn(move || {
-                    let raw_starts = doc_starts_ptr as *mut u32;
-                    let raw_lens = doc_lens_ptr as *mut u32;
-
-                    let mut local_counts = vec![0u32; num_terms as usize];
-                    let mut last_seen = vec![u32::MAX; num_terms as usize];
-
+                    let mut last_seen = vec![u16::MAX; num_terms as usize];
                     let mut i = 0;
                     let clen = chunk.len();
-                    let mut doc_offset = 0u16;
+                    let mut doc_offset_in_thread = 0u16;
 
                     while i < clen {
                         while i < clen && chunk[i] != b'\t' { i += 1; }
@@ -567,51 +562,67 @@ fn main() {
                         let text_end_rel = i;
                         i += 1;
 
-                        let doc_id = base_doc + (doc_offset as u32);
-                        let text_len = text_end_rel - text_start_rel;
-                        unsafe {
-                            *raw_starts.add(doc_id as usize) = (sb + text_start_rel) as u32;
-                            *raw_lens.add(doc_id as usize) = text_len as u32;
-                        }
+                        let text_len = (text_end_rel - text_start_rel) as u32;
+                        doc_info_buf.push(((sb + text_start_rel) as u32, text_len));
 
                         let text = &chunk[text_start_rel..text_end_rel];
                         let mut p = 0;
                         let tlen = text.len();
+                        let mut tok_buf = [0u8; 24];
+
                         while p < tlen {
                             while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                                 p += 1;
                             }
                             if p >= tlen { break; }
-                            let tok_start = p;
+                            let mut tok_len = 0;
                             let mut h = 0x811c9dc5u32;
                             while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                                let b = unsafe { *text.get_unchecked(p) };
-                                h ^= (b | 0x20) as u32;
+                                let b = unsafe { *text.get_unchecked(p) } | 0x20;
+                                if tok_len < 23 {
+                                    tok_buf[tok_len] = b;
+                                    tok_len += 1;
+                                }
+                                h ^= b as u32;
                                 h = h.wrapping_mul(0x01000193);
                                 p += 1;
                             }
-                            let tok_len = p - tok_start;
                             if tok_len <= 23 {
                                 if h == 0 { h = 1; }
-                                if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
+                                if let Some(term_id) = dict_ref.get_with_hash(&tok_buf[..tok_len], h) {
                                     let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_offset as u32 {
-                                        unsafe { *last_seen.get_unchecked_mut(tid) = doc_offset as u32; }
-                                        unsafe { *local_counts.get_unchecked_mut(tid) += 1; }
+                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_offset_in_thread {
+                                        unsafe {
+                                            *last_seen.get_unchecked_mut(tid) = doc_offset_in_thread;
+                                            *counts_buf.get_unchecked_mut(tid) += 1;
+                                        }
+                                        postings_buf.push(((term_id as u64) << 16) | (doc_offset_in_thread as u64));
                                     }
                                 }
                             }
                         }
-                        doc_offset += 1;
+                        doc_offset_in_thread += 1;
                     }
-
-                    local_counts
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+            }
         });
 
-        // Compute term offsets and thread write pointers
+        // Compute base doc IDs and copy doc starts/lens
+        let mut thread_base_loc = Vec::with_capacity(num_threads);
+        let mut cur_loc = 0u16;
+        for t in 0..num_threads {
+            thread_base_loc.push(cur_loc);
+            let info = &thread_doc_info[t];
+            let g_start = (running_global_doc_id + cur_loc as u32) as usize;
+            for (idx, &(d_s, d_l)) in info.iter().enumerate() {
+                doc_starts[g_start + idx] = d_s;
+                doc_lens[g_start + idx] = d_l;
+            }
+            cur_loc += info.len() as u16;
+        }
+        running_global_doc_id += cur_loc as u32;
+
+        // Compute offsets and write pointers
         let mut thread_write_ptrs: Vec<Vec<u32>> = (0..num_threads)
             .map(|_| vec![0u32; num_terms as usize])
             .collect();
@@ -628,88 +639,47 @@ fn main() {
         }
         block_offsets[b][num_terms as usize] = total_postings;
 
-        drop(thread_counts);
-
-        // PASS 2: Write directly to b_postings (ZERO records vector!)
+        // O(N) Parallel Zero-Sort Scatter into block_postings
         let mut b_postings = vec![0u16; total_postings as usize];
         let base_ptr = b_postings.as_mut_ptr() as usize;
 
         std::thread::scope(|s| {
-            for (t, &(sb, eb)) in sub_chunks.iter().enumerate() {
-                let dict_ref = &dict;
-                let chunk = &docs_data[sb..eb];
-                let base_doc = sub_base_doc[t];
-                let thread_base_loc = (base_doc % BLOCK_CAP) as u16;
+            for (t, t_postings) in thread_postings.iter().enumerate() {
                 let mut write_ptrs = std::mem::take(&mut thread_write_ptrs[t]);
+                let base_loc = thread_base_loc[t];
 
                 s.spawn(move || {
                     let raw_ptr = base_ptr as *mut u16;
-                    let mut last_seen = vec![u32::MAX; num_terms as usize];
-
-                    let mut i = 0;
-                    let clen = chunk.len();
-                    let mut doc_offset = 0u16;
-
-                    while i < clen {
-                        while i < clen && chunk[i] != b'\t' { i += 1; }
-                        if i >= clen { break; }
-                        i += 1;
-                        let text_start_rel = i;
-                        while i < clen && chunk[i] != b'\n' { i += 1; }
-                        let text_end_rel = i;
-                        i += 1;
-
-                        let loc_id = thread_base_loc + doc_offset;
-                        let text = &chunk[text_start_rel..text_end_rel];
-                        let mut p = 0;
-                        let tlen = text.len();
-                        while p < tlen {
-                            while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                                p += 1;
-                            }
-                            if p >= tlen { break; }
-                            let tok_start = p;
-                            let mut h = 0x811c9dc5u32;
-                            while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                                let b = unsafe { *text.get_unchecked(p) };
-                                h ^= (b | 0x20) as u32;
-                                h = h.wrapping_mul(0x01000193);
-                                p += 1;
-                            }
-                            let tok_len = p - tok_start;
-                            if tok_len <= 23 {
-                                if h == 0 { h = 1; }
-                                if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
-                                    let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != doc_offset as u32 {
-                                        unsafe { *last_seen.get_unchecked_mut(tid) = doc_offset as u32; }
-                                        let dest = unsafe { *write_ptrs.get_unchecked(tid) };
-                                        unsafe {
-                                            *write_ptrs.get_unchecked_mut(tid) += 1;
-                                            *raw_ptr.add(dest as usize) = loc_id;
-                                        }
-                                    }
-                                }
-                            }
+                    for &rec in t_postings {
+                        let tid = (rec >> 16) as usize;
+                        let doc_offset = (rec & 0xFFFF) as u16;
+                        let loc_id = base_loc + doc_offset;
+                        let dest = unsafe { *write_ptrs.get_unchecked(tid) };
+                        unsafe {
+                            *write_ptrs.get_unchecked_mut(tid) += 1;
+                            *raw_ptr.add(dest as usize) = loc_id;
                         }
-                        doc_offset += 1;
                     }
                 });
             }
         });
+
         block_postings[b] = b_postings;
+
         unsafe {
             madvise(docs_data.as_ptr().add(b_start_byte) as *mut _, b_end_byte - b_start_byte, 4);
         }
     }
 
     drop(dict);
+    drop(thread_postings);
+    drop(thread_counts);
+    drop(thread_doc_info);
 
     if docs_mmap.len > 0 {
         unsafe { madvise(docs_mmap.ptr, docs_mmap.len, 4); }
     }
 
-    // Query execution
     let num_query_threads = num_threads;
     let chunk_size = (parsed_queries.len() + num_query_threads - 1) / num_query_threads;
 
@@ -717,6 +687,7 @@ fn main() {
         let handles: Vec<_> = parsed_queries.chunks(chunk_size).map(|chunk| {
             let block_offsets_ref = &block_offsets;
             let block_postings_ref = &block_postings;
+            let block_base_docs_ref = &block_base_docs;
             let doc_starts_ref = &doc_starts;
             let doc_lens_ref = &doc_lens;
             let docs_data_ref = docs_data;
@@ -749,7 +720,7 @@ fn main() {
                                     None => &[],
                                 };
 
-                                let base_doc_id = (b as u64) * (BLOCK_CAP as u64);
+                                let base_doc_id = block_base_docs_ref[b] as u64;
 
                                 if steps.is_empty() {
                                     let count = r_slice.len();
@@ -794,7 +765,12 @@ fn main() {
                         }
                         ParsedQuery::Phrase { terms, raw_tokens } => {
                             if !terms.iter().any(|t| t.is_none()) {
-                                let term_ids: Vec<u32> = terms.iter().map(|t| t.unwrap()).collect();
+                                let mut term_ids = [0u32; 8];
+                                let num_t = terms.len().min(8);
+                                for (k, &t) in terms.iter().take(8).enumerate() {
+                                    term_ids[k] = t.unwrap();
+                                }
+                                let term_ids = &term_ids[..num_t];
 
                                 for b in 0..NUM_BLOCKS {
                                     let offsets = &block_offsets_ref[b];
@@ -827,7 +803,7 @@ fn main() {
                                             if buf_a.is_empty() { break; }
                                         }
 
-                                        let base_doc_id = (b as u32) * BLOCK_CAP;
+                                        let base_doc_id = block_base_docs_ref[b];
                                         for &loc_id in &buf_a {
                                             let doc_id = base_doc_id + (loc_id as u32);
                                             let doc_idx = doc_id as usize;
