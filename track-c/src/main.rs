@@ -5,10 +5,22 @@ use std::os::unix::io::AsRawFd;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
 
+const MADV_DONTNEED: i32 = 4;
+
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+}
+
+#[inline(always)]
+unsafe fn madvise_dontneed(addr: *const u8, len: usize) {
+    let start = (addr as usize + 4095) & !4095;
+    let end = (addr as usize + len) & !4095;
+    if end > start {
+        madvise(start as *mut u8, end - start, MADV_DONTNEED);
+    }
 }
 
 #[inline(always)]
@@ -240,8 +252,13 @@ fn main() {
 
                 let p = data.as_ptr();
                 let mut pos = start;
+                let mut last_adv = start;
 
                 while pos < end {
+                    if pos - last_adv >= 2 * 1024 * 1024 {
+                        unsafe { madvise_dontneed(p.add(last_adv), pos - last_adv); }
+                        last_adv = pos;
+                    }
                     unsafe {
                         if pos + 3 <= len && *p.add(pos) == 0xEF && *p.add(pos + 1) == 0xBB && *p.add(pos + 2) == 0xBF {
                             pos += 3;
@@ -391,6 +408,10 @@ fn main() {
 
                         flat_crcs.push(((c_id as u64) << 32) | (name_crc as u64));
                     }
+                }
+
+                if end > last_adv {
+                    unsafe { madvise_dontneed(p.add(last_adv), end - last_adv); }
                 }
 
                 // In-thread sort: sorts by c_id first, then name_crc
