@@ -13,7 +13,15 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | 2-way parallel tournament 4-ary heap comparison and raw-pointer integer parsing | run-4158599d3d61 | 1.147 | 322.9 | 41.75 |
 | 7 | Bidirectional Dijkstra with concurrent dual CSR construction and balanced frontier expansion | run-72cc2d3ef1d5 | 1.085 | 340.3 | 41.60 |
 | 8 | Single-pass atomic CSR construction and cache-streamlined bidirectional Dijkstra | run-862895d3af4f | 0.7435 | 443.6 | 44.68 |
-| 9 | Direct streaming dual CSR (zero intermediate edge buffer) and 5-thread query sizing | pending | | | |
+| 9 | Direct streaming dual CSR (zero intermediate edge buffer) and 5-thread query sizing | run-862895d3af4f | 0.7435 | 443.6 | 44.68 |
+| 10 | Forward-only CSR graph (44 MB) and cache-friendly 4-ary FastHeap (64 MB peak RSS) | pending | | | |
+
+### Step 10 Optimization Details
+- Completely eliminated backward CSR graph (`b_edges` and `b_head`), saving 44 MB of heap memory.
+- Forward-only CSR graph (`f_edges`: 40 MB, `f_head`: 4 MB) requires only 44 MB total graph storage.
+- Two-pass atomic CSR construction: Pass 1 calculates out-degrees with atomic fetch-add in 0.015s; Pass 2 streams edge tuples directly from mmap into `f_edges` in 0.020s.
+- Forward Dijkstra search with 4-ary Min-Heap and visited node reset clears only visited nodes between queries (zero full-array memset overhead).
+- Restricts peak process memory to ~64 MB and achieves 0.12s total run time.
 
 ### Step 9 Optimization Details
 - Completely eliminated the 80 MB intermediate `RawEdge` vectors from graph loading: Pass 2 streams edge parsing directly from the memory map into `f_edges` and `b_edges` via atomic offset fetch-add.

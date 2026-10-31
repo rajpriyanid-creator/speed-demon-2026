@@ -2,11 +2,31 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+}
+
+#[inline(always)]
+unsafe fn hash_bytes_fast(tok: *const u8, len: usize) -> u32 {
+    let mut crc = 0u64;
+    let mut i = 0;
+    while i + 8 <= len {
+        let val = std::ptr::read_unaligned(tok.add(i) as *const u64) | 0x2020202020202020;
+        crc = _mm_crc32_u64(crc, val);
+        i += 8;
+    }
+    let mut c32 = crc as u32;
+    while i < len {
+        c32 = _mm_crc32_u8(c32, *tok.add(i) | 0x20);
+        i += 1;
+    }
+    if c32 == 0 { 1 } else { c32 }
 }
 
 const NUM_BLOCKS: usize = 4;
@@ -86,19 +106,9 @@ impl Dict {
         }
     }
 
-    #[inline(always)]
-    fn hash_bytes(b: &[u8]) -> u32 {
-        let mut h: u32 = 0x811c9dc5;
-        for &byte in b {
-            h ^= (byte | 0x20) as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        if h == 0 { 1 } else { h }
-    }
-
     fn insert(&mut self, term: &[u8], term_id: u32) {
         if term.len() > 23 { return; }
-        let h = Self::hash_bytes(term);
+        let h = unsafe { hash_bytes_fast(term.as_ptr(), term.len()) };
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = &mut self.table[idx];
@@ -132,7 +142,7 @@ impl Dict {
     #[inline(always)]
     fn get(&self, term: &[u8]) -> Option<u32> {
         if term.len() > 23 { return None; }
-        let h = Self::hash_bytes(term);
+        let h = unsafe { hash_bytes_fast(term.as_ptr(), term.len()) };
         let mut idx = (h as usize) & self.mask;
         loop {
             let e = unsafe { self.table.get_unchecked(idx) };
@@ -156,21 +166,29 @@ impl Dict {
     }
 
     #[inline(always)]
-    fn get_with_hash(&self, lower_tok: &[u8], h: u32) -> Option<u32> {
+    unsafe fn get_fast(&self, text_ptr: *const u8, len: usize, h: u32) -> Option<u32> {
         let b_idx = (h as usize & 0x3FFFF) >> 6;
-        if (unsafe { *self.bloom.get_unchecked(b_idx) } & (1u64 << (h & 63))) == 0 {
+        if (*self.bloom.get_unchecked(b_idx) & (1u64 << (h & 63))) == 0 {
             return None;
         }
-        let len = lower_tok.len();
         if len > 23 { return None; }
         let mut idx = (h as usize) & self.mask;
         loop {
-            let e = unsafe { self.table.get_unchecked(idx) };
+            let e = self.table.get_unchecked(idx);
             if e.hash == 0 {
                 return None;
             }
-            if e.hash == h && e.len as usize == len && &e.bytes[..len] == lower_tok {
-                return Some(e.term_id);
+            if e.hash == h && e.len as usize == len {
+                let mut match_tok = true;
+                for k in 0..len {
+                    if e.bytes[k] != (*text_ptr.add(k) | 0x20) {
+                        match_tok = false;
+                        break;
+                    }
+                }
+                if match_tok {
+                    return Some(e.term_id);
+                }
             }
             idx = (idx + 1) & self.mask;
         }
@@ -569,28 +587,22 @@ fn main() {
                         let text = &chunk[text_start_rel..text_end_rel];
                         let mut p = 0;
                         let tlen = text.len();
-                        let mut tok_buf = [0u8; 24];
+                        let text_ptr = text.as_ptr();
 
                         while p < tlen {
                             while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
                                 p += 1;
                             }
                             if p >= tlen { break; }
-                            let mut tok_len = 0;
-                            let mut h = 0x811c9dc5u32;
+                            let w_start = p;
                             while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                                let b = unsafe { *text.get_unchecked(p) } | 0x20;
-                                if tok_len < 23 {
-                                    tok_buf[tok_len] = b;
-                                    tok_len += 1;
-                                }
-                                h ^= b as u32;
-                                h = h.wrapping_mul(0x01000193);
                                 p += 1;
                             }
-                            if tok_len <= 23 {
-                                if h == 0 { h = 1; }
-                                if let Some(term_id) = dict_ref.get_with_hash(&tok_buf[..tok_len], h) {
+                            let w_len = p - w_start;
+
+                            if w_len <= 23 {
+                                let h = unsafe { hash_bytes_fast(text_ptr.add(w_start), w_len) };
+                                if let Some(term_id) = unsafe { dict_ref.get_fast(text_ptr.add(w_start), w_len, h) } {
                                     let tid = term_id as usize;
                                     if unsafe { *last_seen.get_unchecked(tid) } != doc_offset_in_thread {
                                         unsafe {
