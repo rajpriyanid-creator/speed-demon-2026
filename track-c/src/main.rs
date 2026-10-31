@@ -31,6 +31,17 @@ unsafe fn find_comma_swar(p: *const u8, mut pos: usize, end: usize) -> usize {
     pos
 }
 
+#[inline(always)]
+fn find_quote_swar(w: u64) -> Option<usize> {
+    let x = w ^ 0x22222222_22222222;
+    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    if m != 0 {
+        Some((m.trailing_zeros() >> 3) as usize)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CountryScalarAgg {
     count: u64,
@@ -79,7 +90,7 @@ fn main() {
         }
     }
 
-    // 1. Fast single-pass load regions.csv and catalog countries
+    // 1. Fast load regions.csv
     let regions_path = format!("{}/regions.csv", data_dir);
     let regions_data = match fs::read(&regions_path) {
         Ok(b) => b,
@@ -105,7 +116,7 @@ fn main() {
             pos += 1;
         }
         if pos >= regions_data.len() { break; }
-        pos += 1; // skip comma
+        pos += 1;
         let b0 = regions_data[pos];
         let b1 = regions_data[pos + 1];
         let b2 = regions_data[pos + 2];
@@ -148,7 +159,7 @@ fn main() {
         }
     }
 
-    // 2. Memory-map records.csv
+    // 2. Mmap records.csv
     let records_path = format!("{}/records.csv", data_dir);
     let file = match File::open(&records_path) {
         Ok(f) => f,
@@ -184,10 +195,7 @@ fn main() {
         header_end += 1;
     }
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .min(12);
+    let num_threads = 8;
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -204,7 +212,7 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // 3. Fast parallel records parse with zero-allocation flat buffer per thread
+    // 3. Fast parallel records parse with SWAR quote & delimiter jumping
     let thread_outputs: Vec<(Vec<CountryScalarAgg>, Vec<u64>, Vec<(u32, u32)>)> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -214,7 +222,7 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_names: Vec<u64> = Vec::with_capacity(350_000);
+                let mut local_names: Vec<u64> = Vec::with_capacity(180_000);
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -238,63 +246,111 @@ fn main() {
                             id = id * 10 + (*p.add(pos) - b'0') as u64;
                             pos += 1;
                         }
-                        pos += 1; // skip comma
+                        pos += 1;
 
-                        // 2. name (32-bit FNV-1a with length folding)
-                        let mut n_hash: u32 = 0x811c9dc5;
-                        let mut name_len: u32 = 0;
+                        // 2. name
+                        let n_hash_combined: u64;
+                        let name_len: u32;
                         if *p.add(pos) == b'"' {
                             pos += 1;
+                            let n_start = pos;
+                            let mut curr = pos;
+                            let mut escaped_quotes = 0u32;
+                            let mut n_hash: u32 = 0x811c9dc5;
                             loop {
-                                let b = *p.add(pos);
-                                if b == b'"' {
-                                    if *p.add(pos + 1) == b'"' {
-                                        n_hash = (n_hash ^ (b'"' as u32)).wrapping_mul(0x01000193);
-                                        name_len += 1;
-                                        pos += 2;
+                                if curr + 8 <= end {
+                                    let w = (p.add(curr) as *const u64).read_unaligned();
+                                    if let Some(off) = find_quote_swar(w) {
+                                        let q = curr + off;
+                                        if *p.add(q + 1) == b'"' {
+                                            for k in curr..=q {
+                                                n_hash = (n_hash ^ (*p.add(k) as u32)).wrapping_mul(0x01000193);
+                                            }
+                                            escaped_quotes += 1;
+                                            curr = q + 2;
+                                        } else {
+                                            for k in curr..q {
+                                                n_hash = (n_hash ^ (*p.add(k) as u32)).wrapping_mul(0x01000193);
+                                            }
+                                            name_len = (q - n_start) as u32 - escaped_quotes;
+                                            pos = q + 1;
+                                            break;
+                                        }
                                     } else {
-                                        pos += 1;
-                                        break;
+                                        for k in 0..8 {
+                                            n_hash = (n_hash ^ (*p.add(curr + k) as u32)).wrapping_mul(0x01000193);
+                                        }
+                                        curr += 8;
                                     }
                                 } else {
-                                    n_hash = (n_hash ^ (b as u32)).wrapping_mul(0x01000193);
-                                    name_len += 1;
-                                    pos += 1;
+                                    while *p.add(curr) != b'"' {
+                                        n_hash = (n_hash ^ (*p.add(curr) as u32)).wrapping_mul(0x01000193);
+                                        curr += 1;
+                                    }
+                                    if *p.add(curr + 1) == b'"' {
+                                        n_hash = (n_hash ^ (b'"' as u32)).wrapping_mul(0x01000193);
+                                        escaped_quotes += 1;
+                                        curr += 2;
+                                    } else {
+                                        name_len = (curr - n_start) as u32 - escaped_quotes;
+                                        pos = curr + 1;
+                                        break;
+                                    }
                                 }
                             }
                             if *p.add(pos) == b',' {
                                 pos += 1;
                             }
+                            n_hash_combined = ((name_len as u64) << 32) | (n_hash as u64);
                         } else {
+                            let mut n_hash: u32 = 0x811c9dc5;
+                            let mut n_len: u32 = 0;
                             while *p.add(pos) != b',' {
                                 let b = *p.add(pos);
                                 n_hash = (n_hash ^ (b as u32)).wrapping_mul(0x01000193);
-                                name_len += 1;
+                                n_len += 1;
                                 pos += 1;
                             }
-                            pos += 1; // skip comma
+                            pos += 1;
+                            name_len = n_len;
+                            n_hash_combined = ((n_len as u64) << 32) | (n_hash as u64);
                         }
-                        let n_hash_combined = ((name_len as u64) << 32) | (n_hash as u64);
 
-                        // 3. note (fast skip & length computation)
+                        // 3. note (SWAR quote skip)
                         let note_len: u64;
                         if *p.add(pos) == b'"' {
                             pos += 1;
                             let n_start = pos;
+                            let mut curr = pos;
                             let mut escaped_quotes = 0u64;
                             loop {
-                                let b = *p.add(pos);
-                                if b == b'"' {
-                                    if *p.add(pos + 1) == b'"' {
-                                        escaped_quotes += 1;
-                                        pos += 2;
+                                if curr + 8 <= end {
+                                    let w = (p.add(curr) as *const u64).read_unaligned();
+                                    if let Some(off) = find_quote_swar(w) {
+                                        let q = curr + off;
+                                        if *p.add(q + 1) == b'"' {
+                                            escaped_quotes += 1;
+                                            curr = q + 2;
+                                        } else {
+                                            note_len = (q - n_start) as u64 - escaped_quotes;
+                                            pos = q + 1;
+                                            break;
+                                        }
                                     } else {
-                                        note_len = (pos - n_start) as u64 - escaped_quotes;
-                                        pos += 1;
-                                        break;
+                                        curr += 8;
                                     }
                                 } else {
-                                    pos += 1;
+                                    while *p.add(curr) != b'"' {
+                                        curr += 1;
+                                    }
+                                    if *p.add(curr + 1) == b'"' {
+                                        escaped_quotes += 1;
+                                        curr += 2;
+                                    } else {
+                                        note_len = (curr - n_start) as u64 - escaped_quotes;
+                                        pos = curr + 1;
+                                        break;
+                                    }
                                 }
                             }
                             if *p.add(pos) == b',' {
@@ -304,7 +360,7 @@ fn main() {
                             let n_start = pos;
                             pos = find_comma_swar(p, pos, end);
                             note_len = (pos - n_start) as u64;
-                            pos += 1; // skip comma
+                            pos += 1;
                         }
 
                         // 4. region_id
@@ -318,7 +374,7 @@ fn main() {
                             }
                             pos += 1;
                         }
-                        pos += 1; // skip comma
+                        pos += 1;
 
                         // 5. amount
                         let mut is_neg = false;
@@ -365,8 +421,8 @@ fn main() {
                 }
                 local_names.sort_unstable();
                 local_names.dedup();
+                local_names.shrink_to_fit();
 
-                // Compute binary slice boundaries per country
                 let mut offsets = vec![(0u32, 0u32); num_countries];
                 let mut cur_idx = 0;
                 for c_id in 0..num_countries {
@@ -386,12 +442,13 @@ fn main() {
         munmap(ptr, len);
     }
 
-    // Merge scalar aggregates
     let mut country_aggs = vec![CountryScalarAgg::default(); num_countries];
     for (thread_agg, _, _) in &thread_outputs {
         for c_id in 0..num_countries {
             let t = &thread_agg[c_id];
-            if t.count == 0 { continue; }
+            if t.count == 0 {
+                continue;
+            }
             let g = &mut country_aggs[c_id];
             g.count += t.count;
             g.id_sum += t.id_sum;
@@ -403,7 +460,6 @@ fn main() {
         }
     }
 
-    // Parallel deduplication of name hashes per country
     let country_chunk = (num_countries + num_threads - 1) / num_threads;
     let distinct_names: Vec<usize> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..num_countries).step_by(country_chunk).map(|start| {
@@ -435,7 +491,6 @@ fn main() {
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
 
-    // Format output
     let mut out_buf = Vec::with_capacity(64 * 1024);
     for (c_id, country_bytes) in country_names.iter().enumerate() {
         let agg = &country_aggs[c_id];

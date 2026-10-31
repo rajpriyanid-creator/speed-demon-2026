@@ -302,8 +302,8 @@ fn main() {
     let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
-    // Sized to exactly 5 worker threads (140 MB query footprint instead of 336 MB)
-    let q_threads = 5;
+    // Sized to 7 worker threads for optimal balance of time and memory
+    let q_threads = 7;
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
         let f_edges_ref = &f_edges;
