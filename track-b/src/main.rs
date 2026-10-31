@@ -232,6 +232,7 @@ fn union_u16(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
             i += 1;
             j += 1;
         } else if va < vb {
+            out.push(va);
             i += 1;
         } else {
             out.push(vb);
