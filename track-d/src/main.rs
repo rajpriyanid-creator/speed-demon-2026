@@ -63,18 +63,33 @@ impl FastHeap {
                 if first_child >= len {
                     break;
                 }
-                let mut best_child = first_child;
-                let mut best_val = unsafe { *self.data.get_unchecked(first_child) };
+                let (best_val, best_child) = if first_child + 3 < len {
+                    // 2-way parallel tournament tree comparison
+                    let c1 = first_child;
+                    let c2 = first_child + 1;
+                    let c3 = first_child + 2;
+                    let c4 = first_child + 3;
 
-                let num_children = (len - first_child).min(4);
-                for c in 1..num_children {
-                    let child_idx = first_child + c;
-                    let child_val = unsafe { *self.data.get_unchecked(child_idx) };
-                    if child_val < best_val {
-                        best_val = child_val;
-                        best_child = child_idx;
+                    let v1 = unsafe { *self.data.get_unchecked(c1) };
+                    let v2 = unsafe { *self.data.get_unchecked(c2) };
+                    let v3 = unsafe { *self.data.get_unchecked(c3) };
+                    let v4 = unsafe { *self.data.get_unchecked(c4) };
+
+                    let (b12_val, b12_idx) = if v2 < v1 { (v2, c2) } else { (v1, c1) };
+                    let (b34_val, b34_idx) = if v4 < v3 { (v4, c4) } else { (v3, c3) };
+                    if b34_val < b12_val { (b34_val, b34_idx) } else { (b12_val, b12_idx) }
+                } else {
+                    let mut b_child = first_child;
+                    let mut b_val = unsafe { *self.data.get_unchecked(first_child) };
+                    for child_idx in (first_child + 1)..len {
+                        let c_val = unsafe { *self.data.get_unchecked(child_idx) };
+                        if c_val < b_val {
+                            b_val = c_val;
+                            b_child = child_idx;
+                        }
                     }
-                }
+                    (b_val, b_child)
+                };
 
                 if best_val < last {
                     unsafe { *self.data.get_unchecked_mut(i) = best_val; }
@@ -90,10 +105,10 @@ impl FastHeap {
 }
 
 #[inline(always)]
-fn parse_u32(data: &[u8], pos: &mut usize) -> u32 {
+unsafe fn parse_u32_fast(p: *const u8, pos: &mut usize) -> u32 {
     let mut val = 0u32;
-    while *pos < data.len() {
-        let b = unsafe { *data.get_unchecked(*pos) };
+    loop {
+        let b = *p.add(*pos);
         if b >= b'0' && b <= b'9' {
             val = val * 10 + (b - b'0') as u32;
             *pos += 1;
@@ -142,13 +157,13 @@ fn main() {
     if g_ptr == usize::MAX as *mut u8 {
         return;
     }
-    let g_data = unsafe { std::slice::from_raw_parts(g_ptr, g_len) };
+    let _g_data = unsafe { std::slice::from_raw_parts(g_ptr, g_len) };
 
     let mut g_pos = 0;
-    let n = parse_u32(g_data, &mut g_pos) as usize;
-    while g_pos < g_len && g_data[g_pos] == b' ' { g_pos += 1; }
-    let m = parse_u32(g_data, &mut g_pos) as usize;
-    while g_pos < g_len && g_data[g_pos] != b'\n' { g_pos += 1; }
+    let n = unsafe { parse_u32_fast(g_ptr, &mut g_pos) } as usize;
+    while g_pos < g_len && unsafe { *g_ptr.add(g_pos) } == b' ' { g_pos += 1; }
+    let m = unsafe { parse_u32_fast(g_ptr, &mut g_pos) } as usize;
+    while g_pos < g_len && unsafe { *g_ptr.add(g_pos) } != b'\n' { g_pos += 1; }
     if g_pos < g_len { g_pos += 1; }
     let edges_start = g_pos;
 
@@ -165,7 +180,7 @@ fn main() {
         for t in 0..num_load_threads {
             let target = edges_start + ((total_edge_bytes * (t + 1)) / num_load_threads);
             let mut end = target.min(g_len);
-            while end < g_len && g_data[end] != b'\n' {
+            while end < g_len && unsafe { *g_ptr.add(end) } != b'\n' {
                 end += 1;
             }
             if end < g_len {
@@ -176,14 +191,16 @@ fn main() {
         }
     }
 
+    let g_addr = g_ptr as usize;
     let deg_results: Vec<Vec<u32>> = std::thread::scope(|s| {
         let handles: Vec<_> = edge_chunks.iter().map(|&(start, end)| {
             s.spawn(move || {
+                let g_ptr = g_addr as *const u8;
                 let mut local_f_deg = vec![0u32; n];
                 let mut pos = start;
                 while pos < end {
-                    let u = parse_u32(g_data, &mut pos) as usize;
-                    while pos < end && unsafe { *g_data.get_unchecked(pos) } != b'\n' {
+                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
+                    while pos < end && unsafe { *g_ptr.add(pos) } != b'\n' {
                         pos += 1;
                     }
                     if pos < end {
@@ -226,16 +243,17 @@ fn main() {
             let mut f_write = thread_f_write[t].clone();
 
             s.spawn(move || {
+                let g_ptr = g_addr as *const u8;
                 let f_raw = f_edges_addr as *mut u64;
                 let mut pos = start;
                 while pos < end {
-                    let u = parse_u32(g_data, &mut pos) as usize;
-                    if pos < end { pos += 1; }
-                    let v = parse_u32(g_data, &mut pos) as usize;
-                    if pos < end { pos += 1; }
-                    let w = parse_u32(g_data, &mut pos) as u64;
-                    if pos < end && g_data[pos] == b'\r' { pos += 1; }
-                    if pos < end && g_data[pos] == b'\n' { pos += 1; }
+                    let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
+                    pos += 1;
+                    let v = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
+                    pos += 1;
+                    let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
+                    if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
 
                     let packed_f = (v as u64) | (w << 32);
 
@@ -274,19 +292,19 @@ fn main() {
     if q_ptr == usize::MAX as *mut u8 {
         return;
     }
-    let q_data = unsafe { std::slice::from_raw_parts(q_ptr, q_len) };
 
     let mut queries: Vec<(u32, u32)> = Vec::with_capacity(10_000);
     let mut q_pos = 0;
     while q_pos < q_len {
-        if q_data[q_pos] == b'\r' || q_data[q_pos] == b'\n' {
+        let b = unsafe { *q_ptr.add(q_pos) };
+        if b == b'\r' || b == b'\n' {
             q_pos += 1;
             continue;
         }
-        let s = parse_u32(q_data, &mut q_pos);
-        if q_pos < q_len && q_data[q_pos] == b' ' { q_pos += 1; }
-        let t = parse_u32(q_data, &mut q_pos);
-        while q_pos < q_len && q_data[q_pos] != b'\n' { q_pos += 1; }
+        let s = unsafe { parse_u32_fast(q_ptr, &mut q_pos) };
+        if q_pos < q_len && unsafe { *q_ptr.add(q_pos) } == b' ' { q_pos += 1; }
+        let t = unsafe { parse_u32_fast(q_ptr, &mut q_pos) };
+        while q_pos < q_len && unsafe { *q_ptr.add(q_pos) } != b'\n' { q_pos += 1; }
         if q_pos < q_len { q_pos += 1; }
         queries.push((s, t));
     }
