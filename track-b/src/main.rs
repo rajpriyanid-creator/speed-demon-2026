@@ -665,6 +665,8 @@ fn main() {
         block_postings[b] = b_postings;
     }
 
+    drop(dict);
+
     if docs_mmap.len > 0 {
         unsafe { madvise(docs_mmap.ptr, docs_mmap.len, 4); }
     }
