@@ -8,7 +8,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Multi-threaded Rust with mmap and select_nth_unstable (BTreeMap baseline) | run-c90c25d39a4e | 0.291 | 67.8 | 52.34 |
 | 2 | Open-addressing EndpointCatalog, single-pass parallel record packing, and contiguous counting sort | run-e7cdfb3f6a83 | 0.1466 | 57.7 | 58.57 |
 | 3 | Packed u64 records with SIMD-aligned chunk boundaries and fast status/method routing | run-e03b5af449fd | 0.0667 | 60.8 | 65.91 |
-| 4 | 32-bit FNV-1a endpoint hash with length folding, zero-discriminant catalog, and target-cpu=native | pending | | | |
+| 4 | 32-bit FNV-1a endpoint hash with length folding, zero-discriminant catalog, and target-cpu=native | run-c756d9c1f1dd | 0.0661 | 57.9 | 66.30 |
 
 ### Step 2 Optimization Details
 - Replaced per-record `BTreeMap` lookups with thread-local open-addressing `LocalCatalog` using linear probing in L1/L2 cache.
