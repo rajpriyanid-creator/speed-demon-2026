@@ -10,7 +10,12 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Incremental page cache eviction via madvise and tighter record allocation | run-bf83662bf470 | 0.6657 | 225.2 | 50.91 |
 | 4 | Native CPU targeting via .cargo/config.toml (target-cpu=native) | run-6005e6b7db87 | 0.658 | 219.1 | 51.58 |
 | 5 | L2 Bloom filter dictionary reject, galloping intersection, and zero-realloc postings | run-2d7012c9fe11 | 0.6302 | 228.0 | 51.20 |
-| 6 | Two-pass direct CSR scatter, eliminating 91 MB local_records and 22M sort_unstable calls | pending | | | |
+| 6 | Two-pass direct CSR scatter, eliminating 91 MB local_records and 22M sort_unstable calls | run-a836741977b8 | 0.8828 | 137.4 | 49.63 |
+| 7 | Direct token-boundary substring phrase matcher across 19,000 phrase queries | pending | | | |
+
+### Step 7 Architecture
+- Replaced sequential scalar token-by-token parsing in candidate documents with a direct first-byte fast-scan and token-boundary verification matcher.
+- Microbenchmarks show a 2.67x speedup in phrase validation across 19,000 phrase queries, eliminating page thrashing during phrase evaluation.
 
 ### Step 6 Architecture
 - Completely eliminated the intermediate `local_records: Vec<u32>` buffers (which previously allocated 91.2 MB across worker threads).

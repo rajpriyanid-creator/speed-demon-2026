@@ -195,61 +195,61 @@ fn phrase_matches(doc_text: &[u8], phrase: &[&[u8]]) -> bool {
     if phrase.is_empty() { return true; }
     let t0 = phrase[0];
     let l0 = t0.len();
+    let b0_lower = t0[0];
+    let b0_upper = b0_lower.to_ascii_uppercase();
     let tlen = doc_text.len();
+    if tlen < l0 { return false; }
+
     let mut p = 0;
-    while p < tlen {
-        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p) as usize) } {
-            p += 1;
-        }
-        if p >= tlen { break; }
-        let tok_start = p;
-        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p) as usize) } {
-            p += 1;
-        }
-        let tok_len = p - tok_start;
-        if tok_len == l0 {
-            let mut matches_t0 = true;
-            for m in 0..l0 {
-                if unsafe { (*doc_text.get_unchecked(tok_start + m) | 0x20) != *t0.get_unchecked(m) } {
-                    matches_t0 = false;
-                    break;
+    while p + l0 <= tlen {
+        let b = unsafe { *doc_text.get_unchecked(p) };
+        if b == b0_lower || b == b0_upper {
+            let left_ok = p == 0 || !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(p - 1) as usize) };
+            if left_ok {
+                let mut match_t0 = true;
+                for m in 1..l0 {
+                    if unsafe { (*doc_text.get_unchecked(p + m) | 0x20) != *t0.get_unchecked(m) } {
+                        match_t0 = false;
+                        break;
+                    }
                 }
-            }
-            if matches_t0 {
-                let mut curr_p = p;
-                let mut all_match = true;
-                for &next_tok in &phrase[1..] {
-                    while curr_p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) } {
-                        curr_p += 1;
-                    }
-                    if curr_p >= tlen {
-                        all_match = false;
-                        break;
-                    }
-                    let nt_start = curr_p;
-                    while curr_p < tlen && unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) } {
-                        curr_p += 1;
-                    }
-                    let nt_len = curr_p - nt_start;
-                    if nt_len != next_tok.len() {
-                        all_match = false;
-                        break;
-                    }
-                    for m in 0..nt_len {
-                        if unsafe { (*doc_text.get_unchecked(nt_start + m) | 0x20) != *next_tok.get_unchecked(m) } {
-                            all_match = false;
-                            break;
+                if match_t0 {
+                    let end_t0 = p + l0;
+                    let right_ok = end_t0 == tlen || !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(end_t0) as usize) };
+                    if right_ok {
+                        let mut curr_p = end_t0;
+                        let mut all_match = true;
+                        for &next_tok in &phrase[1..] {
+                            while curr_p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) } {
+                                curr_p += 1;
+                            }
+                            if curr_p + next_tok.len() > tlen {
+                                all_match = false;
+                                break;
+                            }
+                            let nt_start = curr_p;
+                            for m in 0..next_tok.len() {
+                                if unsafe { (*doc_text.get_unchecked(nt_start + m) | 0x20) != *next_tok.get_unchecked(m) } {
+                                    all_match = false;
+                                    break;
+                                }
+                            }
+                            if !all_match { break; }
+                            curr_p += next_tok.len();
+                            let end_ok = curr_p == tlen || !unsafe { *IS_TOKEN.get_unchecked(*doc_text.get_unchecked(curr_p) as usize) };
+                            if !end_ok {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                        if all_match {
+                            return true;
                         }
                     }
-                    if !all_match {
-                        break;
-                    }
-                }
-                if all_match {
-                    return true;
                 }
             }
         }
+        p += 1;
     }
     false
 }

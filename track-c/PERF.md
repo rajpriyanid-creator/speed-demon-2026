@@ -11,7 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Single-pass direct-mapped 17,576 ASCII country array, 8x faster regions.csv load | run-38150884beac | 0.0796 | 52.0 | 60.48 |
 | 5 | Flat pre-allocated name hash array per thread, fast note scanning, zero heap reallocations, and parallel binary-slice dedupe | run-1672c8e97968 | 0.0747 | 40.43 | 62.13 |
 | 6 | 32-bit FNV-1a with length folding, branchless amount min/max cmov, and target-cpu=native | run-26ab22dffe85 | 0.0751 | 39.86 | 62.17 |
-| 7 | 64-bit SWAR vector comma delimiter scanning for note field | pending | | | |
+| 7 | 64-bit SWAR vector comma delimiter scanning for note field | run-8f6d79bfdee2 | 0.0751 | 40.10 | 62.03 |
 
 ### Step 5 Optimization Details
 - Replaced 2,880 dynamic per-country heap vectors across threads with a single pre-allocated flat `Vec<u64>` per thread (`c_id << 48 | hash`), eliminating ~43,000 heap reallocations during records parsing.
