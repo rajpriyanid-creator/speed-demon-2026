@@ -2,6 +2,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::_mm_crc32_u64;
+
 const PROT_READ: i32 = 1;
 const MAP_SHARED: i32 = 1;
 const NUM_HOURS: usize = 72;
@@ -239,16 +242,16 @@ fn main() {
                     };
 
                     let mut curr = ep_start;
-                    let mut h: u64 = 0xcbf29ce484222325;
+                    let mut h: u64 = 0;
                     loop {
                         let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
                         if let Some(off) = find_space_swar(w) {
                             let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                            h = (h ^ (w & rem_mask)).wrapping_mul(0x100000001b3);
+                            h = unsafe { _mm_crc32_u64(h, w & rem_mask) };
                             curr += off;
                             break;
                         } else {
-                            h = (h ^ w).wrapping_mul(0x100000001b3);
+                            h = unsafe { _mm_crc32_u64(h, w) };
                             curr += 8;
                         }
                     }
@@ -348,16 +351,16 @@ fn main() {
                     };
 
                     let mut curr = ep_start;
-                    let mut h: u64 = 0xcbf29ce484222325;
+                    let mut h: u64 = 0;
                     loop {
                         let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
                         if let Some(off) = find_space_swar(w) {
                             let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                            h = (h ^ (w & rem_mask)).wrapping_mul(0x100000001b3);
+                            h = unsafe { _mm_crc32_u64(h, w & rem_mask) };
                             curr += off;
                             break;
                         } else {
-                            h = (h ^ w).wrapping_mul(0x100000001b3);
+                            h = unsafe { _mm_crc32_u64(h, w) };
                             curr += 8;
                         }
                     }
