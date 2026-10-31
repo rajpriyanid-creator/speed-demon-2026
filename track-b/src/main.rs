@@ -472,14 +472,16 @@ fn main() {
         }
     }
 
-    // Pass 1 on docs.txt in parallel: count term occurrences and record doc slices
-    let pass1_results: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    // Single-pass indexing on docs.txt in parallel:
+    // Each thread collects (term_id << 32) | local_doc_id in local_records, sorts locally, and builds offsets.
+    let thread_data: Vec<(Vec<u64>, Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
         let handles: Vec<_> = doc_chunks.iter().map(|&(start_byte, end_byte)| {
             let dict_ref = &dict;
             let chunk = &docs_data[start_byte..end_byte];
 
             s.spawn(move || {
-                let mut local_counts = vec![0u32; num_terms as usize];
+                let est_records = 1_000_000;
+                let mut local_records: Vec<u64> = Vec::with_capacity(est_records);
                 let mut last_seen = vec![u32::MAX; num_terms as usize];
                 let est_docs = ((end_byte - start_byte) / 1000 + 1024).max(10_000);
                 let mut local_starts = Vec::with_capacity(est_docs);
@@ -530,7 +532,7 @@ fn main() {
                                 let tid = term_id as usize;
                                 if unsafe { *last_seen.get_unchecked(tid) } != local_doc_id {
                                     unsafe { *last_seen.get_unchecked_mut(tid) = local_doc_id; }
-                                    unsafe { *local_counts.get_unchecked_mut(tid) += 1; }
+                                    local_records.push(((term_id as u64) << 32) | (local_doc_id as u64));
                                 }
                             }
                         }
@@ -538,7 +540,23 @@ fn main() {
                     local_doc_id += 1;
                 }
 
-                (local_counts, local_starts, local_lens)
+                local_records.sort_unstable();
+
+                let mut term_offsets = vec![0u32; (num_terms as usize) + 1];
+                let mut cur_term = 0usize;
+                for (idx, &entry) in local_records.iter().enumerate() {
+                    let term = (entry >> 32) as usize;
+                    while cur_term < term {
+                        term_offsets[cur_term + 1] = idx as u32;
+                        cur_term += 1;
+                    }
+                }
+                while cur_term < num_terms as usize {
+                    term_offsets[cur_term + 1] = local_records.len() as u32;
+                    cur_term += 1;
+                }
+
+                (local_records, term_offsets, local_starts, local_lens)
             })
         }).collect();
 
@@ -547,18 +565,17 @@ fn main() {
 
     let mut thread_start_docs = Vec::with_capacity(num_index_threads);
     let mut cur_global_doc = 0u32;
-    for r in &pass1_results {
+    for r in &thread_data {
         thread_start_docs.push(cur_global_doc);
-        cur_global_doc += r.1.len() as u32;
+        cur_global_doc += r.2.len() as u32;
     }
 
     // Assemble global doc_starts and doc_lens
-    let total_docs_est = pass1_results.iter().map(|r| r.1.len()).sum::<usize>();
-    let mut doc_starts: Vec<u32> = Vec::with_capacity(total_docs_est);
-    let mut doc_lens: Vec<u32> = Vec::with_capacity(total_docs_est);
-    for r in &pass1_results {
-        doc_starts.extend_from_slice(&r.1);
-        doc_lens.extend_from_slice(&r.2);
+    let mut doc_starts: Vec<u32> = Vec::with_capacity(cur_global_doc as usize);
+    let mut doc_lens: Vec<u32> = Vec::with_capacity(cur_global_doc as usize);
+    for r in &thread_data {
+        doc_starts.extend_from_slice(&r.2);
+        doc_lens.extend_from_slice(&r.3);
     }
 
     // Prefix sums to build contiguous postings CSR with per-thread write bases
@@ -573,62 +590,33 @@ fn main() {
         let mut cur = total_postings;
         for t in 0..num_index_threads {
             thread_write_bases[t][term] = cur;
-            cur += pass1_results[t].0[term];
+            let term_len = thread_data[t].1[term + 1] - thread_data[t].1[term];
+            cur += term_len;
         }
         total_postings = cur;
     }
     offsets[num_terms as usize] = total_postings;
 
     let mut all_postings = vec![0u32; total_postings as usize];
-
     let base_addr = all_postings.as_mut_ptr() as usize;
 
-    // Pass 2 on docs.txt in parallel: populate contiguous all_postings with zero line scanning
+    // Linear parallel copy of postings directly into all_postings
     std::thread::scope(|s| {
-        for (t, r) in pass1_results.into_iter().enumerate() {
-            let dict_ref = &dict;
-            let docs_data_ref = docs_data;
-            let starts = r.1;
-            let lens = r.2;
+        for (t, (local_records, term_offsets, _, _)) in thread_data.iter().enumerate() {
+            let write_bases = &thread_write_bases[t];
             let start_doc = thread_start_docs[t];
-            let mut write_pos = thread_write_bases[t].clone();
-
             s.spawn(move || {
                 let raw_ptr = base_addr as *mut u32;
-                let mut last_seen = vec![u32::MAX; num_terms as usize];
-                for (local_idx, (&start, &len)) in starts.iter().zip(lens.iter()).enumerate() {
-                    let d_id = start_doc + local_idx as u32;
-                    let text = &docs_data_ref[start as usize..(start + len) as usize];
-                    let mut p = 0;
-                    let tlen = text.len();
-                    while p < tlen {
-                        while p < tlen && !unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                            p += 1;
-                        }
-                        if p >= tlen { break; }
-                        let tok_start = p;
-                        let mut h = 0x811c9dc5u32;
-                        while p < tlen && unsafe { *IS_TOKEN.get_unchecked(*text.get_unchecked(p) as usize) } {
-                            let b = unsafe { *text.get_unchecked(p) };
-                            h ^= (b | 0x20) as u32;
-                            h = h.wrapping_mul(0x01000193);
-                            p += 1;
-                        }
-                        let tok_len = p - tok_start;
-                        if tok_len <= 23 {
-                            if h == 0 { h = 1; }
-                            if let Some(term_id) = dict_ref.get_with_hash(&text[tok_start..p], h) {
-                                let tid = term_id as usize;
-                                if unsafe { *last_seen.get_unchecked(tid) } != d_id {
-                                    unsafe { *last_seen.get_unchecked_mut(tid) = d_id; }
-                                    let slot = unsafe { *write_pos.get_unchecked(tid) } as usize;
-                                    unsafe {
-                                        *write_pos.get_unchecked_mut(tid) += 1;
-                                        *raw_ptr.add(slot) = d_id;
-                                    }
-                                }
-                            }
-                        }
+                for term in 0..(num_terms as usize) {
+                    let start_idx = term_offsets[term] as usize;
+                    let end_idx = term_offsets[term + 1] as usize;
+                    let count = end_idx - start_idx;
+                    if count == 0 { continue; }
+                    let dest = write_bases[term] as usize;
+                    for k in 0..count {
+                        let entry = unsafe { *local_records.get_unchecked(start_idx + k) };
+                        let doc_id = start_doc + (entry as u32);
+                        unsafe { *raw_ptr.add(dest + k) = doc_id; }
                     }
                 }
             });

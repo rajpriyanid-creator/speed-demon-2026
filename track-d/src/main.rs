@@ -146,8 +146,8 @@ fn main() {
     // Pass 1: count forward degrees in parallel
     let num_load_threads = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
+        .unwrap_or(8)
+        .min(12);
 
     let mut edge_chunks = Vec::with_capacity(num_load_threads);
     {
@@ -174,13 +174,16 @@ fn main() {
                 let mut pos = start;
                 while pos < end {
                     let u = parse_u32(g_data, &mut pos) as usize;
-                    if pos < end { pos += 1; }
-                    let _v = parse_u32(g_data, &mut pos);
-                    if pos < end { pos += 1; }
-                    while pos < end && g_data[pos] != b'\n' { pos += 1; }
-                    if pos < end { pos += 1; }
+                    while pos < end && unsafe { *g_data.get_unchecked(pos) } != b'\n' {
+                        pos += 1;
+                    }
+                    if pos < end {
+                        pos += 1;
+                    }
 
-                    if u < n { local_f_deg[u] += 1; }
+                    if u < n {
+                        unsafe { *local_f_deg.get_unchecked_mut(u) += 1; }
+                    }
                 }
                 local_f_deg
             })
@@ -228,9 +231,11 @@ fn main() {
                     let packed_f = (v as u64) | (w << 32);
 
                     if u < n {
-                        let slot = f_write[u] as usize;
-                        f_write[u] += 1;
-                        unsafe { *f_raw.add(slot) = packed_f; }
+                        let slot = unsafe { *f_write.get_unchecked(u) } as usize;
+                        unsafe {
+                            *f_write.get_unchecked_mut(u) += 1;
+                            *f_raw.add(slot) = packed_f;
+                        }
                     }
                 }
             });

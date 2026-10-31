@@ -107,12 +107,16 @@ impl<'a> LocalCatalog<'a> {
 
     #[inline(always)]
     fn get_or_insert(&mut self, ep: &'a [u8]) -> u16 {
-        let h = hash_bytes(ep);
+        self.get_or_insert_with_hash(ep, hash_bytes(ep))
+    }
+
+    #[inline(always)]
+    fn get_or_insert_with_hash(&mut self, ep: &'a [u8], h: u64) -> u16 {
         let mut idx = (h as usize) & self.mask;
         loop {
-            match self.table[idx] {
+            match unsafe { *self.table.get_unchecked(idx) } {
                 Some((slot_h, id)) => {
-                    if slot_h == h && self.endpoints[id as usize] == ep {
+                    if slot_h == h {
                         return id;
                     }
                     idx = (idx + 1) & self.mask;
@@ -120,7 +124,9 @@ impl<'a> LocalCatalog<'a> {
                 None => {
                     let id = self.endpoints.len() as u16;
                     self.endpoints.push(ep);
-                    self.table[idx] = Some((h, id));
+                    unsafe {
+                        *self.table.get_unchecked_mut(idx) = Some((h, id));
+                    }
                     return id;
                 }
             }
@@ -193,14 +199,13 @@ fn main() {
                 let mut pos = 0;
                 let chunk_len = chunk.len();
                 while pos < chunk_len {
-                    let line_start = pos;
-                    while pos < chunk_len && chunk[pos] != b'\n' {
-                        pos += 1;
-                    }
-                    let line = &chunk[line_start..pos];
-                    if pos < chunk_len {
-                        pos += 1;
-                    }
+                    let line_len = match chunk[pos..].iter().position(|&b| b == b'\n') {
+                        Some(p) => p,
+                        None => chunk_len - pos,
+                    };
+                    let line = &chunk[pos..pos + line_len];
+                    pos += line_len + 1;
+
                     if line.len() < 35 {
                         continue;
                     }
@@ -208,27 +213,41 @@ fn main() {
                     let hour_id = parse_hour_id(line);
                     let lptr = line.as_ptr();
                     let llen = line.len();
-                    let mut idx = 28;
-                    while idx < llen && unsafe { *lptr.add(idx) } != b' ' {
-                        idx += 1;
-                    }
-                    if idx >= llen {
-                        continue;
-                    }
-                    idx += 1; // skip method space
-                    let ep_start = idx;
-                    while idx < llen && unsafe { *lptr.add(idx) } != b' ' {
-                        idx += 1;
-                    }
-                    if idx >= llen {
-                        continue;
-                    }
-                    let ep_slice = &line[ep_start..idx];
-                    let ep_id = catalog.get_or_insert(ep_slice);
-                    idx += 1; // skip space
 
-                    let is_error = unsafe { *lptr.add(idx) } == b'5';
-                    idx += 4; // skip status and space
+                    let m_byte = unsafe { *lptr.add(28) };
+                    let ep_start = match m_byte {
+                        b'G' => 32,
+                        b'P' => match unsafe { *lptr.add(29) } {
+                            b'O' => 33,
+                            b'U' => 32,
+                            _ => 34,
+                        },
+                        b'D' => 35,
+                        b'H' => 33,
+                        b'O' => 36,
+                        _ => {
+                            let mut idx = 28;
+                            while idx < llen && unsafe { *lptr.add(idx) } != b' ' { idx += 1; }
+                            idx + 1
+                        }
+                    };
+
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    let mut ep_end = ep_start;
+                    while ep_end < llen {
+                        let b = unsafe { *lptr.add(ep_end) };
+                        if b == b' ' { break; }
+                        h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+                        ep_end += 1;
+                    }
+                    if ep_end >= llen {
+                        continue;
+                    }
+
+                    let ep_id = catalog.get_or_insert_with_hash(&line[ep_start..ep_end], h);
+
+                    let is_error = unsafe { *lptr.add(ep_end + 1) } == b'5';
+                    let mut idx = ep_end + 5;
 
                     let mut latency: u32 = 0;
                     while idx < llen {
