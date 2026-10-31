@@ -8,23 +8,13 @@ use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
 #[inline(always)]
 fn find_quote_swar(w: u64) -> Option<usize> {
     let x = w ^ 0x22222222_22222222;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
-    if m != 0 {
-        Some((m.trailing_zeros() >> 3) as usize)
-    } else {
-        None
-    }
-}
-
-#[inline(always)]
-fn find_comma_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
     let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
     if m != 0 {
         Some((m.trailing_zeros() >> 3) as usize)
@@ -219,7 +209,7 @@ fn main() {
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -234,8 +224,8 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // ONE PASS: Each thread holds thread-local records: Vec<u64> (800 KB per thread)
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u64>);
+    // Phase 1: Parse records, accumulate scalar aggs, and bucket name CRCs per country
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
     let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -245,11 +235,11 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let est_records = (end - start) / 100 + 1024;
-                let mut local_records: Vec<u64> = Vec::with_capacity(est_records);
+                let mut country_crcs: Vec<Vec<u32>> = (0..num_countries).map(|_| Vec::with_capacity(1200)).collect();
 
                 let p = data.as_ptr();
                 let mut pos = start;
+                let mut last_madv_pos = start;
 
                 while pos < end {
                     unsafe {
@@ -257,7 +247,6 @@ fn main() {
                             pos += 3;
                         }
                         if pos >= len { break; }
-
                         let b_lead = *p.add(pos);
                         if b_lead == b'\r' || b_lead == b'\n' {
                             pos += 1;
@@ -302,17 +291,6 @@ fn main() {
                         } else {
                             let n_start = pos;
                             let mut crc: u32 = 0;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    crc = crc32_hardware(crc, p.add(pos), off);
-                                    pos += off;
-                                    break;
-                                } else {
-                                    crc = crc32_hardware(crc, p.add(pos), 8);
-                                    pos += 8;
-                                }
-                            }
                             while *p.add(pos) != b',' {
                                 crc = _mm_crc32_u8(crc, *p.add(pos));
                                 pos += 1;
@@ -359,15 +337,6 @@ fn main() {
                             if *p.add(pos) == b',' { pos += 1; }
                         } else {
                             let n_start = pos;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    pos += off;
-                                    break;
-                                } else {
-                                    pos += 8;
-                                }
-                            }
                             while *p.add(pos) != b',' { pos += 1; }
                             note_len = (pos - n_start) as u64;
                             pos += 1;
@@ -414,13 +383,23 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        let packed = ((c_id as u64) << 32) | (name_crc as u64);
-                        local_records.push(packed);
+                        country_crcs[c_id as usize].push(name_crc);
+
+                        if pos - last_madv_pos >= 2 * 1024 * 1024 {
+                            let madv_len = (pos - last_madv_pos) & !4095;
+                            madvise(p.add(last_madv_pos) as *mut _, madv_len, 4);
+                            last_madv_pos += madv_len;
+                        }
                     }
                 }
 
-                local_records.sort_unstable();
-                (local_aggs, local_records)
+                unsafe {
+                    if end > last_madv_pos {
+                        madvise(p.add(last_madv_pos) as *mut _, end - last_madv_pos, 4);
+                    }
+                }
+
+                (local_aggs, country_crcs)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -441,70 +420,66 @@ fn main() {
                 let mut scratch = Vec::with_capacity(32_768);
 
                 for c_id in c_start..c_end {
-                    let mut total_agg = CountryScalarAgg::default();
+                    let mut count = 0u64;
+                    let mut id_sum = 0u64;
+                    let mut amount_sum = 0i64;
+                    let mut amount_min = i64::MAX;
+                    let mut amount_max = i64::MIN;
+                    let mut name_bytes = 0u64;
+                    let mut note_bytes = 0u64;
+
                     scratch.clear();
 
                     for t in 0..num_threads {
                         let agg = &thread_results_ref[t].0[c_id];
                         if agg.count > 0 {
-                            total_agg.count += agg.count;
-                            total_agg.id_sum += agg.id_sum;
-                            total_agg.amount_sum += agg.amount_sum;
-                            total_agg.amount_min = total_agg.amount_min.min(agg.amount_min);
-                            total_agg.amount_max = total_agg.amount_max.max(agg.amount_max);
-                            total_agg.name_bytes += agg.name_bytes;
-                            total_agg.note_bytes += agg.note_bytes;
-
-                            let recs = &thread_results_ref[t].1;
-                            let c_prefix = (c_id as u64) << 32;
-                            let c_next_prefix = ((c_id as u64) + 1) << 32;
-                            let s_idx = recs.partition_point(|&x| x < c_prefix);
-                            let e_idx = recs[s_idx..].partition_point(|&x| x < c_next_prefix) + s_idx;
-                            for &packed in &recs[s_idx..e_idx] {
-                                scratch.push(packed as u32);
-                            }
+                            count += agg.count;
+                            id_sum += agg.id_sum;
+                            amount_sum += agg.amount_sum;
+                            amount_min = amount_min.min(agg.amount_min);
+                            amount_max = amount_max.max(agg.amount_max);
+                            name_bytes += agg.name_bytes;
+                            note_bytes += agg.note_bytes;
+                            scratch.extend_from_slice(&thread_results_ref[t].1[c_id]);
                         }
                     }
 
-                    if total_agg.count == 0 {
-                        continue;
-                    }
+                    if count == 0 { continue; }
 
                     scratch.sort_unstable();
-
-                    let mut distinct: u64 = 0;
-                    let mut i = 0;
-                    while i < scratch.len() {
-                        distinct += 1;
-                        let val = scratch[i];
-                        while i < scratch.len() && scratch[i] == val {
-                            i += 1;
+                    let mut distinct = 0usize;
+                    let mut last = u32::MAX;
+                    for &crc in &scratch {
+                        if crc != last {
+                            distinct += 1;
+                            last = crc;
                         }
                     }
 
-                    out.extend_from_slice(&country_names_ref[c_id]);
+                    // Format line
+                    let c_name = &country_names_ref[c_id];
+                    out.extend_from_slice(c_name);
                     out.push(b' ');
-                    write_u64_fast(total_agg.count, &mut out);
+                    write_u64_fast(count, &mut out);
                     out.push(b' ');
-                    write_u64_fast(total_agg.id_sum, &mut out);
+                    write_u64_fast(id_sum, &mut out);
                     out.push(b' ');
-                    write_cents_fast(total_agg.amount_sum, &mut out);
+                    write_cents_fast(amount_sum, &mut out);
                     out.push(b' ');
-                    write_cents_fast(total_agg.amount_min, &mut out);
+                    write_cents_fast(amount_min, &mut out);
                     out.push(b' ');
-                    write_cents_fast(total_agg.amount_max, &mut out);
+                    write_cents_fast(amount_max, &mut out);
                     out.push(b' ');
-                    write_u64_fast(distinct, &mut out);
+                    write_u64_fast(distinct as u64, &mut out);
                     out.push(b' ');
-                    write_u64_fast(total_agg.name_bytes, &mut out);
+                    write_u64_fast(name_bytes, &mut out);
                     out.push(b' ');
-                    write_u64_fast(total_agg.note_bytes, &mut out);
+                    write_u64_fast(note_bytes, &mut out);
                     out.push(b'\n');
                 }
                 out
             })
         }).collect();
-
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
@@ -513,7 +488,7 @@ fn main() {
         Ok(f) => f,
         Err(_) => return,
     };
-    for part in formatted_outputs {
-        let _ = out_file.write_all(&part);
+    for chunk in &formatted_outputs {
+        let _ = out_file.write_all(chunk);
     }
 }

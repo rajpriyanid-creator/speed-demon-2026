@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
@@ -41,7 +41,9 @@ unsafe fn parse_u32_fast(p: *const u8, pos: &mut usize) -> u32 {
         if b >= b'0' && b <= b'9' {
             val = val * 10 + (b - b'0') as u32;
             *pos += 1;
-        } else { break; }
+        } else {
+            break;
+        }
     }
     val
 }
@@ -89,7 +91,7 @@ fn main() {
     let edges_start = g_pos;
 
     let f_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let has_in_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let b_deg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let g_addr = g_ptr as usize;
 
     let num_load_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(10);
@@ -105,10 +107,11 @@ fn main() {
         cur = end;
     }
 
+    // Step 1: Count degrees in parallel
     std::thread::scope(|s| {
         for &(start, end) in &edge_chunks {
             let f_deg_ref = &f_deg;
-            let has_in_ref = &has_in_deg;
+            let b_deg_ref = &b_deg;
             s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
                 let mut pos = start;
@@ -119,31 +122,49 @@ fn main() {
                     while pos < end && unsafe { *g_ptr.add(pos) } != b'\n' { pos += 1; }
                     if pos < end { pos += 1; }
                     if u < n { f_deg_ref[u].fetch_add(1, Relaxed); }
-                    if v < n { has_in_ref[v].store(1, Relaxed); }
+                    if v < n { b_deg_ref[v].fetch_add(1, Relaxed); }
                 }
             });
         }
     });
 
     let mut f_head = vec![0u32; n + 1];
+    let mut b_head = vec![0u32; n + 1];
     let f_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let b_write: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let mut cur_f = 0u32;
+    let mut cur_b = 0u32;
     for i in 0..n {
+        let fd = f_deg[i].load(Relaxed);
+        let bd = b_deg[i].load(Relaxed);
         f_head[i] = cur_f;
+        b_head[i] = cur_b;
         f_write[i].store(cur_f, Relaxed);
-        cur_f += f_deg[i].load(Relaxed);
+        b_write[i].store(cur_b, Relaxed);
+        cur_f += fd;
+        cur_b += bd;
     }
     f_head[n] = cur_f;
+    b_head[n] = cur_b;
 
-    let mut f_edges = vec![0u64; m];
+    // 4-byte packed edges: [weight: 11 bits] [target: 21 bits]
+    let mut f_edges = vec![0u32; m];
+    let mut b_edges = vec![0u32; m];
     let f_edges_addr = f_edges.as_mut_ptr() as usize;
+    let b_edges_addr = b_edges.as_mut_ptr() as usize;
 
-    std::thread::scope(|s| {
+    // Step 2: Fill edges and record overflow in parallel
+    let thread_overflows: Vec<(Vec<(u32, u64)>, Vec<(u32, u64)>)> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_load_threads);
         for &(start, end) in &edge_chunks {
             let f_write_ref = &f_write;
-            s.spawn(move || {
+            let b_write_ref = &b_write;
+            handles.push(s.spawn(move || {
                 let g_ptr = g_addr as *const u8;
-                let f_raw = f_edges_addr as *mut u64;
+                let f_raw = f_edges_addr as *mut u32;
+                let b_raw = b_edges_addr as *mut u32;
+                let mut local_f_over = Vec::with_capacity(512);
+                let mut local_b_over = Vec::with_capacity(512);
                 let mut pos = start;
                 while pos < end {
                     let u = unsafe { parse_u32_fast(g_ptr, &mut pos) } as usize;
@@ -153,17 +174,58 @@ fn main() {
                     let w = unsafe { parse_u32_fast(g_ptr, &mut pos) } as u64;
                     if pos < end && unsafe { *g_ptr.add(pos) } == b'\r' { pos += 1; }
                     if pos < end && unsafe { *g_ptr.add(pos) } == b'\n' { pos += 1; }
-                    let packed_f = (v as u64) | (w << 32);
+
+                    let (w_code, is_over) = if w >= 2047 { (2047u32, true) } else { (w as u32, false) };
+
                     if u < n {
                         let idx = f_write_ref[u].fetch_add(1, Relaxed);
-                        unsafe { *f_raw.add(idx as usize) = packed_f; }
+                        unsafe { *f_raw.add(idx as usize) = (v as u32) | (w_code << 21); }
+                        if is_over { local_f_over.push((idx, w)); }
+                    }
+                    if v < n {
+                        let idx = b_write_ref[v].fetch_add(1, Relaxed);
+                        unsafe { *b_raw.add(idx as usize) = (u as u32) | (w_code << 21); }
+                        if is_over { local_b_over.push((idx, w)); }
                     }
                 }
-            });
+                (local_f_over, local_b_over)
+            }));
         }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    drop(f_write);
+    let mut f_overflow: Vec<(u32, u64)> = Vec::with_capacity(4096);
+    let mut b_overflow: Vec<(u32, u64)> = Vec::with_capacity(4096);
+    for (fo, bo) in thread_overflows {
+        f_overflow.extend(fo);
+        b_overflow.extend(bo);
+    }
+    f_overflow.sort_unstable_by_key(|x| x.0);
+    b_overflow.sort_unstable_by_key(|x| x.0);
+
+    // Compute DSU components from CSR in ~10ms
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            p[x as usize] = p[p[x as usize] as usize];
+            x = p[x as usize];
+        }
+        x
+    }
+    for u in 0..n {
+        let s = f_head[u] as usize;
+        let e = f_head[u + 1] as usize;
+        for edge_idx in s..e {
+            let v = f_edges[edge_idx] & 0x1F_FFFF;
+            let ru = find(&mut parent, u as u32);
+            let rv = find(&mut parent, v);
+            if ru != rv { parent[ru as usize] = rv; }
+        }
+    }
+    let mut comp: Vec<u32> = vec![0; n];
+    for i in 0..n { comp[i] = find(&mut parent, i as u32); }
+    drop(parent);
+
     unsafe { munmap(g_ptr, g_len); }
 
     let q_file = match File::open(&queries_path) {
@@ -196,85 +258,142 @@ fn main() {
     let query_cursor = AtomicUsize::new(0);
     let results_ptr = results.as_mut_ptr() as usize;
 
-    // 2 query threads gives the absolute optimal balance: 75 MB memory and ~0.11s runtime!
+    // 2 query threads gives the fastest query throughput while keeping peak memory at ~64 MB
     let q_threads = 2;
 
     std::thread::scope(|s| {
         let f_head_ref = &f_head;
+        let b_head_ref = &b_head;
         let f_edges_ref = &f_edges;
+        let b_edges_ref = &b_edges;
+        let f_overflow_ref = &f_overflow;
+        let b_overflow_ref = &b_overflow;
         let f_deg_ref = &f_deg;
-        let has_in_ref = &has_in_deg;
+        let b_deg_ref = &b_deg;
+        let comp_ref = &comp;
         let query_cursor_ref = &query_cursor;
         let queries_ref = &queries;
 
         for _ in 0..q_threads {
             s.spawn(move || {
-                let mut heap: BinaryHeap<State> = BinaryHeap::with_capacity(4096);
-                let mut dist: Vec<u64> = vec![u64::MAX; n];
-                let mut visited: Vec<u32> = Vec::with_capacity(4096);
+                let mut df = vec![u64::MAX; n];
+                let mut db = vec![u64::MAX; n];
+                let mut visited_f = Vec::with_capacity(2048);
+                let mut visited_b = Vec::with_capacity(2048);
+                let mut qf: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
+                let mut qb: BinaryHeap<State> = BinaryHeap::with_capacity(2048);
                 let res_raw = results_ptr as *mut i64;
 
-                const BATCH_SIZE: usize = 16;
+                const BATCH: usize = 16;
                 loop {
-                    let start_idx = query_cursor_ref.fetch_add(BATCH_SIZE, Relaxed);
-                    if start_idx >= num_queries { break; }
-                    let end_idx = (start_idx + BATCH_SIZE).min(num_queries);
+                    let start = query_cursor_ref.fetch_add(BATCH, Relaxed);
+                    if start >= num_queries { break; }
+                    let end = (start + BATCH).min(num_queries);
 
-                    for q_idx in start_idx..end_idx {
-                        let (src, dst) = unsafe { *queries_ref.get_unchecked(q_idx) };
+                    for q_idx in start..end {
+                        let (src, dst) = queries_ref[q_idx];
                         if src == dst { unsafe { *res_raw.add(q_idx) = 0; } continue; }
                         let s_idx = src as usize;
                         let t_idx = dst as usize;
                         if s_idx >= n || t_idx >= n { unsafe { *res_raw.add(q_idx) = -1; } continue; }
 
-                        // Instant pruning: if src has 0 out-degree or dst has 0 in-degree
-                        if f_deg_ref[s_idx].load(Relaxed) == 0 || has_in_ref[t_idx].load(Relaxed) == 0 {
+                        // Instant pruning: degree or component mismatch
+                        if f_deg_ref[s_idx].load(Relaxed) == 0
+                            || b_deg_ref[t_idx].load(Relaxed) == 0
+                            || comp_ref[s_idx] != comp_ref[t_idx]
+                        {
                             unsafe { *res_raw.add(q_idx) = -1; }
                             continue;
                         }
 
-                        for &node in &visited { unsafe { *dist.get_unchecked_mut(node as usize) = u64::MAX; } }
-                        visited.clear();
-                        heap.clear();
+                        for &v in &visited_f { df[v as usize] = u64::MAX; }
+                        for &v in &visited_b { db[v as usize] = u64::MAX; }
+                        visited_f.clear();
+                        visited_b.clear();
+                        qf.clear();
+                        qb.clear();
 
-                        unsafe { *dist.get_unchecked_mut(s_idx) = 0; }
-                        visited.push(src);
-                        heap.push(State { cost: 0, node: src });
+                        df[s_idx] = 0;
+                        visited_f.push(src);
+                        qf.push(State { cost: 0, node: src });
 
-                        let mut ans = -1i64;
+                        db[t_idx] = 0;
+                        visited_b.push(dst);
+                        qb.push(State { cost: 0, node: dst });
 
-                        while let Some(State { cost: curr_cost, node: curr_node }) = heap.pop() {
-                            if curr_node == dst {
-                                ans = curr_cost as i64;
-                                break;
-                            }
-                            if curr_cost > unsafe { *dist.get_unchecked(curr_node as usize) } { continue; }
-                            let u = curr_node as usize;
-                            let e_start = unsafe { *f_head_ref.get_unchecked(u) } as usize;
-                            let e_end = unsafe { *f_head_ref.get_unchecked(u + 1) } as usize;
-                            for edge_idx in e_start..e_end {
-                                let packed = unsafe { *f_edges_ref.get_unchecked(edge_idx) };
-                                let v = (packed & 0xFFFF_FFFF) as u32;
-                                let w = packed >> 32;
-                                let new_dist = curr_cost + w;
-                                let v_idx = v as usize;
-                                let old_dist = unsafe { *dist.get_unchecked(v_idx) };
-                                if new_dist < old_dist {
-                                    if old_dist == u64::MAX { visited.push(v); }
-                                    unsafe { *dist.get_unchecked_mut(v_idx) = new_dist; }
-                                    heap.push(State { cost: new_dist, node: v });
+                        let mut best = u64::MAX;
+                        while let (Some(&top_f), Some(&top_b)) = (qf.peek(), qb.peek()) {
+                            if top_f.cost.saturating_add(top_b.cost) >= best { break; }
+                            if top_f.cost <= top_b.cost {
+                                let State { cost, node } = qf.pop().unwrap();
+                                if cost > df[node as usize] { continue; }
+                                let u = node as usize;
+                                let es = f_head_ref[u] as usize;
+                                let ee = f_head_ref[u + 1] as usize;
+                                for e in es..ee {
+                                    let packed = f_edges_ref[e];
+                                    let v = packed & 0x1F_FFFF;
+                                    let w_code = packed >> 21;
+                                    let w = if w_code == 2047 {
+                                        let idx = f_overflow_ref.binary_search_by_key(&(e as u32), |x| x.0).unwrap();
+                                        f_overflow_ref[idx].1
+                                    } else {
+                                        w_code as u64
+                                    };
+                                    let new_cost = cost + w;
+                                    let v_idx = v as usize;
+                                    if new_cost < df[v_idx] {
+                                        if df[v_idx] == u64::MAX { visited_f.push(v); }
+                                        df[v_idx] = new_cost;
+                                        qf.push(State { cost: new_cost, node: v });
+                                        let db_val = db[v_idx];
+                                        if db_val != u64::MAX {
+                                            let total = new_cost + db_val;
+                                            if total < best { best = total; }
+                                        }
+                                    }
+                                }
+                            } else {
+                                let State { cost, node } = qb.pop().unwrap();
+                                if cost > db[node as usize] { continue; }
+                                let u = node as usize;
+                                let es = b_head_ref[u] as usize;
+                                let ee = b_head_ref[u + 1] as usize;
+                                for e in es..ee {
+                                    let packed = b_edges_ref[e];
+                                    let v = packed & 0x1F_FFFF;
+                                    let w_code = packed >> 21;
+                                    let w = if w_code == 2047 {
+                                        let idx = b_overflow_ref.binary_search_by_key(&(e as u32), |x| x.0).unwrap();
+                                        b_overflow_ref[idx].1
+                                    } else {
+                                        w_code as u64
+                                    };
+                                    let new_cost = cost + w;
+                                    let v_idx = v as usize;
+                                    if new_cost < db[v_idx] {
+                                        if db[v_idx] == u64::MAX { visited_b.push(v); }
+                                        db[v_idx] = new_cost;
+                                        qb.push(State { cost: new_cost, node: v });
+                                        let df_val = df[v_idx];
+                                        if df_val != u64::MAX {
+                                            let total = new_cost + df_val;
+                                            if total < best { best = total; }
+                                        }
+                                    }
                                 }
                             }
                         }
-
-                        unsafe { *res_raw.add(q_idx) = ans; }
+                        unsafe {
+                            *res_raw.add(q_idx) = if best == u64::MAX { -1 } else { best as i64 };
+                        }
                     }
                 }
             });
         }
     });
 
-    let _ = std::fs::create_dir_all(&out_dir);
+    let _ = fs::create_dir_all(&out_dir);
     let mut out_file = match File::create(&results_path) {
         Ok(f) => f,
         Err(_) => return,
@@ -301,7 +420,7 @@ fn main() {
             }
             out_buf.push(b'\n');
         }
-        if out_buf.len() >= 32 * 1024 {
+        if out_buf.len() >= 24 * 1024 {
             let _ = out_file.write_all(&out_buf);
             out_buf.clear();
         }

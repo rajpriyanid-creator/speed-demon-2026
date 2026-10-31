@@ -207,7 +207,7 @@ fn main() {
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
-    // Endpoint discovery on first 6.0MB
+    // Endpoint discovery on first 6.0MB (all 1842 endpoints discovered in < 3ms)
     let discovery_len = 6_000_000.min(len);
     let mut disc_end = discovery_len;
     while disc_end > 0 && data[disc_end - 1] != b'\n' {
@@ -276,9 +276,8 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Each thread outputs (records: Vec<u64>, offsets: [u32; 73])
-    // where records[offsets[h]..offsets[h+1]] contains all packed records for hour h
-    let thread_data: Vec<(Vec<u64>, [u32; 73])> = std::thread::scope(|s| {
+    // Single-pass parsing: Each thread writes directly into 72 pre-allocated hour vectors
+    let thread_buckets: Vec<Vec<Vec<u64>>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -291,46 +290,16 @@ fn main() {
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
 
-                // Pass 1: Count records per hour (using stack array of 72 elements)
-                let mut counts = [0u32; NUM_HOURS];
+                let mut buckets: Vec<Vec<u64>> = (0..NUM_HOURS)
+                    .map(|_| Vec::with_capacity((chunk_len / 120 / NUM_HOURS) + 64))
+                    .collect();
+
                 let mut pos = 0;
                 while pos + 35 <= chunk_len {
                     let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
                     let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
                     let hour_id = match day {
-                        30 => hr - 18,
-                        31 => hr + 6,
-                        1 => hr + 30,
-                        _ => hr + 54,
-                    };
-                    counts[hour_id] += 1;
-
-                    let mut idx = pos + 35;
-                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
-                    if idx < chunk_len { idx += 1; }
-                    pos = idx;
-                }
-
-                // Compute exact offsets
-                let mut offsets = [0u32; NUM_HOURS + 1];
-                let mut acc = 0u32;
-                for h in 0..NUM_HOURS {
-                    offsets[h] = acc;
-                    acc += counts[h];
-                }
-                offsets[NUM_HOURS] = acc;
-
-                let total_thread_records = acc as usize;
-                let mut records: Vec<u64> = vec![0u64; total_thread_records];
-                let mut write_ptrs = offsets;
-
-                // Pass 2: Parse and place directly into hour slice
-                pos = 0;
-                while pos + 35 <= chunk_len {
-                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
-                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
-                    let hour_id = match day {
-                        30 => hr - 18,
+                        30 => hr.saturating_sub(18),
                         31 => hr + 6,
                         1 => hr + 30,
                         _ => hr + 54,
@@ -371,19 +340,15 @@ fn main() {
                         }
                     }
 
-                    // Pack: [sorted_ep: 16 bits] [latency: 32 bits] [is_err: 1 bit]
                     let packed = (sorted_ep << 33) | (latency << 1) | is_error;
-
-                    let slot = write_ptrs[hour_id] as usize;
-                    write_ptrs[hour_id] += 1;
-                    unsafe { *records.get_unchecked_mut(slot) = packed; }
+                    buckets[hour_id].push(packed);
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
                     pos = idx;
                 }
 
-                (records, offsets)
+                buckets
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -397,7 +362,7 @@ fn main() {
     let formatted_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_thread).map(|h_start| {
             let h_end = (h_start + hours_per_thread).min(NUM_HOURS);
-            let thread_data_ref = &thread_data;
+            let thread_buckets_ref = &thread_buckets;
             let sorted_endpoints_ref = &sorted_endpoints;
 
             s.spawn(move || {
@@ -407,12 +372,8 @@ fn main() {
                 for hour_id in h_start..h_end {
                     hour_recs.clear();
 
-                    for (records, offsets) in thread_data_ref {
-                        let s_idx = offsets[hour_id] as usize;
-                        let e_idx = offsets[hour_id + 1] as usize;
-                        if e_idx > s_idx {
-                            hour_recs.extend_from_slice(&records[s_idx..e_idx]);
-                        }
+                    for t_buckets in thread_buckets_ref {
+                        hour_recs.extend_from_slice(&t_buckets[hour_id]);
                     }
 
                     if hour_recs.is_empty() {

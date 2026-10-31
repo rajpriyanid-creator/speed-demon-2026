@@ -28,7 +28,7 @@ unsafe fn hash_bytes_fast(tok: *const u8, len: usize) -> u32 {
     if c32 == 0 { 1 } else { c32 }
 }
 
-const NUM_BLOCKS: usize = 12;
+const NUM_BLOCKS: usize = 5;
 
 struct MmapSlice {
     ptr: *mut u8,
@@ -534,6 +534,9 @@ fn main() {
     let mut thread_doc_info: Vec<Vec<(u32, u32)>> = (0..num_threads)
         .map(|_| Vec::with_capacity(8_000))
         .collect();
+    let mut thread_last_seen: Vec<Vec<u16>> = (0..num_threads)
+        .map(|_| vec![u16::MAX; num_terms as usize])
+        .collect();
 
     let mut running_global_doc_id = 0u32;
 
@@ -569,10 +572,11 @@ fn main() {
         }
 
         std::thread::scope(|s| {
-            for (((postings_buf, counts_buf), doc_info_buf), &(sb, eb)) in
+            for ((((postings_buf, counts_buf), doc_info_buf), last_seen_buf), &(sb, eb)) in
                 thread_postings.iter_mut()
                 .zip(thread_counts.iter_mut())
                 .zip(thread_doc_info.iter_mut())
+                .zip(thread_last_seen.iter_mut())
                 .zip(sub_chunks.iter())
             {
                 let dict_ref = &dict;
@@ -581,9 +585,10 @@ fn main() {
                 postings_buf.clear();
                 counts_buf.fill(0);
                 doc_info_buf.clear();
+                last_seen_buf.fill(u16::MAX);
 
                 s.spawn(move || {
-                    let mut last_seen = vec![u16::MAX; num_terms as usize];
+                    let last_seen = last_seen_buf;
                     let mut i = 0;
                     let clen = chunk.len();
                     let mut doc_offset_in_thread = 0u16;
