@@ -77,7 +77,7 @@ struct FastDict {
 impl FastDict {
     fn new(cap: usize) -> Self {
         let size = cap.next_power_of_two();
-        let bloom_words = 65536; // 64 KB Bloom filter
+        let bloom_words = 65536; // 512 KB 2-bit Bloom filter
         Self {
             table: vec![DictEntry { hash: 0, term_id: 0, _pad: 0 }; size],
             mask: size - 1,
@@ -88,8 +88,10 @@ impl FastDict {
 
     #[inline(always)]
     fn insert(&mut self, h: u64, term_id: u32) {
-        let bit = (h as usize) & self.bloom_mask;
-        self.bloom[bit / 64] |= 1u64 << (bit % 64);
+        let bit1 = (h as usize) & self.bloom_mask;
+        let bit2 = ((h >> 32) as usize) & self.bloom_mask;
+        self.bloom[bit1 / 64] |= 1u64 << (bit1 % 64);
+        self.bloom[bit2 / 64] |= 1u64 << (bit2 % 64);
 
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -105,9 +107,14 @@ impl FastDict {
 
     #[inline(always)]
     fn get(&self, h: u64) -> Option<u32> {
-        let bit = (h as usize) & self.bloom_mask;
-        let word = unsafe { *self.bloom.get_unchecked(bit / 64) };
-        if (word & (1u64 << (bit % 64))) == 0 {
+        let bit1 = (h as usize) & self.bloom_mask;
+        let word1 = unsafe { *self.bloom.get_unchecked(bit1 / 64) };
+        if (word1 & (1u64 << (bit1 % 64))) == 0 {
+            return None;
+        }
+        let bit2 = ((h >> 32) as usize) & self.bloom_mask;
+        let word2 = unsafe { *self.bloom.get_unchecked(bit2 / 64) };
+        if (word2 & (1u64 << (bit2 % 64))) == 0 {
             return None;
         }
 
@@ -426,7 +433,7 @@ fn main() {
     if q_ptr == usize::MAX as *mut u8 || q_ptr.is_null() { return; }
     let q_data = unsafe { std::slice::from_raw_parts(q_ptr, q_len) };
 
-    let mut dict = FastDict::new(131_072);
+    let mut dict = FastDict::new(262_144);
     let mut num_terms = 0u32;
     for line in q_data.split(|&b| b == b'\n') {
         let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
