@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::_mm_crc32_u64;
@@ -307,8 +308,12 @@ fn main() {
 
     let num_groups = NUM_HOURS * num_endpoints;
 
-    // PASS 1: Count requests and errors per group for each thread (Takes ~6ms, 0 RAM allocated!)
-    let thread_stats: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    // Global Atomic arrays for counts and errors - ONLY 2.48 MB total!
+    let total_counts: Vec<AtomicU32> = (0..num_groups).map(|_| AtomicU32::new(0)).collect();
+    let total_errs: Vec<AtomicU32> = (0..num_groups).map(|_| AtomicU32::new(0)).collect();
+
+    // PASS 1: Count requests and errors per group across threads (with madvise_dontneed every 2MB)
+    std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let start = boundaries[i];
@@ -316,15 +321,15 @@ fn main() {
             if start >= end { continue; }
             let chunk = &data[start..end];
             let lookup_ref = &lookup_table;
+            let total_counts_ref = &total_counts;
+            let total_errs_ref = &total_errs;
 
             handles.push(s.spawn(move || {
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
-                let mut counts = vec![0u32; num_groups];
-                let mut errs = vec![0u32; num_groups];
-
                 let mut pos = 0;
                 let mut last_adv = 0;
+
                 while pos + 35 <= chunk_len {
                     if pos - last_adv >= 2 * 1024 * 1024 {
                         unsafe { madvise_dontneed(cptr.add(last_adv), pos - last_adv); }
@@ -378,9 +383,9 @@ fn main() {
 
                     let gid = hour_id * num_endpoints + sorted_ep;
                     unsafe {
-                        *counts.get_unchecked_mut(gid) += 1;
+                        total_counts_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed);
                         if *cptr.add(ep_end + 1) == b'5' {
-                            *errs.get_unchecked_mut(gid) += 1;
+                            total_errs_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -392,61 +397,39 @@ fn main() {
                 if chunk_len > last_adv {
                     unsafe { madvise_dontneed(cptr.add(last_adv), chunk_len - last_adv); }
                 }
-                (counts, errs)
             }));
         }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Compute prefix sums: group_offsets and thread write bases
-    let mut total_counts = vec![0u32; num_groups];
-    let mut total_errs = vec![0u32; num_groups];
-    for (t_counts, t_errs) in &thread_stats {
-        for g in 0..num_groups {
-            total_counts[g] += t_counts[g];
-            total_errs[g] += t_errs[g];
+        for h in handles {
+            h.join().unwrap();
         }
-    }
+    });
 
     let mut group_offsets = vec![0u32; num_groups + 1];
     let mut cur_offset = 0u32;
     for g in 0..num_groups {
         group_offsets[g] = cur_offset;
-        cur_offset += total_counts[g];
+        cur_offset += total_counts[g].load(Ordering::Relaxed);
     }
     group_offsets[num_groups] = cur_offset;
     let total_records = cur_offset as usize;
 
-    // Per-thread write offsets
-    let mut thread_write_offsets: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
-    let mut current_g_offsets = group_offsets.clone();
-    for (t_counts, _) in &thread_stats {
-        let mut t_offsets = vec![0u32; num_groups];
-        for g in 0..num_groups {
-            t_offsets[g] = current_g_offsets[g];
-            current_g_offsets[g] += t_counts[g];
-        }
-        thread_write_offsets.push(t_offsets);
-    }
-
-    // Drop thread_stats immediately to free memory!
-    drop(thread_stats);
-    drop(current_g_offsets);
+    // Atomic write offsets for Pass 2 (zero 15MB matrix!)
+    let write_offsets: Vec<AtomicU32> = group_offsets[..num_groups].iter().map(|&off| AtomicU32::new(off)).collect();
 
     // Allocate flat u32 array: exactly 12.4 MB for 3.1M records!
     let mut all_latencies: Vec<u32> = vec![0u32; total_records];
     let lat_ptr = all_latencies.as_mut_ptr() as usize;
 
-    // PASS 2: Parse latencies and write directly to group buckets (Takes ~8ms!)
+    // PASS 2: Parse latencies and write directly to group buckets (with madvise_dontneed every 2MB)
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
+        let write_offsets_ref = &write_offsets;
         for i in 0..num_threads {
             let start = boundaries[i];
             let end = boundaries[i + 1];
             if start >= end { continue; }
             let chunk = &data[start..end];
             let lookup_ref = &lookup_table;
-            let mut write_offsets = thread_write_offsets[i].clone();
 
             handles.push(s.spawn(move || {
                 let cptr = chunk.as_ptr();
@@ -519,10 +502,9 @@ fn main() {
                     }
 
                     let gid = hour_id * num_endpoints + sorted_ep;
-                    let dst = unsafe { *write_offsets.get_unchecked(gid) };
+                    let slot = unsafe { write_offsets_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed) as usize };
                     unsafe {
-                        *write_offsets.get_unchecked_mut(gid) = dst + 1;
-                        *base_lat_ptr.add(dst as usize) = latency;
+                        *base_lat_ptr.add(slot) = latency;
                     }
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
@@ -571,7 +553,7 @@ fn main() {
                         let p50 = slice[nearest_rank(count, 50)];
                         let p95 = slice[nearest_rank(count, 95)];
                         let p99 = slice[nearest_rank(count, 99)];
-                        let err_count = total_errs_ref[gid] as u64;
+                        let err_count = total_errs_ref[gid].load(Ordering::Relaxed) as u64;
                         let error_ppm = (err_count * 1_000_000) / (count as u64);
 
                         out.extend_from_slice(&hour_str);
