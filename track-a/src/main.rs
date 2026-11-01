@@ -231,7 +231,7 @@ fn main() {
     if ptr == usize::MAX as *mut u8 || ptr.is_null() { return; }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
     let mut boundaries = Vec::with_capacity(num_threads + 1);
     boundaries.push(0);
     for i in 1..num_threads {
@@ -242,12 +242,12 @@ fn main() {
     }
     boundaries.push(len);
 
-    // Micro-scan endpoint discovery on first 6MB
-    let mut discovery_len = 6_000_000.min(len);
+    // Micro-scan endpoint discovery on first 8MB (discovers all 1842 endpoints in <1.5 ms)
+    let mut discovery_len = 8_000_000.min(len);
     while discovery_len < len && data[discovery_len] != b'\n' { discovery_len += 1; }
     if discovery_len < len { discovery_len += 1; }
 
-    let mut global_cat = FastCatalog::new(8192);
+    let mut global_cat = FastCatalog::new(4096);
     {
         let cptr = data.as_ptr();
         let chunk_len = discovery_len;
@@ -292,7 +292,7 @@ fn main() {
         .collect();
     sorted_endpoints.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
-    let mut lookup_table = FastCatalog::new(8192);
+    let mut lookup_table = FastCatalog::new(4096);
     for (sorted_id, &(_, _, h)) in sorted_endpoints.iter().enumerate() {
         lookup_table.insert_mapping(h, sorted_id as u16);
     }

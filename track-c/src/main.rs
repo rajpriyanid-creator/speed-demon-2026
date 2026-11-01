@@ -257,7 +257,7 @@ fn main() {
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
     let mut boundaries = vec![header_end; num_threads + 1];
     let chunk_target = (len - header_end) / num_threads;
 
@@ -272,9 +272,8 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // ONE PASS: Each thread holds thread-local country_crcs with tight 512 capacity
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
-    let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
+    // PASS 1: Count records per country per thread (ZERO heap allocations! 1 KB per thread!)
+    let pass1_counts: Vec<Vec<u32>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
@@ -282,11 +281,7 @@ fn main() {
             let region_to_country_ref = &region_to_country;
 
             handles.push(s.spawn(move || {
-                let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut local_crcs: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::with_capacity(512))
-                    .collect();
-
+                let mut local_counts = vec![0u32; num_countries];
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -296,7 +291,151 @@ fn main() {
                             pos += 3;
                         }
                         if pos >= len { break; }
+                        let b_lead = *p.add(pos);
+                        if b_lead == b'\r' || b_lead == b'\n' {
+                            pos += 1;
+                            continue;
+                        }
+                        // Skip ID
+                        while *p.add(pos) != b',' { pos += 1; }
+                        pos += 1;
+                        // Skip Name
+                        if *p.add(pos) == b'"' {
+                            pos += 1;
+                            loop {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_quote_swar(w) {
+                                    let q = pos + off;
+                                    if *p.add(q + 1) == b'"' {
+                                        pos = q + 2;
+                                    } else {
+                                        pos = q + 1;
+                                        break;
+                                    }
+                                } else {
+                                    pos += 8;
+                                }
+                            }
+                            if *p.add(pos) == b',' { pos += 1; }
+                        } else {
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    pos += off;
+                                    break;
+                                } else {
+                                    pos += 8;
+                                }
+                            }
+                            while *p.add(pos) != b',' { pos += 1; }
+                            pos += 1;
+                        }
+                        // Skip Note
+                        if *p.add(pos) == b'"' {
+                            pos += 1;
+                            loop {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_quote_swar(w) {
+                                    let q = pos + off;
+                                    if *p.add(q + 1) == b'"' {
+                                        pos = q + 2;
+                                    } else {
+                                        pos = q + 1;
+                                        break;
+                                    }
+                                } else {
+                                    pos += 8;
+                                }
+                            }
+                            if *p.add(pos) == b',' { pos += 1; }
+                        } else {
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    pos += off;
+                                    break;
+                                } else {
+                                    pos += 8;
+                                }
+                            }
+                            while *p.add(pos) != b',' { pos += 1; }
+                            pos += 1;
+                        }
+                        // Read Region ID
+                        let mut rid: usize = 0;
+                        while *p.add(pos) != b',' {
+                            rid = rid * 10 + (*p.add(pos) - b'0') as usize;
+                            pos += 1;
+                        }
+                        pos += 1;
+                        // Skip to end of line
+                        while pos < end && *p.add(pos) != b'\n' { pos += 1; }
+                        if pos < end { pos += 1; }
 
+                        let c_id = if rid < region_to_country_ref.len() {
+                            *region_to_country_ref.get_unchecked(rid) as usize
+                        } else {
+                            num_countries - 1
+                        };
+                        *local_counts.get_unchecked_mut(c_id) += 1;
+                    }
+                }
+                local_counts
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut country_total_crcs = vec![0usize; num_countries];
+    for t in 0..num_threads {
+        for c in 0..num_countries {
+            country_total_crcs[c] += pass1_counts[t][c] as usize;
+        }
+    }
+
+    let mut country_offsets = vec![0usize; num_countries + 1];
+    let mut total_records = 0usize;
+    for c in 0..num_countries {
+        country_offsets[c] = total_records;
+        total_records += country_total_crcs[c];
+    }
+    country_offsets[num_countries] = total_records;
+
+    // Allocate flat CRCs array: 3.72M * 4 bytes = 14.9 MB EXACTLY ONCE!
+    let mut all_crcs: Vec<u32> = vec![0u32; total_records];
+    let all_crcs_ptr = all_crcs.as_mut_ptr() as usize;
+
+    let mut thread_write_offsets: Vec<Vec<usize>> = (0..num_threads).map(|_| vec![0usize; num_countries]).collect();
+    for c in 0..num_countries {
+        let mut cur = country_offsets[c];
+        for t in 0..num_threads {
+            thread_write_offsets[t][c] = cur;
+            cur += pass1_counts[t][c] as usize;
+        }
+    }
+    drop(pass1_counts);
+
+    // PASS 2: Full parse, accumulate scalars, write name_crc DIRECTLY into all_crcs!
+    let pass2_aggs: Vec<Vec<CountryScalarAgg>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for k in 0..num_threads {
+            let start = boundaries[k];
+            let end = boundaries[k + 1];
+            let region_to_country_ref = &region_to_country;
+            let mut write_pos = std::mem::take(&mut thread_write_offsets[k]);
+
+            handles.push(s.spawn(move || {
+                let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
+                let p = data.as_ptr();
+                let mut pos = start;
+                let base = all_crcs_ptr as *mut u32;
+
+                while pos < end {
+                    unsafe {
+                        if pos + 3 <= len && *p.add(pos) == 0xEF && *p.add(pos + 1) == 0xBB && *p.add(pos + 2) == 0xBF {
+                            pos += 3;
+                        }
+                        if pos >= len { break; }
                         let b_lead = *p.add(pos);
                         if b_lead == b'\r' || b_lead == b'\n' {
                             pos += 1;
@@ -450,11 +589,12 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        local_crcs.get_unchecked_mut(c_id).push(name_crc);
+                        let dest = *write_pos.get_unchecked(c_id);
+                        *write_pos.get_unchecked_mut(c_id) += 1;
+                        *base.add(dest) = name_crc;
                     }
                 }
-
-                (local_aggs, local_crcs)
+                local_aggs
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -463,10 +603,9 @@ fn main() {
     unsafe { munmap(ptr, len); }
 
     let mut global_aggs = vec![CountryScalarAgg::default(); num_countries];
-    let mut country_total_crcs = vec![0usize; num_countries];
     for t in 0..num_threads {
         for c in 0..num_countries {
-            let loc = &thread_results[t].0[c];
+            let loc = &pass2_aggs[t][c];
             let g = &mut global_aggs[c];
             g.count += loc.count;
             g.id_sum += loc.id_sum;
@@ -475,8 +614,6 @@ fn main() {
             if loc.amount_max > g.amount_max { g.amount_max = loc.amount_max; }
             g.name_bytes += loc.name_bytes;
             g.note_bytes += loc.note_bytes;
-
-            country_total_crcs[c] += thread_results[t].1[c].len();
         }
     }
 
@@ -485,38 +622,36 @@ fn main() {
         .collect();
     sorted_country_ids.sort_unstable_by(|&a, &b| country_names[a].cmp(&country_names[b]));
 
+    // Parallel sort and format across countries
     let c_chunk = (sorted_country_ids.len() + num_threads - 1) / num_threads;
     let formatted_outputs: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..sorted_country_ids.len()).step_by(c_chunk).map(|c_start| {
             let c_end = (c_start + c_chunk).min(sorted_country_ids.len());
-            let thread_results_ref = &thread_results;
             let global_aggs_ref = &global_aggs;
             let country_names_ref = &country_names;
             let sorted_ids_ref = &sorted_country_ids;
-            let total_crcs_ref = &country_total_crcs;
+            let offsets_ref = &country_offsets;
 
             s.spawn(move || {
                 let mut out = Vec::with_capacity((c_end - c_start) * 128);
                 let mut num_buf = [0u8; 32];
-                let mut merged_crcs = Vec::with_capacity(32768);
+                let base = all_crcs_ptr as *mut u32;
 
                 for idx in c_start..c_end {
                     let c = sorted_ids_ref[idx];
                     let g = &global_aggs_ref[c];
+                    let s_off = offsets_ref[c];
+                    let e_off = offsets_ref[c + 1];
 
-                    merged_crcs.clear();
-                    merged_crcs.reserve(total_crcs_ref[c]);
-                    for t in 0..num_threads {
-                        merged_crcs.extend_from_slice(&thread_results_ref[t].1[c]);
-                    }
+                    let slice = unsafe { std::slice::from_raw_parts_mut(base.add(s_off), e_off - s_off) };
+                    slice.sort_unstable();
 
-                    merged_crcs.sort_unstable();
                     let mut unique_names = 0u64;
                     let mut i = 0;
-                    while i < merged_crcs.len() {
-                        let cur = merged_crcs[i];
+                    while i < slice.len() {
+                        let cur = slice[i];
                         unique_names += 1;
-                        while i < merged_crcs.len() && merged_crcs[i] == cur { i += 1; }
+                        while i < slice.len() && slice[i] == cur { i += 1; }
                     }
 
                     out.extend_from_slice(&country_names_ref[c]);

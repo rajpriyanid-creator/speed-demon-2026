@@ -5,23 +5,10 @@ use std::os::unix::io::AsRawFd;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
 
-const MADV_DONTNEED: i32 = 4;
-
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn malloc_trim(pad: usize) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
-}
-
-#[inline(always)]
-unsafe fn madvise_dontneed(addr: *const u8, len: usize) {
-    let start = (addr as usize + 4095) & !4095;
-    let end = (addr as usize + len) & !4095;
-    if end > start {
-        madvise(start as *mut u8, end - start, MADV_DONTNEED);
-    }
 }
 
 #[inline(always)]
@@ -71,19 +58,27 @@ struct DictEntry {
 struct FastDict {
     table: Vec<DictEntry>,
     mask: usize,
+    bloom: Vec<u64>,
+    bloom_mask: usize,
 }
 
 impl FastDict {
     fn new(cap: usize) -> Self {
         let size = cap.next_power_of_two();
+        let bloom_words = 65536; // 64 KB Bloom filter
         Self {
             table: vec![DictEntry { hash: 0, term_id: 0, _pad: 0 }; size],
             mask: size - 1,
+            bloom: vec![0u64; bloom_words],
+            bloom_mask: (bloom_words * 64) - 1,
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, h: u64, term_id: u32) {
+        let bit = (h as usize) & self.bloom_mask;
+        self.bloom[bit / 64] |= 1u64 << (bit % 64);
+
         let mut idx = (h as usize) & self.mask;
         loop {
             let slot = unsafe { self.table.get_unchecked_mut(idx) };
@@ -98,6 +93,12 @@ impl FastDict {
 
     #[inline(always)]
     fn get(&self, h: u64) -> Option<u32> {
+        let bit = (h as usize) & self.bloom_mask;
+        let word = unsafe { *self.bloom.get_unchecked(bit / 64) };
+        if (word & (1u64 << (bit % 64))) == 0 {
+            return None;
+        }
+
         let mut idx = (h as usize) & self.mask;
         loop {
             let slot = unsafe { *self.table.get_unchecked(idx) };
@@ -352,6 +353,16 @@ struct QueryAccum {
 
 const NUM_SEGMENTS: usize = 4;
 
+struct SegmentIndex {
+    base_doc: u32,
+    offsets: Vec<u32>,
+    postings: Vec<u16>,
+    doc_starts: Vec<u32>,
+    doc_lens: Vec<u32>,
+    data_start: usize,
+    data_len: usize,
+}
+
 fn main() {
     unsafe { mallopt(-8, 2); }
 
@@ -395,7 +406,6 @@ fn main() {
 
     let mut dict = FastDict::new(131_072);
     let mut num_terms = 0u32;
-
     for line in q_data.split(|&b| b == b'\n') {
         let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
         if line.is_empty() { continue; }
@@ -463,12 +473,6 @@ fn main() {
         }
     }
 
-    let num_queries = parsed_queries.len();
-    let mut query_accums: Vec<QueryAccum> = vec![
-        QueryAccum { count: 0, id_sum: 0, top_k: [0; 10], top_k_len: 0 };
-        num_queries
-    ];
-
     let docs_file = match File::open(&docs_path) {
         Ok(f) => f,
         Err(_) => return,
@@ -478,43 +482,31 @@ fn main() {
         Err(_) => return,
     };
     let docs_fd = docs_file.as_raw_fd();
+    let docs_ptr = unsafe { mmap(std::ptr::null_mut(), docs_len, 1, 1, docs_fd, 0) };
+    if docs_ptr == usize::MAX as *mut u8 || docs_ptr.is_null() { return; }
+    let docs_slice = unsafe { std::slice::from_raw_parts(docs_ptr, docs_len) };
 
     let mut seg_byte_boundaries = [0usize; NUM_SEGMENTS + 1];
+    seg_byte_boundaries[0] = 0;
     for i in 1..NUM_SEGMENTS {
         let target = (docs_len * i) / NUM_SEGMENTS;
-        let p_start = (target / 4096) * 4096;
-        let p_len = (target - p_start + 65536).min(docs_len - p_start);
-        let ptr = unsafe { mmap(std::ptr::null_mut(), p_len, 1, 1, docs_fd, p_start as i64) };
-        if ptr != usize::MAX as *mut u8 && !ptr.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(ptr, p_len) };
-            let mut p = target - p_start;
-            while p < p_len && slice[p] != b'\n' { p += 1; }
-            if p < p_len { p += 1; }
-            seg_byte_boundaries[i] = p_start + p;
-            unsafe { munmap(ptr, p_len); }
-        } else {
-            seg_byte_boundaries[i] = target;
-        }
+        let mut p = target;
+        while p < docs_len && docs_slice[p] != b'\n' { p += 1; }
+        if p < docs_len { p += 1; }
+        seg_byte_boundaries[i] = p;
     }
     seg_byte_boundaries[NUM_SEGMENTS] = docs_len;
 
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(16);
+    let mut segments: Vec<SegmentIndex> = Vec::with_capacity(NUM_SEGMENTS);
     let mut running_global_doc_id = 0u32;
 
     for seg in 0..NUM_SEGMENTS {
         let seg_base_doc = running_global_doc_id;
-        let seg_start_byte = seg_byte_boundaries[seg];
-        let seg_end_byte = seg_byte_boundaries[seg + 1];
-        let seg_len = seg_end_byte - seg_start_byte;
-        if seg_len == 0 { continue; }
-
-        let page_off = (seg_start_byte / 4096) * 4096;
-        let page_len = seg_end_byte - page_off;
-        let ptr = unsafe { mmap(std::ptr::null_mut(), page_len, 1, 1, docs_fd, page_off as i64) };
-        if ptr == usize::MAX as *mut u8 || ptr.is_null() { continue; }
-
-        let rel_start = seg_start_byte - page_off;
-        let seg_slice = unsafe { std::slice::from_raw_parts(ptr.add(rel_start), seg_len) };
+        let seg_start = seg_byte_boundaries[seg];
+        let seg_end = seg_byte_boundaries[seg + 1];
+        let seg_len = seg_end - seg_start;
+        let seg_slice = &docs_slice[seg_start..seg_end];
 
         let mut sub_chunks = Vec::with_capacity(num_threads);
         let mut cur_sb = 0usize;
@@ -527,7 +519,7 @@ fn main() {
             cur_sb = end;
         }
 
-        // PASS 1: Count term frequencies and collect doc boundaries (ZERO big intermediate allocations!)
+        // Pass 1: Count term frequencies and doc starts with 64KB Bloom filter
         let pass1: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
             let handles: Vec<_> = sub_chunks.iter().map(|&(sb, eb)| {
                 let dict_ref = &dict;
@@ -551,10 +543,8 @@ fn main() {
                         while i < clen && chunk[i] != b'\n' { i += 1; }
                         let text_end = i;
                         i += 1;
-
                         local_starts.push((sb + text_start) as u32);
                         local_lens.push((text_end - text_start) as u32);
-
                         let mut p = text_start;
                         while p < text_end {
                             while p < text_end && !unsafe { *IS_TOKEN.get_unchecked(*chunk.get_unchecked(p) as usize) } { p += 1; }
@@ -590,11 +580,10 @@ fn main() {
             t_start_doc.push(cur_d);
             cur_d += r.1.len() as u16;
         }
-        let seg_docs_count = cur_d as usize;
         running_global_doc_id += cur_d as u32;
 
-        let mut seg_doc_starts = Vec::with_capacity(seg_docs_count);
-        let mut seg_doc_lens = Vec::with_capacity(seg_docs_count);
+        let mut seg_doc_starts = Vec::with_capacity(cur_d as usize);
+        let mut seg_doc_lens = Vec::with_capacity(cur_d as usize);
         for r in &pass1 {
             seg_doc_starts.extend_from_slice(&r.1);
             seg_doc_lens.extend_from_slice(&r.2);
@@ -617,7 +606,7 @@ fn main() {
         let mut all_postings: Vec<u16> = vec![0u16; total_postings as usize];
         let base_postings_ptr = all_postings.as_mut_ptr() as usize;
 
-        // PASS 2: Direct parallel write into exact non-overlapping postings (ZERO intermediate hit vectors!)
+        // Pass 2: Fill postings with 64KB Bloom filter
         std::thread::scope(|s| {
             for (t, &(sb, eb)) in sub_chunks.iter().enumerate() {
                 let s_doc = t_start_doc[t];
@@ -641,7 +630,6 @@ fn main() {
                         while i < clen && chunk[i] != b'\n' { i += 1; }
                         let text_end = i;
                         i += 1;
-
                         let d_id = s_doc + loc_doc;
                         let mut p = text_start;
                         while p < text_end {
@@ -672,58 +660,81 @@ fn main() {
             }
         });
 
-        // Parallel Query Evaluation against this segment with galloping intersections
-        let q_chunk_size = (parsed_queries.len() + num_threads - 1) / num_threads;
+        segments.push(SegmentIndex {
+            base_doc: seg_base_doc,
+            offsets,
+            postings: all_postings,
+            doc_starts: seg_doc_starts,
+            doc_lens: seg_doc_lens,
+            data_start: seg_start,
+            data_len: seg_len,
+        });
+    }
 
-        let partials: Vec<Vec<(u32, u64, [u32; 10], u8)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..num_threads).map(|t| {
-                let q_start = t * q_chunk_size;
-                let q_end = (q_start + q_chunk_size).min(parsed_queries.len());
-                let queries_ref = &parsed_queries[q_start..q_end];
-                let offsets_ref = &offsets;
-                let all_postings_ref = &all_postings;
-                let seg_slice_ref = seg_slice;
-                let doc_starts_ref = &seg_doc_starts;
-                let doc_lens_ref = &seg_doc_lens;
+    // Evaluate all 50,000 queries across the 4 segments in parallel
+    let num_queries = parsed_queries.len();
+    let mut query_accums: Vec<QueryAccum> = vec![
+        QueryAccum { count: 0, id_sum: 0, top_k: [0; 10], top_k_len: 0 };
+        num_queries
+    ];
 
-                s.spawn(move || {
-                    let mut seg_res = Vec::with_capacity(q_end - q_start);
-                    let mut buf_a: Vec<u16> = Vec::with_capacity(8192);
-                    let mut buf_b: Vec<u16> = Vec::with_capacity(8192);
-                    let mut matches: Vec<u16> = Vec::with_capacity(8192);
+    let q_chunk_size = (num_queries + num_threads - 1) / num_threads;
+    let seg_refs = &segments;
+    let queries_ref = &parsed_queries;
+    let out_accums_ptr = query_accums.as_mut_ptr() as usize;
 
-                    let get_postings = |term_id: u32| -> &[u16] {
-                        let tid = term_id as usize;
-                        let s = offsets_ref[tid] as usize;
-                        let e = offsets_ref[tid + 1] as usize;
-                        &all_postings_ref[s..e]
-                    };
+    std::thread::scope(|s| {
+        for t in 0..num_threads {
+            let q_start = t * q_chunk_size;
+            let q_end = (q_start + q_chunk_size).min(num_queries);
+            if q_start >= q_end { continue; }
 
-                    for q in queries_ref {
-                        let mut c_count = 0u32;
-                        let mut c_sum = 0u64;
-                        let mut c_top = [0u32; 10];
-                        let mut c_top_len = 0u8;
+            s.spawn(move || {
+                let acc_base = out_accums_ptr as *mut QueryAccum;
+                let mut buf_a: Vec<u16> = Vec::with_capacity(8192);
+                let mut buf_b: Vec<u16> = Vec::with_capacity(8192);
+                let mut matches: Vec<u16> = Vec::with_capacity(8192);
+
+                for q_idx in q_start..q_end {
+                    let q = &queries_ref[q_idx];
+                    let mut total_count = 0u32;
+                    let mut total_sum = 0u64;
+                    let mut top_k = [0u32; 10];
+                    let mut top_k_len = 0u8;
+
+                    for seg_idx in 0..NUM_SEGMENTS {
+                        let seg = &seg_refs[seg_idx];
+                        let offsets = &seg.offsets;
+                        let postings = &seg.postings;
+                        let base_doc = seg.base_doc;
+
+                        let get_postings = |tid: u32| -> &[u16] {
+                            let s = offsets[tid as usize] as usize;
+                            let e = offsets[tid as usize + 1] as usize;
+                            &postings[s..e]
+                        };
+
+                        let mut seg_cnt = 0u32;
+                        let mut seg_sum = 0u64;
 
                         match q {
                             ParsedQuery::Bool { first_term, steps } => {
                                 let r_slice: &[u16] = match first_term {
-                                    Some(t) => get_postings(*t),
+                                    Some(tid) => get_postings(*tid),
                                     None => &[],
                                 };
-
                                 if steps.is_empty() {
-                                    c_count = r_slice.len() as u32;
+                                    seg_cnt = r_slice.len() as u32;
                                     let loc_sum: u64 = r_slice.iter().map(|&x| x as u64).sum();
-                                    c_sum = (seg_base_doc as u64) * (c_count as u64) + loc_sum;
-                                    for &loc_id in r_slice.iter().take(10) {
-                                        c_top[c_top_len as usize] = seg_base_doc + (loc_id as u32);
-                                        c_top_len += 1;
+                                    seg_sum = (base_doc as u64) * (seg_cnt as u64) + loc_sum;
+                                    for &loc_id in r_slice.iter().take(10 - top_k_len as usize) {
+                                        top_k[top_k_len as usize] = base_doc + (loc_id as u32);
+                                        top_k_len += 1;
                                     }
                                 } else {
                                     let (first_op, first_term_opt) = steps[0];
                                     let b_first: &[u16] = match first_term_opt {
-                                        Some(t) => get_postings(t),
+                                        Some(tid) => get_postings(tid),
                                         None => &[],
                                     };
                                     match first_op {
@@ -733,7 +744,7 @@ fn main() {
                                     }
                                     for &(op, maybe_term) in &steps[1..] {
                                         let b: &[u16] = match maybe_term {
-                                            Some(t) => get_postings(t),
+                                            Some(tid) => get_postings(tid),
                                             None => &[],
                                         };
                                         match op {
@@ -743,12 +754,12 @@ fn main() {
                                         }
                                         std::mem::swap(&mut buf_a, &mut buf_b);
                                     }
-                                    c_count = buf_a.len() as u32;
+                                    seg_cnt = buf_a.len() as u32;
                                     let loc_sum: u64 = buf_a.iter().map(|&x| x as u64).sum();
-                                    c_sum = (seg_base_doc as u64) * (c_count as u64) + loc_sum;
-                                    for &loc_id in buf_a.iter().take(10) {
-                                        c_top[c_top_len as usize] = seg_base_doc + (loc_id as u32);
-                                        c_top_len += 1;
+                                    seg_sum = (base_doc as u64) * (seg_cnt as u64) + loc_sum;
+                                    for &loc_id in buf_a.iter().take(10 - top_k_len as usize) {
+                                        top_k[top_k_len as usize] = base_doc + (loc_id as u32);
+                                        top_k_len += 1;
                                     }
                                 }
                             }
@@ -757,7 +768,7 @@ fn main() {
                                     let mut min_idx = 0;
                                     let mut min_len = usize::MAX;
                                     for (idx, &tid) in term_ids.iter().enumerate() {
-                                        let plen = (offsets_ref[tid as usize + 1] - offsets_ref[tid as usize]) as usize;
+                                        let plen = (offsets[tid as usize + 1] - offsets[tid as usize]) as usize;
                                         if plen < min_len {
                                             min_len = plen;
                                             min_idx = idx;
@@ -774,56 +785,43 @@ fn main() {
                                         }
                                         if !buf_a.is_empty() {
                                             matches.clear();
+                                            let seg_text = &docs_slice[seg.data_start..seg.data_start + seg.data_len];
                                             for &cand_loc in &buf_a {
-                                                let start = doc_starts_ref[cand_loc as usize] as usize;
-                                                let len = doc_lens_ref[cand_loc as usize] as usize;
-                                                let doc_text = &seg_slice_ref[start..start + len];
+                                                let start = seg.doc_starts[cand_loc as usize] as usize;
+                                                let len = seg.doc_lens[cand_loc as usize] as usize;
+                                                let doc_text = &seg_text[start..start + len];
                                                 if phrase_matches(doc_text, raw_tokens) {
                                                     matches.push(cand_loc);
                                                 }
                                             }
-                                            c_count = matches.len() as u32;
+                                            seg_cnt = matches.len() as u32;
                                             let loc_sum: u64 = matches.iter().map(|&x| x as u64).sum();
-                                            c_sum = (seg_base_doc as u64) * (c_count as u64) + loc_sum;
-                                            for &loc_id in matches.iter().take(10) {
-                                                c_top[c_top_len as usize] = seg_base_doc + (loc_id as u32);
-                                                c_top_len += 1;
+                                            seg_sum = (base_doc as u64) * (seg_cnt as u64) + loc_sum;
+                                            for &loc_id in matches.iter().take(10 - top_k_len as usize) {
+                                                top_k[top_k_len as usize] = base_doc + (loc_id as u32);
+                                                top_k_len += 1;
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        seg_res.push((c_count, c_sum, c_top, c_top_len));
+                        total_count += seg_cnt;
+                        total_sum += seg_sum;
                     }
-                    seg_res
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
 
-        // Accumulate segment results into global query_accums
-        let mut idx = 0;
-        for p_chunk in partials {
-            for (c, s, top, top_len) in p_chunk {
-                let acc = &mut query_accums[idx];
-                acc.count += c as u32;
-                acc.id_sum += s;
-                let needed = (10 - acc.top_k_len as usize).min(top_len as usize);
-                for k in 0..needed {
-                    acc.top_k[acc.top_k_len as usize] = top[k];
-                    acc.top_k_len += 1;
+                    unsafe {
+                        *acc_base.add(q_idx) = QueryAccum {
+                            count: total_count,
+                            id_sum: total_sum,
+                            top_k,
+                            top_k_len,
+                        };
+                    }
                 }
-                idx += 1;
-            }
+            });
         }
-
-        unsafe {
-            madvise_dontneed(ptr, page_len);
-            munmap(ptr, page_len);
-            malloc_trim(0);
-        }
-    }
+    });
 
     let _ = std::fs::create_dir_all(&out_dir);
     let mut out_file = match File::create(&results_path) {
@@ -857,5 +855,8 @@ fn main() {
         let _ = out_file.write_all(&out_buf);
     }
     let _ = out_file.flush();
-    unsafe { munmap(q_ptr, q_len); }
+    unsafe {
+        munmap(docs_ptr, docs_len);
+        munmap(q_ptr, q_len);
+    }
 }
