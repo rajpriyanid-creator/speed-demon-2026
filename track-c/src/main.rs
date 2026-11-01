@@ -87,29 +87,68 @@ impl Default for CountryScalarAgg {
     }
 }
 
+static DIGIT_PAIRS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
 #[inline(always)]
-fn write_u64_fast(mut n: u64, out: &mut Vec<u8>) {
-    if n == 0 { out.push(b'0'); return; }
-    let mut buf = [0u8; 24];
+unsafe fn write_u64_fast(mut n: u64, buf: *mut u8) -> usize {
+    if n == 0 {
+        *buf = b'0';
+        return 1;
+    }
+    let mut temp = [0u8; 24];
     let mut i = 0;
-    while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    while i > 0 { i -= 1; out.push(buf[i]); }
+    while n >= 100 {
+        let rem = (n % 100) as usize * 2;
+        n /= 100;
+        temp[i] = DIGIT_PAIRS[rem + 1];
+        temp[i + 1] = DIGIT_PAIRS[rem];
+        i += 2;
+    }
+    if n >= 10 {
+        let rem = (n as usize) * 2;
+        temp[i] = DIGIT_PAIRS[rem + 1];
+        temp[i + 1] = DIGIT_PAIRS[rem];
+        i += 2;
+    } else if n > 0 {
+        temp[i] = b'0' + n as u8;
+        i += 1;
+    }
+    for j in 0..i {
+        *buf.add(j) = temp[i - 1 - j];
+    }
+    i
 }
 
 #[inline(always)]
-fn write_cents_fast(c: i64, out: &mut Vec<u8>) {
-    if c < 0 { out.push(b'-'); }
-    let abs_c = c.abs() as u64;
+unsafe fn write_cents_fast(c: i64, buf: *mut u8) -> usize {
+    let mut len = 0;
+    let abs_c = if c < 0 {
+        *buf = b'-';
+        len = 1;
+        (-c) as u64
+    } else {
+        c as u64
+    };
     let dollars = abs_c / 100;
-    let cents = abs_c % 100;
-    write_u64_fast(dollars, out);
-    out.push(b'.');
-    out.push(b'0' + (cents / 10) as u8);
-    out.push(b'0' + (cents % 10) as u8);
+    let cents = (abs_c % 100) as usize;
+    len += write_u64_fast(dollars, buf.add(len));
+    *buf.add(len) = b'.';
+    *buf.add(len + 1) = DIGIT_PAIRS[cents * 2];
+    *buf.add(len + 2) = DIGIT_PAIRS[cents * 2 + 1];
+    len + 3
 }
 
 fn main() {
-    
     unsafe { mallopt(-8, 2); }
 
     let mut data_dir = "/data".to_string();
@@ -266,7 +305,7 @@ fn main() {
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
                 let mut country_crcs: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::with_capacity(1200))
+                    .map(|_| Vec::new())
                     .collect();
 
                 let p = data.as_ptr();
@@ -274,7 +313,7 @@ fn main() {
                 let mut last_adv = start;
 
                 while pos < end {
-                    if pos - last_adv >= 2 * 1024 * 1024 {
+                    if pos - last_adv >= 1024 * 1024 {
                         unsafe { madvise_dontneed(p.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -472,6 +511,7 @@ fn main() {
             s.spawn(move || {
                 let mut out = Vec::with_capacity((c_end - c_start) * 128);
                 let mut scratch: Vec<u32> = Vec::with_capacity(32_768);
+                let mut num_buf = [0u8; 32];
 
                 for c_id in c_start..c_end {
                     let mut count = 0u64;
@@ -514,21 +554,29 @@ fn main() {
                     let c_name = &country_names_ref[c_id];
                     out.extend_from_slice(c_name);
                     out.push(b' ');
-                    write_u64_fast(count, &mut out);
+                    let w = unsafe { write_u64_fast(count, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_u64_fast(id_sum, &mut out);
+                    let w = unsafe { write_u64_fast(id_sum, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_cents_fast(amount_sum, &mut out);
+                    let w = unsafe { write_cents_fast(amount_sum, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_cents_fast(amount_min, &mut out);
+                    let w = unsafe { write_cents_fast(amount_min, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_cents_fast(amount_max, &mut out);
+                    let w = unsafe { write_cents_fast(amount_max, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_u64_fast(distinct_names, &mut out);
+                    let w = unsafe { write_u64_fast(distinct_names, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_u64_fast(name_bytes, &mut out);
+                    let w = unsafe { write_u64_fast(name_bytes, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b' ');
-                    write_u64_fast(note_bytes, &mut out);
+                    let w = unsafe { write_u64_fast(note_bytes, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
                     out.push(b'\n');
                 }
                 out
@@ -537,14 +585,12 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let _ = std::fs::create_dir_all(&out_dir);
-    let mut out_file = match File::create(format!("{}/aggregates.txt", out_dir)) {
+    let results_path = format!("{}/aggregates.txt", out_dir);
+    let mut final_file = match File::create(&results_path) {
         Ok(f) => f,
         Err(_) => return,
     };
-    for chunk in &formatted_outputs {
-        let _ = out_file.write_all(chunk);
+    for chunk in formatted_outputs {
+        let _ = final_file.write_all(&chunk);
     }
-    let _ = out_file.flush();
-    
 }
