@@ -541,7 +541,7 @@ fn main() {
     let mut running_global_doc_id = 0u32;
 
     for seg in 0..NUM_SEGMENTS {
-        let seg_base_doc = running_global_doc_id;
+                let seg_base_doc = running_global_doc_id;
         let seg_start = seg_byte_boundaries[seg];
         let seg_end = seg_byte_boundaries[seg + 1];
         let seg_len = seg_end - seg_start;
@@ -575,8 +575,13 @@ fn main() {
                     let clen = chunk.len();
                     let mut loc_doc: u16 = 0;
                     let base_ptr = chunk.as_ptr();
+                    let mut last_adv = 0usize;
 
                     while i < clen {
+                        if i - last_adv >= 512 * 1024 {
+                            unsafe { madvise_dontneed(base_ptr.add(last_adv), i - last_adv); }
+                            last_adv = i;
+                        }
                         while i < clen && chunk[i] != b'\t' { i += 1; }
                         if i >= clen { break; }
                         i += 1;
@@ -610,6 +615,9 @@ fn main() {
                             }
                         }
                         loc_doc += 1;
+                    }
+                    if clen > last_adv {
+                        unsafe { madvise_dontneed(base_ptr.add(last_adv), clen - last_adv); }
                     }
                     ThreadBuffer {
                         postings: local_postings,
@@ -680,7 +688,7 @@ fn main() {
 
         // Drop thread temporary data
         drop(t_results);
-
+                
         // EVALUATE ALL QUERIES ON THIS SEGMENT IMMEDIATELY!
         let q_chunk_size = (num_queries + num_threads - 1) / num_threads;
         let queries_ref = &parsed_queries;
@@ -736,7 +744,13 @@ fn main() {
                                         None => &[],
                                     };
                                     match first_op {
-                                        Op::And => intersect_u16(r_slice, b_first, &mut buf_a),
+                                        Op::And => {
+                                            if r_slice.is_empty() || b_first.is_empty() {
+                                                buf_a.clear();
+                                            } else {
+                                                intersect_u16(r_slice, b_first, &mut buf_a);
+                                            }
+                                        }
                                         Op::Or => union_u16(r_slice, b_first, &mut buf_a),
                                         Op::Not => difference_u16(r_slice, b_first, &mut buf_a),
                                     }
@@ -747,16 +761,22 @@ fn main() {
                                         };
                                         match op {
                                             Op::And => {
-                                                intersect_u16(&buf_a, b, &mut buf_b);
-                                                std::mem::swap(&mut buf_a, &mut buf_b);
+                                                if buf_a.is_empty() || b.is_empty() {
+                                                    buf_a.clear();
+                                                } else {
+                                                    intersect_u16(&buf_a, b, &mut buf_b);
+                                                    std::mem::swap(&mut buf_a, &mut buf_b);
+                                                }
                                             }
                                             Op::Or => {
                                                 union_u16(&buf_a, b, &mut buf_b);
                                                 std::mem::swap(&mut buf_a, &mut buf_b);
                                             }
                                             Op::Not => {
-                                                difference_u16(&buf_a, b, &mut buf_b);
-                                                std::mem::swap(&mut buf_a, &mut buf_b);
+                                                if !buf_a.is_empty() {
+                                                    difference_u16(&buf_a, b, &mut buf_b);
+                                                    std::mem::swap(&mut buf_a, &mut buf_b);
+                                                }
                                             }
                                         }
                                     }
@@ -832,7 +852,7 @@ fn main() {
         // Postings, doc_starts, doc_lens, offsets are completely dropped here at end of segment loop!
         unsafe {
             madvise_dontneed(seg_slice.as_ptr(), seg_len);
-        }
+                }
     }
 
     let _ = std::fs::create_dir_all(&out_dir);

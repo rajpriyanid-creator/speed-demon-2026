@@ -542,10 +542,34 @@ fn main() {
                                 }
                             }
 
-                            pdqsort(&mut lat_buf);
-                            let p50 = lat_buf[nearest_rank(total_cnt as usize, 50)];
-                            let p95 = lat_buf[nearest_rank(total_cnt as usize, 95)];
-                            let p99 = lat_buf[nearest_rank(total_cnt as usize, 99)];
+                            let n = total_cnt as usize;
+                            let (p50, p95, p99) = if n <= 32 {
+                                pdqsort(&mut lat_buf);
+                                (lat_buf[nearest_rank(n, 50)], lat_buf[nearest_rank(n, 95)], lat_buf[nearest_rank(n, 99)])
+                            } else {
+                                let r99 = nearest_rank(n, 99);
+                                let r95 = nearest_rank(n, 95);
+                                let r50 = nearest_rank(n, 50);
+
+                                lat_buf.select_nth_unstable(r99);
+                                let v99 = lat_buf[r99];
+
+                                let v95 = if r95 == r99 {
+                                    v99
+                                } else {
+                                    lat_buf[..r99].select_nth_unstable(r95);
+                                    lat_buf[r95]
+                                };
+
+                                let v50 = if r50 == r95 {
+                                    v95
+                                } else {
+                                    lat_buf[..r95].select_nth_unstable(r50);
+                                    lat_buf[r50]
+                                };
+
+                                (v50, v95, v99)
+                            };
 
                             let ppm = ((total_err as u64 * 1_000_000) / total_cnt as u64) as u32;
 

@@ -104,34 +104,36 @@ unsafe fn write_u64_fast(mut n: u64, buf: *mut u8) -> usize {
         temp[i] = b'0' + n as u8;
         i += 1;
     }
-    for j in 0..i {
-        *buf.add(j) = temp[i - 1 - j];
+    let len = i;
+    for j in 0..len {
+        *buf.add(j) = temp[len - 1 - j];
     }
-    i
+    len
 }
 
 #[inline(always)]
-unsafe fn write_cents_fast(c: i64, buf: *mut u8) -> usize {
-    let mut p = 0;
-    if c < 0 {
-        *buf.add(p) = b'-';
-        p += 1;
+unsafe fn write_cents_fast(mut cents: i64, buf: *mut u8) -> usize {
+    let mut off = 0;
+    if cents < 0 {
+        *buf = b'-';
+        off = 1;
+        cents = -cents;
     }
-    let abs_c = c.abs() as u64;
-    let dollars = abs_c / 100;
-    let cents = (abs_c % 100) as usize * 2;
-    p += write_u64_fast(dollars, buf.add(p));
-    *buf.add(p) = b'.';
-    p += 1;
-    *buf.add(p) = DIGIT_PAIRS[cents];
-    *buf.add(p + 1) = DIGIT_PAIRS[cents + 1];
-    p + 2
+    let c = cents as u64;
+    let whole = c / 100;
+    let rem = (c % 100) as usize * 2;
+    let w_len = write_u64_fast(whole, buf.add(off));
+    off += w_len;
+    *buf.add(off) = b'.';
+    *buf.add(off + 1) = DIGIT_PAIRS[rem];
+    *buf.add(off + 2) = DIGIT_PAIRS[rem + 1];
+    off + 3
 }
 
 #[inline(always)]
 fn find_quote_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x22222222_22222222;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    let x = w ^ 0x2222222222222222;
+    let m = (x.wrapping_sub(0x0101010101010101)) & !x & 0x8080808080808080;
     if m != 0 {
         Some((m.trailing_zeros() >> 3) as usize)
     } else {
@@ -141,8 +143,8 @@ fn find_quote_swar(w: u64) -> Option<usize> {
 
 #[inline(always)]
 fn find_comma_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    let x = w ^ 0x2c2c2c2c2c2c2c2c;
+    let m = (x.wrapping_sub(0x0101010101010101)) & !x & 0x8080808080808080;
     if m != 0 {
         Some((m.trailing_zeros() >> 3) as usize)
     } else {
@@ -151,20 +153,19 @@ fn find_comma_swar(w: u64) -> Option<usize> {
 }
 
 #[inline(always)]
-unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
-    let mut c = crc as u64;
-    let mut i = 0;
-    while i + 8 <= len {
-        let val = std::ptr::read_unaligned(p.add(i) as *const u64);
-        c = _mm_crc32_u64(c, val);
-        i += 8;
+unsafe fn crc32_hardware(mut crc: u32, mut p: *const u8, mut len: usize) -> u32 {
+    while len >= 8 {
+        let w = (p as *const u64).read_unaligned();
+        crc = _mm_crc32_u64(crc as u64, w) as u32;
+        p = p.add(8);
+        len -= 8;
     }
-    let mut c32 = c as u32;
-    while i < len {
-        c32 = _mm_crc32_u8(c32, *p.add(i));
-        i += 1;
+    while len > 0 {
+        crc = _mm_crc32_u8(crc, *p);
+        p = p.add(1);
+        len -= 1;
     }
-    c32
+    crc
 }
 
 fn main() {
@@ -191,8 +192,8 @@ fn main() {
         }
     }
 
-    let regions_path = format!("{}/regions.csv", data_dir);
-    let regions_file = match File::open(&regions_path) {
+    let reg_path = format!("{}/regions.csv", data_dir);
+    let regions_file = match File::open(&reg_path) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -297,7 +298,6 @@ fn main() {
     if header_end < len { header_end += 1; }
 
     let num_threads = 12;
-    // Fast parallel boundary finding
     let chunk_target = (len - header_end) / num_threads;
     let mut boundaries = vec![header_end; num_threads + 1];
     boundaries[num_threads] = len;
@@ -307,7 +307,8 @@ fn main() {
 
     struct ThreadResult {
         aggs: Vec<CountryScalarAgg>,
-        records: Vec<u64>, // packed ((c_id as u64) << 32) | (name_crc as u64)
+        c_ids: Vec<u8>,
+        crcs: Vec<u32>,
     }
 
     let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
@@ -318,16 +319,17 @@ fn main() {
             let region_to_country_ref = &region_to_country;
 
             handles.push(s.spawn(move || {
-                let est_cap = 28_000;
+                let est_cap = (end - start) / 95 + 1024;
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut records = Vec::with_capacity(est_cap);
+                let mut c_ids = Vec::with_capacity(est_cap);
+                let mut crcs = Vec::with_capacity(est_cap);
 
                 let p = data.as_ptr();
                 let mut pos = start;
                 let mut last_adv = start;
 
                 while pos < end {
-                    if pos - last_adv >= 2 * 1024 * 1024 {
+                    if pos - last_adv >= 512 * 1024 {
                         unsafe { madvise_dontneed(p.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -374,7 +376,7 @@ fn main() {
                                     pos += 8;
                                 }
                             }
-                            if *p.add(pos) == b',' { pos += 1; }
+                            pos += 1;
                             (_mm_crc32_u16(crc, n_len as u16), n_len)
                         } else {
                             let n_start = pos;
@@ -420,7 +422,7 @@ fn main() {
                                     pos += 8;
                                 }
                             }
-                            if *p.add(pos) == b',' { pos += 1; }
+                            pos += 1;
                         } else {
                             let n_start = pos;
                             while pos + 8 <= end {
@@ -478,7 +480,8 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        records.push(((c_id as u64) << 32) | (name_crc as u64));
+                        c_ids.push(c_id);
+                        crcs.push(name_crc);
                     }
                 }
 
@@ -486,7 +489,7 @@ fn main() {
                     unsafe { madvise_dontneed(p.add(last_adv), end - last_adv); }
                 }
 
-                ThreadResult { aggs: local_aggs, records }
+                ThreadResult { aggs: local_aggs, c_ids, crcs }
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -512,7 +515,6 @@ fn main() {
         }
     }
 
-    // Prefix sum to compute write offsets for each country
     for c in 0..num_countries {
         country_offsets[c + 1] += country_offsets[c];
     }
@@ -521,10 +523,7 @@ fn main() {
     let mut all_crcs = vec![0u32; total_records];
     let all_crcs_ptr = all_crcs.as_mut_ptr() as usize;
 
-    // Parallel scatter of CRCs into contiguous country slices
-    // Each thread gets write cursor per country
     std::thread::scope(|s| {
-        // Precompute write offsets for each (thread, country)
         let mut thread_cursors: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
         let mut cur_offsets = country_offsets[..num_countries].to_vec();
         for t in 0..num_threads {
@@ -536,12 +535,13 @@ fn main() {
 
         for t in 0..num_threads {
             let mut cursors = thread_cursors[t].clone();
-            let records_ref = &thread_results[t].records;
+            let c_ids_ref = &thread_results[t].c_ids;
+            let crcs_ref = &thread_results[t].crcs;
             s.spawn(move || {
                 let dst_base = all_crcs_ptr as *mut u32;
-                for &rec in records_ref {
-                    let c_id = (rec >> 32) as usize;
-                    let crc = rec as u32;
+                for i in 0..c_ids_ref.len() {
+                    let c_id = c_ids_ref[i] as usize;
+                    let crc = crcs_ref[i];
                     let dst_idx = cursors[c_id];
                     cursors[c_id] += 1;
                     unsafe { *dst_base.add(dst_idx as usize) = crc; }
@@ -622,7 +622,6 @@ fn main() {
                     out.extend_from_slice(&num_buf[..w]);
                     out.push(b'\n');
                 }
-
                 out
             })
         }).collect();
