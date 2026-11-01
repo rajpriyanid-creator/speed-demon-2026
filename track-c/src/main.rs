@@ -1,45 +1,13 @@
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
+use std::arch::x86_64::_mm_crc32_u64;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
-}
-
-#[inline(always)]
-fn find_quote_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x22222222_22222222;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
-    if m != 0 { Some((m.trailing_zeros() >> 3) as usize) } else { None }
-}
-
-#[inline(always)]
-fn find_comma_swar(w: u64) -> Option<usize> {
-    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
-    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
-    if m != 0 { Some((m.trailing_zeros() >> 3) as usize) } else { None }
-}
-
-#[inline(always)]
-unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
-    let mut c = crc as u64;
-    let mut i = 0;
-    while i + 8 <= len {
-        let val = std::ptr::read_unaligned(p.add(i) as *const u64);
-        c = _mm_crc32_u64(c, val);
-        i += 8;
-    }
-    let mut c32 = c as u32;
-    while i < len {
-        c32 = _mm_crc32_u8(c32, *p.add(i));
-        i += 1;
-    }
-    c32
 }
 
 #[derive(Clone, Copy)]
@@ -85,7 +53,7 @@ unsafe fn write_u64_fast(mut n: u64, buf: *mut u8) -> usize {
         *buf = b'0';
         return 1;
     }
-    let mut temp = [0u8; 24];
+    let mut temp = [0u8; 20];
     let mut i = 0;
     while n >= 100 {
         let rem = (n % 100) as usize * 2;
@@ -110,28 +78,33 @@ unsafe fn write_u64_fast(mut n: u64, buf: *mut u8) -> usize {
 }
 
 #[inline(always)]
-unsafe fn write_cents_fast(c: i64, buf: *mut u8) -> usize {
-    let mut p = 0;
-    if c < 0 {
-        *buf.add(p) = b'-';
-        p += 1;
+unsafe fn write_amount_fast(mut val: i64, buf: *mut u8) -> usize {
+    let mut len = 0;
+    if val < 0 {
+        *buf = b'-';
+        len = 1;
+        val = -val;
     }
-    let abs_c = c.abs() as u64;
-    let dollars = abs_c / 100;
-    let cents = (abs_c % 100) as usize * 2;
-    p += write_u64_fast(dollars, buf.add(p));
-    *buf.add(p) = b'.';
-    *buf.add(p + 1) = DIGIT_PAIRS[cents];
-    *buf.add(p + 2) = DIGIT_PAIRS[cents + 1];
-    p + 3
+    let dollars = val / 100;
+    let cents = val % 100;
+    let w = write_u64_fast(dollars as u64, buf.add(len));
+    len += w;
+    *buf.add(len) = b'.';
+    len += 1;
+    let rem = (cents as usize) * 2;
+    *buf.add(len) = DIGIT_PAIRS[rem];
+    *buf.add(len + 1) = DIGIT_PAIRS[rem + 1];
+    len + 2
+}
+
+fn pdqsort_u32(v: &mut [u32]) {
+    v.sort_unstable();
 }
 
 fn main() {
-    unsafe { mallopt(-8, 2); }
-
+    let args: Vec<String> = std::env::args().collect();
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
-    let args: Vec<String> = std::env::args().collect();
     let mut positional = Vec::new();
     let mut arg_i = 1;
     while arg_i < args.len() {
@@ -156,46 +129,41 @@ fn main() {
     let results_path = format!("{}/aggregates.txt", out_dir);
 
     // 1. Parse regions.csv
-    let reg_bytes = match fs::read(&regions_path) {
+    let reg_bytes = match std::fs::read(&regions_path) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let mut raw_regions: Vec<(u32, Vec<u8>)> = Vec::with_capacity(5000);
     let mut unique_countries: Vec<Vec<u8>> = Vec::with_capacity(300);
+    unique_countries.push(b"_UNMATCHED".to_vec());
 
-    let mut p = 0;
-    let rlen = reg_bytes.len();
-    if p + 3 <= rlen && &reg_bytes[p..p + 3] == b"\xEF\xBB\xBF" {
-        p += 3;
-    }
-    while p < rlen && reg_bytes[p] != b'\n' { p += 1; }
-    if p < rlen { p += 1; }
+    let mut raw_regions = Vec::with_capacity(3000);
+    let mut r_pos = 0;
+    while r_pos < reg_bytes.len() && reg_bytes[r_pos] != b'\n' { r_pos += 1; }
+    if r_pos < reg_bytes.len() { r_pos += 1; }
 
-    while p < rlen {
-        let b = reg_bytes[p];
-        if b == b'\r' || b == b'\n' { p += 1; continue; }
-        let mut reg_id = 0u32;
-        while p < rlen && reg_bytes[p] != b',' {
-            reg_id = reg_id * 10 + (reg_bytes[p] - b'0') as u32;
-            p += 1;
+    while r_pos < reg_bytes.len() {
+        if reg_bytes[r_pos] == b'\r' || reg_bytes[r_pos] == b'\n' {
+            r_pos += 1;
+            continue;
         }
-        p += 1;
-        let c_start = p;
-        while p < rlen && reg_bytes[p] != b'\r' && reg_bytes[p] != b'\n' { p += 1; }
-        let c_name = &reg_bytes[c_start..p];
-        if p < rlen && reg_bytes[p] == b'\r' { p += 1; }
-        if p < rlen && reg_bytes[p] == b'\n' { p += 1; }
-
-        if !unique_countries.iter().any(|c| c.as_slice() == c_name) {
-            unique_countries.push(c_name.to_vec());
+        let mut id = 0u32;
+        while r_pos < reg_bytes.len() && reg_bytes[r_pos] >= b'0' && reg_bytes[r_pos] <= b'9' {
+            id = id * 10 + (reg_bytes[r_pos] - b'0') as u32;
+            r_pos += 1;
         }
-        raw_regions.push((reg_id, c_name.to_vec()));
-    }
-
-    unique_countries.sort();
-    let unmatched_name = b"_UNMATCHED".to_vec();
-    if !unique_countries.iter().any(|c| c == &unmatched_name) {
-        unique_countries.push(unmatched_name);
+        if r_pos < reg_bytes.len() && reg_bytes[r_pos] == b',' { r_pos += 1; }
+        let c_start = r_pos;
+        while r_pos < reg_bytes.len() && reg_bytes[r_pos] != b'\r' && reg_bytes[r_pos] != b'\n' {
+            r_pos += 1;
+        }
+        let c_name = reg_bytes[c_start..r_pos].to_vec();
+        if !unique_countries.iter().any(|x| x == &c_name) {
+            unique_countries.push(c_name.clone());
+        }
+        raw_regions.push((id, c_name));
+        while r_pos < reg_bytes.len() && (reg_bytes[r_pos] == b'\r' || reg_bytes[r_pos] == b'\n') {
+            r_pos += 1;
+        }
     }
     unique_countries.sort();
 
@@ -246,12 +214,13 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // PASS 1: Accumulate scalar aggregates & count records per country. ZERO Vec<u64>!
-    struct Pass1Result {
+    // SINGLE PASS: Each thread parses scalars and collects (c_id << 32) | name_crc
+    struct ThreadParseData {
         aggs: Vec<CountryScalarAgg>,
+        crcs: Vec<u64>,
     }
 
-    let pass1_results: Vec<Pass1Result> = std::thread::scope(|s| {
+    let mut thread_data: Vec<ThreadParseData> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
@@ -260,6 +229,9 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
+                let est_records = (end - start) / 60 + 1024;
+                let mut local_crcs: Vec<u64> = Vec::with_capacity(est_records);
+
                 let p = data.as_ptr();
                 let mut pos = start;
 
@@ -283,83 +255,64 @@ fn main() {
                         }
                         pos += 1;
 
-                        // 2. Parse Name length
-                        let name_len: u32;
+                        // 2. Parse & Unescape Name + Calculate CRC32
+                        let mut name_crc = 0u64;
+                        let mut name_len = 0usize;
                         if *p.add(pos) == b'"' {
                             pos += 1;
-                            let n_start = pos;
-                            let mut escaped_quotes: u32 = 0;
                             loop {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_quote_swar(w) {
-                                    let q = pos + off;
-                                    if *p.add(q + 1) == b'"' {
-                                        escaped_quotes += 1;
-                                        pos = q + 2;
+                                let b = *p.add(pos);
+                                if b == b'"' {
+                                    if *p.add(pos + 1) == b'"' {
+                                        name_crc = _mm_crc32_u64(name_crc, b'"' as u64);
+                                        name_len += 1;
+                                        pos += 2;
                                     } else {
-                                        name_len = (q - n_start) as u32 - escaped_quotes;
-                                        pos = q + 1;
+                                        pos += 1;
                                         break;
                                     }
                                 } else {
-                                    pos += 8;
+                                    name_crc = _mm_crc32_u64(name_crc, b as u64);
+                                    name_len += 1;
+                                    pos += 1;
                                 }
                             }
-                            if *p.add(pos) == b',' { pos += 1; }
                         } else {
-                            let n_start = pos;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    pos += off;
-                                    break;
-                                } else {
-                                    pos += 8;
-                                }
+                            while *p.add(pos) != b',' {
+                                name_crc = _mm_crc32_u64(name_crc, *p.add(pos) as u64);
+                                name_len += 1;
+                                pos += 1;
                             }
-                            while *p.add(pos) != b',' { pos += 1; }
-                            name_len = (pos - n_start) as u32;
-                            pos += 1;
                         }
+                        name_crc = _mm_crc32_u64(name_crc, name_len as u64);
+                        pos += 1; // skip comma
 
-                        // 3. Parse Note length
-                        let note_len: u32;
+                        // 3. Parse & Unescape Note
+                        let mut note_len = 0usize;
                         if *p.add(pos) == b'"' {
                             pos += 1;
-                            let n_start = pos;
-                            let mut escaped_quotes: u32 = 0;
                             loop {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_quote_swar(w) {
-                                    let q = pos + off;
-                                    if *p.add(q + 1) == b'"' {
-                                        escaped_quotes += 1;
-                                        pos = q + 2;
+                                let b = *p.add(pos);
+                                if b == b'"' {
+                                    if *p.add(pos + 1) == b'"' {
+                                        note_len += 1;
+                                        pos += 2;
                                     } else {
-                                        note_len = (q - n_start) as u32 - escaped_quotes;
-                                        pos = q + 1;
+                                        pos += 1;
                                         break;
                                     }
                                 } else {
-                                    pos += 8;
+                                    note_len += 1;
+                                    pos += 1;
                                 }
                             }
-                            if *p.add(pos) == b',' { pos += 1; }
                         } else {
-                            let n_start = pos;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    pos += off;
-                                    break;
-                                } else {
-                                    pos += 8;
-                                }
+                            while *p.add(pos) != b',' {
+                                note_len += 1;
+                                pos += 1;
                             }
-                            while *p.add(pos) != b',' { pos += 1; }
-                            note_len = (pos - n_start) as u32;
-                            pos += 1;
                         }
+                        pos += 1; // skip comma
 
                         // 4. Parse Region ID
                         let mut reg_id = 0usize;
@@ -396,18 +349,26 @@ fn main() {
                         if amount > agg.amount_max { agg.amount_max = amount; }
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len as u64;
+
+                        local_crcs.push(((c_id as u64) << 32) | (name_crc as u32 as u64));
                     }
                 }
 
-                Pass1Result { aggs: local_aggs }
+                ThreadParseData { aggs: local_aggs, crcs: local_crcs }
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+
+    // Munmap records.csv IMMEDIATELY! Drops 230MB from address space
+    unsafe {
+        munmap(ptr, len);
+    }
+
     // Merge scalar aggregates
     let mut final_aggs = vec![CountryScalarAgg::default(); num_countries];
-    for r in &pass1_results {
+    for r in &thread_data {
         for c in 0..num_countries {
             let src = &r.aggs[c];
             let dst = &mut final_aggs[c];
@@ -421,7 +382,7 @@ fn main() {
         }
     }
 
-    // Prefix sums for country offsets and per-thread write bases
+    // Prefix sums for country offsets
     let mut country_offsets = vec![0u32; num_countries + 1];
     let mut t_write_pos: Vec<Vec<u32>> = (0..num_threads).map(|_| vec![0u32; num_countries]).collect();
     let mut total_records = 0u32;
@@ -431,209 +392,94 @@ fn main() {
         let mut cur = total_records;
         for t in 0..num_threads {
             t_write_pos[t][c] = cur;
-            cur += pass1_results[t].aggs[c].count as u32;
+            cur += thread_data[t].aggs[c].count as u32;
         }
         total_records = cur;
     }
     country_offsets[num_countries] = total_records;
 
-    drop(pass1_results);
-
     // Allocate flat all_crcs: exactly 3.7 million u32 = 14.8 MB!
     let mut all_crcs = vec![0u32; total_records as usize];
     let raw_crc_ptr = all_crcs.as_mut_ptr() as usize;
 
-    // PASS 2: Parse name CRC and write DIRECTLY into all_crcs!
+    // Fast in-memory scatter across 12 threads
     std::thread::scope(|s| {
-        for k in 0..num_threads {
-            let start = boundaries[k];
-            let end = boundaries[k + 1];
-            let reg_ref = &region_to_country;
-            let mut write_pos = std::mem::take(&mut t_write_pos[k]);
+        for t in 0..num_threads {
+            let crc_list = std::mem::take(&mut thread_data[t].crcs);
+            let mut write_pos = std::mem::take(&mut t_write_pos[t]);
 
             s.spawn(move || {
-                let out_ptr = raw_crc_ptr as *mut u32;
-                let p = data.as_ptr();
-                let mut pos = start;
-
-                while pos < end {
+                let raw_crc = raw_crc_ptr as *mut u32;
+                for packed in crc_list {
+                    let c = (packed >> 32) as usize;
+                    let crc = packed as u32;
                     unsafe {
-                        if pos + 3 <= len && *p.add(pos) == 0xEF && *p.add(pos + 1) == 0xBB && *p.add(pos + 2) == 0xBF {
-                            pos += 3;
-                        }
-                        if pos >= len { break; }
-                        let b_lead = *p.add(pos);
-                        if b_lead == b'\r' || b_lead == b'\n' {
-                            pos += 1;
-                            continue;
-                        }
-
-                        // Skip Record ID
-                        while *p.add(pos) != b',' { pos += 1; }
-                        pos += 1;
-
-                        // Parse Name & compute CRC
-                        let name_crc: u32;
-                        let name_len: u32;
-                        if *p.add(pos) == b'"' {
-                            pos += 1;
-                            let n_start = pos;
-                            let mut crc: u32 = 0;
-                            let mut escaped_quotes: u32 = 0;
-                            loop {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_quote_swar(w) {
-                                    crc = crc32_hardware(crc, p.add(pos), off);
-                                    let q = pos + off;
-                                    if *p.add(q + 1) == b'"' {
-                                        crc = _mm_crc32_u8(crc, b'"');
-                                        escaped_quotes += 1;
-                                        pos = q + 2;
-                                    } else {
-                                        name_len = (q - n_start) as u32 - escaped_quotes;
-                                        pos = q + 1;
-                                        break;
-                                    }
-                                } else {
-                                    crc = crc32_hardware(crc, p.add(pos), 8);
-                                    pos += 8;
-                                }
-                            }
-                            if *p.add(pos) == b',' { pos += 1; }
-                            name_crc = _mm_crc32_u16(crc, name_len as u16);
-                        } else {
-                            let n_start = pos;
-                            let mut crc: u32 = 0;
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    crc = crc32_hardware(crc, p.add(pos), off);
-                                    pos += off;
-                                    break;
-                                } else {
-                                    crc = crc32_hardware(crc, p.add(pos), 8);
-                                    pos += 8;
-                                }
-                            }
-                            while *p.add(pos) != b',' {
-                                crc = _mm_crc32_u8(crc, *p.add(pos));
-                                pos += 1;
-                            }
-                            name_len = (pos - n_start) as u32;
-                            pos += 1;
-                            name_crc = _mm_crc32_u16(crc, name_len as u16);
-                        }
-
-                        // Skip Note
-                        if *p.add(pos) == b'"' {
-                            pos += 1;
-                            loop {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_quote_swar(w) {
-                                    let q = pos + off;
-                                    if *p.add(q + 1) == b'"' {
-                                        pos = q + 2;
-                                    } else {
-                                        pos = q + 1;
-                                        break;
-                                    }
-                                } else {
-                                    pos += 8;
-                                }
-                            }
-                            if *p.add(pos) == b',' { pos += 1; }
-                        } else {
-                            while pos + 8 <= end {
-                                let w = (p.add(pos) as *const u64).read_unaligned();
-                                if let Some(off) = find_comma_swar(w) {
-                                    pos += off;
-                                    break;
-                                } else {
-                                    pos += 8;
-                                }
-                            }
-                            while *p.add(pos) != b',' { pos += 1; }
-                            pos += 1;
-                        }
-
-                        // Parse Region ID
-                        let mut reg_id = 0usize;
-                        while *p.add(pos) != b',' {
-                            reg_id = reg_id * 10 + (*p.add(pos) - b'0') as usize;
-                            pos += 1;
-                        }
-                        pos += 1;
-
-                        // Skip Amount & Timestamp to newline
-                        while pos < len && *p.add(pos) != b'\n' { pos += 1; }
-                        if pos < len { pos += 1; }
-
-                        let c_id = if reg_id < reg_ref.len() { *reg_ref.get_unchecked(reg_id) as usize } else { unmatched_id as usize };
-
-                        let target = *write_pos.get_unchecked(c_id);
-                        *out_ptr.add(target as usize) = name_crc;
-                        *write_pos.get_unchecked_mut(c_id) += 1;
+                        let target = *write_pos.get_unchecked(c);
+                        *raw_crc.add(target as usize) = crc;
+                        *write_pos.get_unchecked_mut(c) += 1;
                     }
                 }
             });
         }
     });
 
-    // Unmap records.csv IMMEDIATELY
-    unsafe {
-        munmap(ptr, len);
-    }
+    drop(thread_data);
+    drop(t_write_pos);
 
-    // Parallel in-place sort and dedup of each country's CRCs
-    let mut unique_names = vec![0u64; num_countries];
-    let raw_uniq_ptr = unique_names.as_mut_ptr() as usize;
+
+    // Parallel in-place sort & unique count per country across 12 threads
+    let mut unique_names_per_country = vec![0u64; num_countries];
+    let countries_per_thread = (num_countries + num_threads - 1) / num_threads;
+    let raw_crc_ref = &all_crcs;
+    let c_offsets_ref = &country_offsets;
+    let out_u_ptr = unique_names_per_country.as_mut_ptr() as usize;
 
     std::thread::scope(|s| {
-        let chunk_size = (num_countries + num_threads - 1) / num_threads;
-        let crcs_raw = raw_crc_ptr;
-        let offsets_ref = &country_offsets;
-
         for t in 0..num_threads {
-            let c_start = t * chunk_size;
-            let c_end = (c_start + chunk_size).min(num_countries);
+            let c_start = t * countries_per_thread;
+            let c_end = (c_start + countries_per_thread).min(num_countries);
             if c_start >= c_end { continue; }
 
             s.spawn(move || {
-                let crc_ptr = crcs_raw as *mut u32;
-                let uniq_ptr = raw_uniq_ptr as *mut u64;
+                let out_u = out_u_ptr as *mut u64;
+                let crc_slice = unsafe {
+                    std::slice::from_raw_parts_mut(raw_crc_ref.as_ptr() as *mut u32, raw_crc_ref.len())
+                };
 
                 for c in c_start..c_end {
-                    let s_off = offsets_ref[c] as usize;
-                    let e_off = offsets_ref[c + 1] as usize;
-                    let count = e_off - s_off;
-                    if count == 0 {
+                    let s_idx = c_offsets_ref[c] as usize;
+                    let e_idx = c_offsets_ref[c + 1] as usize;
+                    if s_idx >= e_idx {
+                        unsafe { *out_u.add(c) = 0; }
                         continue;
                     }
 
-                    let sl = unsafe { std::slice::from_raw_parts_mut(crc_ptr.add(s_off), count) };
-                    sl.sort_unstable();
+                    let slice = &mut crc_slice[s_idx..e_idx];
+                    pdqsort_u32(slice);
 
                     let mut unique = 1u64;
-                    let mut prev = sl[0];
-                    for &crc in &sl[1..] {
-                        if crc != prev {
+                    let mut prev = slice[0];
+                    for &val in &slice[1..] {
+                        if val != prev {
                             unique += 1;
-                            prev = crc;
+                            prev = val;
                         }
                     }
-                    unsafe {
-                        *uniq_ptr.add(c) = unique;
-                    }
+                    unsafe { *out_u.add(c) = unique; }
                 }
             });
         }
     });
 
+
+    // Drop all_crcs BEFORE formatting output!
+    drop(all_crcs);
+
     // Format output
-    let _ = fs::create_dir_all(&out_dir);
+    let _ = std::fs::create_dir_all(&out_dir);
     if let Ok(mut out_file) = File::create(&results_path) {
         let mut out_buf = Vec::with_capacity(num_countries * 128);
-        let mut num_buf = [0u8; 32];
+        let mut num_buf = [0u8; 64];
 
         for c in 0..num_countries {
             let agg = &final_aggs[c];
@@ -650,19 +496,19 @@ fn main() {
             out_buf.extend_from_slice(&num_buf[..w]);
             out_buf.push(b' ');
 
-            let w = unsafe { write_cents_fast(agg.amount_sum, num_buf.as_mut_ptr()) };
+            let w = unsafe { write_amount_fast(agg.amount_sum, num_buf.as_mut_ptr()) };
             out_buf.extend_from_slice(&num_buf[..w]);
             out_buf.push(b' ');
 
-            let w = unsafe { write_cents_fast(agg.amount_min, num_buf.as_mut_ptr()) };
+            let w = unsafe { write_amount_fast(agg.amount_min, num_buf.as_mut_ptr()) };
             out_buf.extend_from_slice(&num_buf[..w]);
             out_buf.push(b' ');
 
-            let w = unsafe { write_cents_fast(agg.amount_max, num_buf.as_mut_ptr()) };
+            let w = unsafe { write_amount_fast(agg.amount_max, num_buf.as_mut_ptr()) };
             out_buf.extend_from_slice(&num_buf[..w]);
             out_buf.push(b' ');
 
-            let w = unsafe { write_u64_fast(unique_names[c], num_buf.as_mut_ptr()) };
+            let w = unsafe { write_u64_fast(unique_names_per_country[c], num_buf.as_mut_ptr()) };
             out_buf.extend_from_slice(&num_buf[..w]);
             out_buf.push(b' ');
 
@@ -677,4 +523,5 @@ fn main() {
 
         let _ = out_file.write_all(&out_buf);
     }
+
 }
