@@ -318,7 +318,7 @@ fn main() {
             let region_to_country_ref = &region_to_country;
 
             handles.push(s.spawn(move || {
-                let est_cap = (end - start) / 48 + 4096;
+                let est_cap = 28_000;
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
                 let mut records = Vec::with_capacity(est_cap);
 
