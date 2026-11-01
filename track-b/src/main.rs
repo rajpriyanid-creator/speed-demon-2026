@@ -376,7 +376,7 @@ struct QueryAccum {
     top_k_len: u8,
 }
 
-const NUM_SEGMENTS: usize = 8;
+const NUM_SEGMENTS: usize = 4;
 
 struct ThreadBuffer {
     postings: Vec<u32>,
@@ -766,10 +766,15 @@ fn main() {
                                             acc.top_k_len += 1;
                                         }
                                     } else {
-                                        let p0 = get_postings(term_ids[0]);
-                                        let p1 = get_postings(term_ids[1]);
+                                        let mut terms = [0u32; 16];
+                                        let n = term_ids.len().min(16);
+                                        terms[..n].copy_from_slice(&term_ids[..n]);
+                                        let t_slice = &mut terms[..n];
+                                        t_slice.sort_unstable_by_key(|&t| get_postings(t).len());
+                                        let p0 = get_postings(t_slice[0]);
+                                        let p1 = get_postings(t_slice[1]);
                                         intersect_u16(p0, p1, &mut buf_a);
-                                        for &tid in &term_ids[2..] {
+                                        for &tid in &t_slice[2..] {
                                             if buf_a.is_empty() { break; }
                                             let p_next = get_postings(tid);
                                             intersect_u16(&buf_a, p_next, &mut buf_b);
