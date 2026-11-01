@@ -293,8 +293,9 @@ fn main() {
     }
     boundaries[num_threads] = len;
 
-    // Single Pass: Parse records, accumulate scalar aggs, and bucket CRC32s per country
-    type ThreadResult = (Vec<CountryScalarAgg>, Vec<Vec<u32>>);
+    // Single Pass: Flat arrays per thread (ONE allocation per thread, zero resizing!)
+    // (CountryScalarAgg, sorted_crcs_by_country, country_offsets)
+    type ThreadResult = (Vec<CountryScalarAgg>, Vec<u32>, [u32; 256]);
     let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
@@ -304,16 +305,17 @@ fn main() {
 
             handles.push(s.spawn(move || {
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
-                let mut country_crcs: Vec<Vec<u32>> = (0..num_countries)
-                    .map(|_| Vec::new())
-                    .collect();
+                let est_records = (end - start) / 50 + 2048;
+                let mut flat_country = Vec::with_capacity(est_records);
+                let mut flat_crc = Vec::with_capacity(est_records);
+                let mut c_counts = [0u32; 256];
 
                 let p = data.as_ptr();
                 let mut pos = start;
                 let mut last_adv = start;
 
                 while pos < end {
-                    if pos - last_adv >= 1024 * 1024 {
+                    if pos - last_adv >= 512 * 1024 {
                         unsafe { madvise_dontneed(p.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -484,7 +486,9 @@ fn main() {
                         agg.name_bytes += name_len as u64;
                         agg.note_bytes += note_len;
 
-                        country_crcs[c_id as usize].push(name_crc);
+                        flat_country.push(c_id);
+                        flat_crc.push(name_crc);
+                        c_counts[c_id as usize] += 1;
                     }
                 }
 
@@ -492,7 +496,25 @@ fn main() {
                     unsafe { madvise_dontneed(p.add(last_adv), end - last_adv); }
                 }
 
-                (local_aggs, country_crcs)
+                // 8-bit Radix Sort: bucket flat_crc by country in < 1 ms!
+                let total_hits = flat_crc.len();
+                let mut c_offsets = [0u32; 256];
+                let mut sum = 0u32;
+                for i in 0..256 {
+                    c_offsets[i] = sum;
+                    sum += c_counts[i];
+                }
+
+                let mut sorted_crcs = vec![0u32; total_hits];
+                let mut write_pos = c_offsets;
+                for i in 0..total_hits {
+                    let c = flat_country[i] as usize;
+                    let slot = write_pos[c] as usize;
+                    write_pos[c] += 1;
+                    sorted_crcs[slot] = flat_crc[i];
+                }
+
+                (local_aggs, sorted_crcs, c_offsets)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -535,7 +557,15 @@ fn main() {
                             name_bytes += agg.name_bytes;
                             note_bytes += agg.note_bytes;
 
-                            scratch.extend_from_slice(&thread_results_ref[t].1[c_id]);
+                            let s_off = thread_results_ref[t].2[c_id] as usize;
+                            let e_off = if c_id + 1 < 256 {
+                                thread_results_ref[t].2[c_id + 1] as usize
+                            } else {
+                                thread_results_ref[t].1.len()
+                            };
+                            if e_off > s_off {
+                                scratch.extend_from_slice(&thread_results_ref[t].1[s_off..e_off]);
+                            }
                         }
                     }
 

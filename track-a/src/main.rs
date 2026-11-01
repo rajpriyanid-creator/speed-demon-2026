@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::_mm_crc32_u64;
@@ -112,7 +111,7 @@ fn find_space_swar(w: u64) -> Option<usize> {
 }
 
 struct FastCatalog {
-    endpoints: Vec<(usize, usize)>, // (start_idx, end_idx) into original data
+    endpoints: Vec<(usize, usize)>, // (start_idx, end_idx)
     hashes: Vec<u64>,
     table: Vec<(u64, u16)>,
     mask: usize,
@@ -225,54 +224,82 @@ fn main() {
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
-    // Fast Endpoint Discovery on first 6.0MB with ZERO heap allocations!
+    // Parallel Endpoint Discovery across chunks of the first 6 MB (instant < 1 ms!)
     let disc_total = 6_000_000.min(len);
+    let mut disc_bounds = Vec::with_capacity(num_threads + 1);
+    disc_bounds.push(0);
+    for i in 1..num_threads {
+        let mut target = (disc_total * i) / num_threads;
+        while target < disc_total && data[target] != b'\n' { target += 1; }
+        if target < disc_total { target += 1; }
+        disc_bounds.push(target);
+    }
+    disc_bounds.push(disc_total);
+
+    let local_catalogs: Vec<Vec<((usize, usize), u64)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..num_threads).map(|t| {
+            let sb = disc_bounds[t];
+            let eb = disc_bounds[t + 1];
+            s.spawn(move || {
+                let mut list = Vec::with_capacity(256);
+                if sb >= eb { return list; }
+                let cptr = data.as_ptr();
+                let mut pos = sb;
+                while pos + 35 <= eb {
+                    let m_byte = unsafe { *cptr.add(pos + 28) };
+                    let ep_start = match m_byte {
+                        b'G' => pos + 32,
+                        b'P' => match unsafe { *cptr.add(pos + 29) } {
+                            b'O' => pos + 33,
+                            b'U' => pos + 32,
+                            _ => pos + 34,
+                        },
+                        b'D' => pos + 35,
+                        b'H' => pos + 33,
+                        b'O' => pos + 36,
+                        _ => {
+                            let mut idx = pos + 28;
+                            while idx < eb && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
+                            idx + 1
+                        }
+                    };
+
+                    let mut curr = ep_start;
+                    let mut h: u64 = 0;
+                    loop {
+                        let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
+                        if let Some(off) = find_space_swar(w) {
+                            let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
+                            h = unsafe { _mm_crc32_u64(h, w & rem_mask) };
+                            curr += off;
+                            break;
+                        } else {
+                            h = unsafe { _mm_crc32_u64(h, w) };
+                            curr += 8;
+                        }
+                    }
+                    let ep_end = curr;
+                    let ep_len = (ep_end - ep_start) as u64;
+                    let h_combined = h ^ (ep_len.rotate_left(56));
+
+                    list.push(((ep_start, ep_end), h_combined));
+
+                    let mut idx = ep_end + 5;
+                    while idx < eb && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
+                    if idx < eb { idx += 1; }
+                    pos = idx;
+                }
+                list
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
     let mut global_cat = FastCatalog::new(8192);
-    let cptr = data.as_ptr();
-    let mut pos = 0;
-    while pos + 35 <= disc_total {
-        let m_byte = unsafe { *cptr.add(pos + 28) };
-        let ep_start = match m_byte {
-            b'G' => pos + 32,
-            b'P' => match unsafe { *cptr.add(pos + 29) } {
-                b'O' => pos + 33,
-                b'U' => pos + 32,
-                _ => pos + 34,
-            },
-            b'D' => pos + 35,
-            b'H' => pos + 33,
-            b'O' => pos + 36,
-            _ => {
-                let mut idx = pos + 28;
-                while idx < disc_total && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
-                idx + 1
-            }
-        };
-
-        let mut curr = ep_start;
-        let mut h: u64 = 0;
-        loop {
-            let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
-            if let Some(off) = find_space_swar(w) {
-                let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                h = unsafe { _mm_crc32_u64(h, w & rem_mask) };
-                curr += off;
-                break;
-            } else {
-                h = unsafe { _mm_crc32_u64(h, w) };
-                curr += 8;
-            }
+    for cat in local_catalogs {
+        for ((s, e), h) in cat {
+            global_cat.get_or_insert(s, e, h);
         }
-        let ep_end = curr;
-        let ep_len = (ep_end - ep_start) as u64;
-        let h_combined = h ^ (ep_len.rotate_left(56));
-
-        global_cat.get_or_insert(ep_start, ep_end, h_combined);
-
-        let mut idx = ep_end + 5;
-        while idx < disc_total && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
-        if idx < disc_total { idx += 1; }
-        pos = idx;
     }
 
     let num_endpoints = global_cat.endpoints.len();
@@ -303,30 +330,26 @@ fn main() {
 
     let num_groups = NUM_HOURS * num_endpoints;
 
-    // Global Atomic arrays for counts and errors - ONLY 2.1 MB total!
-    let total_counts: Vec<AtomicU32> = (0..num_groups).map(|_| AtomicU32::new(0)).collect();
-    let total_errs: Vec<AtomicU32> = (0..num_groups).map(|_| AtomicU32::new(0)).collect();
-
-    // PASS 1: Count requests and errors per group across threads (with 4MB madvise window)
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for i in 0..num_threads {
+    // PASS 1: Thread-local counts with ZERO ATOMIC CONTENTION! (512 KB madvise window)
+    let thread_p1: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..num_threads).map(|i| {
             let start = boundaries[i];
             let end = boundaries[i + 1];
-            if start >= end { continue; }
-            let chunk = &data[start..end];
             let lookup_ref = &lookup_table;
-            let total_counts_ref = &total_counts;
-            let total_errs_ref = &total_errs;
 
-            handles.push(s.spawn(move || {
+            s.spawn(move || {
+                let mut local_counts = vec![0u32; num_groups];
+                let mut local_errs = vec![0u32; num_groups];
+                if start >= end { return (local_counts, local_errs); }
+
+                let chunk = &data[start..end];
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
                 let mut pos = 0;
                 let mut last_adv = 0;
 
                 while pos + 35 <= chunk_len {
-                    if pos - last_adv >= 4 * 1024 * 1024 {
+                    if pos - last_adv >= 512 * 1024 {
                         unsafe { madvise_dontneed(cptr.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -378,9 +401,9 @@ fn main() {
 
                     let gid = hour_id * num_endpoints + sorted_ep;
                     unsafe {
-                        total_counts_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed);
+                        *local_counts.get_unchecked_mut(gid) += 1;
                         if *cptr.add(ep_end + 1) == b'5' {
-                            total_errs_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed);
+                            *local_errs.get_unchecked_mut(gid) += 1;
                         }
                     }
 
@@ -392,40 +415,54 @@ fn main() {
                 if chunk_len > last_adv {
                     unsafe { madvise_dontneed(cptr.add(last_adv), chunk_len - last_adv); }
                 }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
+                (local_counts, local_errs)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+
+    // Consolidate counts and pre-calculate exact per-thread write offsets (ZERO ATOMICS IN PASS 2!)
+    let mut total_counts = vec![0u32; num_groups];
+    let mut total_errs = vec![0u32; num_groups];
+    let mut thread_write_offsets: Vec<Vec<u32>> = (0..num_threads).map(|_| vec![0u32; num_groups]).collect();
 
     let mut group_offsets = vec![0u32; num_groups + 1];
     let mut cur_offset = 0u32;
-    for g in 0..num_groups {
-        group_offsets[g] = cur_offset;
-        cur_offset += total_counts[g].load(Ordering::Relaxed);
+
+    for gid in 0..num_groups {
+        group_offsets[gid] = cur_offset;
+        let mut cur_thread_base = cur_offset;
+        let mut sum_count = 0u32;
+        let mut sum_err = 0u32;
+        for t in 0..num_threads {
+            thread_write_offsets[t][gid] = cur_thread_base;
+            let cnt = thread_p1[t].0[gid];
+            cur_thread_base += cnt;
+            sum_count += cnt;
+            sum_err += thread_p1[t].1[gid];
+        }
+        total_counts[gid] = sum_count;
+        total_errs[gid] = sum_err;
+        cur_offset = cur_thread_base;
     }
     group_offsets[num_groups] = cur_offset;
     let total_records = cur_offset as usize;
-
-    let write_offsets: Vec<AtomicU32> = group_offsets[..num_groups].iter().map(|&off| AtomicU32::new(off)).collect();
 
     // Allocate flat u32 array: exactly 12.4 MB for 3.1M records!
     let mut all_latencies: Vec<u32> = vec![0u32; total_records];
     let lat_ptr = all_latencies.as_mut_ptr() as usize;
 
-    // PASS 2: Parse latencies and write directly to group buckets (4MB madvise window)
+    // PASS 2: Parse latencies and write directly with ZERO ATOMICS! (512 KB madvise window)
     std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_threads);
-        let write_offsets_ref = &write_offsets;
-        for i in 0..num_threads {
+        let handles: Vec<_> = (0..num_threads).map(|i| {
             let start = boundaries[i];
             let end = boundaries[i + 1];
-            if start >= end { continue; }
-            let chunk = &data[start..end];
             let lookup_ref = &lookup_table;
+            let mut my_write_offsets = thread_write_offsets[i].clone();
 
-            handles.push(s.spawn(move || {
+            s.spawn(move || {
+                if start >= end { return; }
+                let chunk = &data[start..end];
                 let cptr = chunk.as_ptr();
                 let chunk_len = chunk.len();
                 let base_lat_ptr = lat_ptr as *mut u32;
@@ -433,7 +470,7 @@ fn main() {
                 let mut pos = 0;
                 let mut last_adv = 0;
                 while pos + 35 <= chunk_len {
-                    if pos - last_adv >= 4 * 1024 * 1024 {
+                    if pos - last_adv >= 512 * 1024 {
                         unsafe { madvise_dontneed(cptr.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -496,8 +533,9 @@ fn main() {
                     }
 
                     let gid = hour_id * num_endpoints + sorted_ep;
-                    let slot = unsafe { write_offsets_ref.get_unchecked(gid).fetch_add(1, Ordering::Relaxed) as usize };
                     unsafe {
+                        let slot = *my_write_offsets.get_unchecked(gid) as usize;
+                        *my_write_offsets.get_unchecked_mut(gid) += 1;
                         *base_lat_ptr.add(slot) = latency;
                     }
 
@@ -508,8 +546,8 @@ fn main() {
                 if chunk_len > last_adv {
                     unsafe { madvise_dontneed(cptr.add(last_adv), chunk_len - last_adv); }
                 }
-            }));
-        }
+            })
+        }).collect();
         for h in handles {
             h.join().unwrap();
         }
@@ -559,7 +597,7 @@ fn main() {
                         let p50 = slice[nearest_rank(count, 50)];
                         let p95 = slice[nearest_rank(count, 95)];
                         let p99 = slice[nearest_rank(count, 99)];
-                        let err_count = total_errs_ref[gid].load(Ordering::Relaxed) as u64;
+                        let err_count = total_errs_ref[gid] as u64;
                         let error_ppm = (err_count * 1_000_000) / (count as u64);
 
                         out.extend_from_slice(&hour_str);
