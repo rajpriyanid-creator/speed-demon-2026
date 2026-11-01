@@ -3,29 +3,41 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+use std::arch::x86_64::_mm_crc32_u64;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 #[inline(always)]
 unsafe fn hash_bytes_fast(tok: *const u8, len: usize) -> u32 {
-    let mut crc = 0u64;
-    let mut i = 0;
-    while i + 8 <= len {
-        let val = std::ptr::read_unaligned(tok.add(i) as *const u64) | 0x2020202020202020;
-        crc = _mm_crc32_u64(crc, val);
-        i += 8;
+    let crc: u64;
+    if len <= 8 {
+        let mask = if len == 8 { u64::MAX } else { (1u64 << (len * 8)) - 1 };
+        let val = (std::ptr::read_unaligned(tok as *const u64) | 0x2020202020202020) & mask;
+        crc = _mm_crc32_u64(0, val);
+    } else if len <= 16 {
+        let val0 = std::ptr::read_unaligned(tok as *const u64) | 0x2020202020202020;
+        let c0 = _mm_crc32_u64(0, val0);
+        let rem_len = len - 8;
+        let mask = if rem_len == 8 { u64::MAX } else { (1u64 << (rem_len * 8)) - 1 };
+        let val1 = (std::ptr::read_unaligned(tok.add(8) as *const u64) | 0x2020202020202020) & mask;
+        crc = _mm_crc32_u64(c0, val1);
+    } else {
+        let val0 = std::ptr::read_unaligned(tok as *const u64) | 0x2020202020202020;
+        let c0 = _mm_crc32_u64(0, val0);
+        let val1 = std::ptr::read_unaligned(tok.add(8) as *const u64) | 0x2020202020202020;
+        let c1 = _mm_crc32_u64(c0, val1);
+        let rem_len = len - 16;
+        let mask = if rem_len == 8 { u64::MAX } else { (1u64 << (rem_len * 8)) - 1 };
+        let val2 = (std::ptr::read_unaligned(tok.add(16) as *const u64) | 0x2020202020202020) & mask;
+        crc = _mm_crc32_u64(c1, val2);
     }
-    let mut c32 = crc as u32;
-    while i < len {
-        c32 = _mm_crc32_u8(c32, *tok.add(i) | 0x20);
-        i += 1;
-    }
-    if c32 == 0 { 1 } else { c32 }
+    let c = crc as u32;
+    if c == 0 { 1 } else { c }
 }
 
 #[inline(always)]
@@ -364,7 +376,14 @@ struct QueryAccum {
     top_k_len: u8,
 }
 
-const NUM_SEGMENTS: usize = 4;
+const NUM_SEGMENTS: usize = 8;
+
+struct ThreadBuffer {
+    postings: Vec<u32>,
+    counts: Vec<u16>,
+    doc_starts: Vec<u32>,
+    doc_lens: Vec<u32>,
+}
 
 fn main() {
     unsafe { mallopt(-8, 2); }
@@ -523,23 +542,18 @@ fn main() {
             cur_sb = end;
         }
 
-        // PASS 1: Count term occurrences per thread & record doc offsets
-        struct Pass1Result {
-            counts: Vec<u16>,
-            doc_starts: Vec<u32>,
-            doc_lens: Vec<u32>,
-        }
-
-        let p1_results: Vec<Pass1Result> = std::thread::scope(|s| {
+        // SINGLE PASS: Each thread scans text ONCE and collects packed (term_id << 15) | loc_doc
+        let mut t_results: Vec<ThreadBuffer> = std::thread::scope(|s| {
             let handles: Vec<_> = sub_chunks.iter().map(|&(sb, eb)| {
                 let dict_ref = &dict;
                 let chunk = &seg_slice[sb..eb];
                 s.spawn(move || {
                     let mut local_counts = vec![0u16; num_terms as usize];
                     let mut last_seen = vec![u16::MAX; num_terms as usize];
-                    let est_docs = ((eb - sb) / 1000 + 512).max(4000);
+                    let est_docs = ((eb - sb) / 1000 + 512).max(3000);
                     let mut local_starts = Vec::with_capacity(est_docs);
                     let mut local_lens = Vec::with_capacity(est_docs);
+                    let mut local_postings = Vec::with_capacity(250_000);
 
                     let mut i = 0;
                     let clen = chunk.len();
@@ -556,6 +570,7 @@ fn main() {
                         i += 1;
                         local_starts.push((sb + text_start) as u32);
                         local_lens.push((text_end - text_start) as u32);
+
                         let mut p = text_start;
                         while p < text_end {
                             while p < text_end && !unsafe { *IS_TOKEN.get_unchecked(*chunk.get_unchecked(p) as usize) } { p += 1; }
@@ -572,6 +587,7 @@ fn main() {
                                         unsafe {
                                             *last_seen.get_unchecked_mut(tid) = loc_doc;
                                             *local_counts.get_unchecked_mut(tid) += 1;
+                                            local_postings.push(((term_id as u32) << 15) | (loc_doc as u32));
                                         }
                                     }
                                 }
@@ -579,7 +595,8 @@ fn main() {
                         }
                         loc_doc += 1;
                     }
-                    Pass1Result {
+                    ThreadBuffer {
+                        postings: local_postings,
                         counts: local_counts,
                         doc_starts: local_starts,
                         doc_lens: local_lens,
@@ -591,7 +608,7 @@ fn main() {
 
         let mut t_start_doc = Vec::with_capacity(num_threads);
         let mut cur_d = 0u16;
-        for r in &p1_results {
+        for r in &t_results {
             t_start_doc.push(cur_d);
             cur_d += r.doc_starts.len() as u16;
         }
@@ -599,7 +616,7 @@ fn main() {
 
         let mut seg_doc_starts = Vec::with_capacity(cur_d as usize);
         let mut seg_doc_lens = Vec::with_capacity(cur_d as usize);
-        for r in &p1_results {
+        for r in &t_results {
             seg_doc_starts.extend_from_slice(&r.doc_starts);
             seg_doc_lens.extend_from_slice(&r.doc_lens);
         }
@@ -613,73 +630,40 @@ fn main() {
             let mut cur = total_postings;
             for t in 0..num_threads {
                 t_write_bases[t][term] = cur;
-                cur += p1_results[t].counts[term] as u32;
+                cur += t_results[t].counts[term] as u32;
             }
             total_postings = cur;
         }
         offsets[num_terms as usize] = total_postings;
 
-        // Allocate flat postings for this segment ONLY: exactly ~11 MB!
+        // Allocate flat postings for this segment ONLY: exactly ~5.5 MB!
         let mut all_postings: Vec<u16> = vec![0u16; total_postings as usize];
         let raw_postings_ptr = all_postings.as_mut_ptr() as usize;
 
-        // PASS 2: Rescan chunk and write directly into pre-calculated slices
+        // Fast parallel scatter of doc IDs directly into all_postings
         std::thread::scope(|s| {
             for t in 0..num_threads {
-                let dict_ref = &dict;
-                let (sb, eb) = sub_chunks[t];
-                let chunk = &seg_slice[sb..eb];
+                let p_list = std::mem::take(&mut t_results[t].postings);
                 let mut write_pos = std::mem::take(&mut t_write_bases[t]);
                 let base_doc_offset = t_start_doc[t];
 
                 s.spawn(move || {
                     let raw_p = raw_postings_ptr as *mut u16;
-                    let mut last_seen = vec![u16::MAX; num_terms as usize];
-                    let mut i = 0;
-                    let clen = chunk.len();
-                    let mut loc_doc: u16 = 0;
-                    let base_ptr = chunk.as_ptr();
-
-                    while i < clen {
-                        while i < clen && chunk[i] != b'\t' { i += 1; }
-                        if i >= clen { break; }
-                        i += 1;
-                        let text_start = i;
-                        while i < clen && chunk[i] != b'\n' { i += 1; }
-                        let text_end = i;
-                        i += 1;
-
-                        let mut p = text_start;
-                        while p < text_end {
-                            while p < text_end && !unsafe { *IS_TOKEN.get_unchecked(*chunk.get_unchecked(p) as usize) } { p += 1; }
-                            if p >= text_end { break; }
-                            let tok_start = p;
-                            while p < text_end && unsafe { *IS_TOKEN.get_unchecked(*chunk.get_unchecked(p) as usize) } { p += 1; }
-                            let tok_len = p - tok_start;
-                            if tok_len <= 23 {
-                                let ptr_tok = unsafe { base_ptr.add(tok_start) };
-                                let h64 = unsafe { make_h64(ptr_tok, tok_len) };
-                                if let Some(term_id) = dict_ref.get(h64) {
-                                    let tid = term_id as usize;
-                                    if unsafe { *last_seen.get_unchecked(tid) } != loc_doc {
-                                        unsafe {
-                                            *last_seen.get_unchecked_mut(tid) = loc_doc;
-                                            let target = *write_pos.get_unchecked(tid);
-                                            *raw_p.add(target as usize) = loc_doc + base_doc_offset;
-                                            *write_pos.get_unchecked_mut(tid) += 1;
-                                        }
-                                    }
-                                }
-                            }
+                    for &packed in &p_list {
+                        let tid = (packed >> 15) as usize;
+                        let ldoc = (packed & 0x7FFF) as u16;
+                        unsafe {
+                            let target = *write_pos.get_unchecked(tid);
+                            *raw_p.add(target as usize) = ldoc + base_doc_offset;
+                            *write_pos.get_unchecked_mut(tid) += 1;
                         }
-                        loc_doc += 1;
                     }
                 });
             }
         });
 
-        // Drop pass 1 data
-        drop(p1_results);
+        // Drop thread temporary data
+        drop(t_results);
 
         // EVALUATE ALL QUERIES ON THIS SEGMENT IMMEDIATELY!
         let q_chunk_size = (num_queries + num_threads - 1) / num_threads;
@@ -823,6 +807,9 @@ fn main() {
         });
 
         // Postings, doc_starts, doc_lens, offsets are completely dropped here at end of segment loop!
+        unsafe {
+            madvise(seg_slice.as_ptr() as *mut u8, seg_len, 4);
+        }
     }
 
     let _ = std::fs::create_dir_all(&out_dir);
