@@ -1,15 +1,46 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::_mm_crc32_u8;
+use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8, _mm_crc32_u16};
+
+const MADV_DONTNEED: i32 = 4;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+}
+
+#[inline(always)]
+unsafe fn madvise_dontneed(addr: *const u8, len: usize) {
+    let start = (addr as usize + 4095) & !4095;
+    let end = (addr as usize + len) & !4095;
+    if end > start {
+        madvise(start as *mut u8, end - start, MADV_DONTNEED);
+    }
+}
+
+#[inline(always)]
+fn find_record_boundary(data: &[u8], mut p: usize) -> usize {
+    let len = data.len();
+    while p + 8 < len {
+        if data[p] == b'\n' {
+            let prev = if p > 0 && data[p - 1] == b'\r' { p - 1 } else { p };
+            if prev >= 3 && data[prev - 3] == b'.' && data[prev - 2].is_ascii_digit() && data[prev - 1].is_ascii_digit() {
+                let mut next = p + 1;
+                while next < len && data[next].is_ascii_digit() { next += 1; }
+                if next < len && data[next] == b',' && next > p + 1 {
+                    return p + 1;
+                }
+            }
+        }
+        p += 1;
+    }
+    len
 }
 
 #[derive(Clone, Copy)]
@@ -97,87 +128,52 @@ unsafe fn write_cents_fast(c: i64, buf: *mut u8) -> usize {
     p + 2
 }
 
-// Concurrent Lock-Free Name Interner:
-// Up to 131,072 names.
-// Open addressing table with 262,144 slots.
-// Slot stores atomic hash (u64) and name_id (u32).
-const INTERNER_CAP: usize = 262_144;
-const INTERNER_MASK: usize = INTERNER_CAP - 1;
-
-struct AtomicNameSlot {
-    hash: AtomicU64,
-    id: AtomicU32,
-}
-
-struct GlobalNameInterner {
-    table: Box<[AtomicNameSlot]>,
-    next_id: AtomicU32,
-}
-
-impl GlobalNameInterner {
-    fn new() -> Self {
-        let mut slots = Vec::with_capacity(INTERNER_CAP);
-        for _ in 0..INTERNER_CAP {
-            slots.push(AtomicNameSlot {
-                hash: AtomicU64::new(0),
-                id: AtomicU32::new(0),
-            });
-        }
-        Self {
-            table: slots.into_boxed_slice(),
-            next_id: AtomicU32::new(1), // 0 is reserved for empty name
-        }
-    }
-
-    #[inline(always)]
-    fn get_or_insert(&self, h: u64) -> u32 {
-        if h == 0 { return 0; }
-        let h_key = h;
-        let mut idx = (h_key as usize) & INTERNER_MASK;
-        loop {
-            let slot = unsafe { self.table.get_unchecked(idx) };
-            let existing = slot.hash.load(Ordering::Acquire);
-            if existing == h_key {
-                loop {
-                    let id = slot.id.load(Ordering::Acquire);
-                    if id != 0 { return id; }
-                    std::hint::spin_loop();
-                }
-            }
-            if existing == 0 {
-                match slot.hash.compare_exchange(0, h_key, Ordering::SeqCst, Ordering::Acquire) {
-                    Ok(_) => {
-                        let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                        slot.id.store(new_id, Ordering::Release);
-                        return new_id;
-                    }
-                    Err(actual) => {
-                        if actual == h_key {
-                            loop {
-                                let id = slot.id.load(Ordering::Acquire);
-                                if id != 0 { return id; }
-                                std::hint::spin_loop();
-                            }
-                        }
-                    }
-                }
-            }
-            idx = (idx + 1) & INTERNER_MASK;
-        }
+#[inline(always)]
+fn find_quote_swar(w: u64) -> Option<usize> {
+    let x = w ^ 0x22222222_22222222;
+    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    if m != 0 {
+        Some((m.trailing_zeros() >> 3) as usize)
+    } else {
+        None
     }
 }
 
-// Country Bitsets: 241 countries * 2048 u64 words = 131,072 bits per country.
-// 241 * 2048 * 8 bytes = 3.94 MB!
-const BITSET_WORDS: usize = 2048;
+#[inline(always)]
+fn find_comma_swar(w: u64) -> Option<usize> {
+    let x = w ^ 0x2C2C2C2C_2C2C2C2C;
+    let m = (x.wrapping_sub(0x01010101_01010101)) & !x & 0x80808080_80808080;
+    if m != 0 {
+        Some((m.trailing_zeros() >> 3) as usize)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+unsafe fn crc32_hardware(crc: u32, p: *const u8, len: usize) -> u32 {
+    let mut c = crc as u64;
+    let mut i = 0;
+    while i + 8 <= len {
+        let val = std::ptr::read_unaligned(p.add(i) as *const u64);
+        c = _mm_crc32_u64(c, val);
+        i += 8;
+    }
+    let mut c32 = c as u32;
+    while i < len {
+        c32 = _mm_crc32_u8(c32, *p.add(i));
+        i += 1;
+    }
+    c32
+}
 
 fn main() {
+    let t0 = Instant::now();
     unsafe { mallopt(-8, 2); }
 
     let mut data_dir = "/data".to_string();
     let mut out_dir = "/out".to_string();
     let args: Vec<String> = std::env::args().collect();
-    let mut positional = Vec::new();
     let mut arg_i = 1;
     while arg_i < args.len() {
         if args[arg_i] == "--data" && arg_i + 1 < args.len() {
@@ -187,69 +183,99 @@ fn main() {
             out_dir = args[arg_i + 1].clone();
             arg_i += 2;
         } else if !args[arg_i].starts_with("--") {
-            positional.push(args[arg_i].clone());
+            if data_dir == "/data" { data_dir = args[arg_i].clone(); }
+            else if out_dir == "/out" { out_dir = args[arg_i].clone(); }
             arg_i += 1;
         } else {
             arg_i += 1;
         }
     }
-    if positional.len() >= 1 && data_dir == "/data" { data_dir = positional[0].clone(); }
-    if positional.len() >= 2 && out_dir == "/out" { out_dir = positional[1].clone(); }
 
     let regions_path = format!("{}/regions.csv", data_dir);
-    let records_path = format!("{}/records.csv", data_dir);
-    let results_path = format!("{}/aggregates.txt", out_dir);
-
-    // 1. Parse regions.csv
-    let reg_file = match File::open(&regions_path) {
+    let regions_file = match File::open(&regions_path) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let reg_len = match reg_file.metadata() {
+    let r_len = match regions_file.metadata() {
         Ok(m) => m.len() as usize,
         Err(_) => return,
     };
-    let reg_ptr = unsafe { mmap(std::ptr::null_mut(), reg_len, 1, 1, reg_file.as_raw_fd(), 0) };
-    if reg_ptr == usize::MAX as *mut u8 || reg_ptr.is_null() { return; }
-    let reg_data = unsafe { std::slice::from_raw_parts(reg_ptr, reg_len) };
+    if r_len == 0 { return; }
+    let r_ptr = unsafe { mmap(std::ptr::null_mut(), r_len, 1, 1, regions_file.as_raw_fd(), 0) };
+    if r_ptr == usize::MAX as *mut u8 { return; }
+    let regions_data = unsafe { std::slice::from_raw_parts(r_ptr, r_len) };
 
-    let mut country_map = std::collections::BTreeMap::new();
-    let mut country_names: Vec<[u8; 3]> = Vec::with_capacity(256);
-    let mut region_to_country = vec![255u8; 1_000_000];
-
+    let mut seen = [false; 17576];
     let mut pos = 0;
-    while pos < reg_len && reg_data[pos] != b'\n' { pos += 1; }
-    if pos < reg_len { pos += 1; }
+    while pos < regions_data.len() && regions_data[pos] != b'\n' { pos += 1; }
+    if pos < regions_data.len() { pos += 1; }
 
-    while pos < reg_len {
-        let mut reg_id = 0usize;
-        while pos < reg_len && reg_data[pos] != b',' {
-            reg_id = reg_id * 10 + (reg_data[pos] - b'0') as usize;
-            pos += 1;
-        }
+    let body_start = pos;
+    while pos < regions_data.len() {
+        while pos < regions_data.len() && regions_data[pos] != b',' { pos += 1; }
+        if pos >= regions_data.len() { break; }
         pos += 1;
-        if pos + 3 <= reg_len {
-            let c_bytes: [u8; 3] = [reg_data[pos], reg_data[pos + 1], reg_data[pos + 2]];
-            let c_id = *country_map.entry(c_bytes).or_insert_with(|| {
-                let id = country_names.len() as u8;
-                country_names.push(c_bytes);
-                id
-            });
-            if reg_id < region_to_country.len() {
-                region_to_country[reg_id] = c_id;
-            }
-            pos += 3;
-            while pos < reg_len && reg_data[pos] != b'\n' { pos += 1; }
-            if pos < reg_len { pos += 1; }
+        let b0 = regions_data[pos];
+        let b1 = regions_data[pos + 1];
+        let b2 = regions_data[pos + 2];
+        pos += 3;
+        while pos < regions_data.len() && regions_data[pos] != b'\n' { pos += 1; }
+        if pos < regions_data.len() { pos += 1; }
+
+        if b0 >= b'A' && b0 <= b'Z' && b1 >= b'A' && b1 <= b'Z' && b2 >= b'A' && b2 <= b'Z' {
+            let code = ((b0 - b'A') as u16) * 676 + ((b1 - b'A') as u16) * 26 + ((b2 - b'A') as u16);
+            seen[code as usize] = true;
         }
     }
-    unsafe { munmap(reg_ptr, reg_len); }
 
+    let mut country_names: Vec<Vec<u8>> = Vec::with_capacity(300);
+    let mut code_map = [u8::MAX; 17576];
+    for idx in 0..17576 {
+        if seen[idx] {
+            let c0 = b'A' + (idx / 676) as u8;
+            let c1 = b'A' + ((idx / 26) % 26) as u8;
+            let c2 = b'A' + (idx % 26) as u8;
+            let c_id = country_names.len() as u8;
+            country_names.push(vec![c0, c1, c2]);
+            code_map[idx] = c_id;
+        }
+    }
     let unmatched_id = country_names.len() as u8;
-    let num_countries = (unmatched_id + 1) as usize;
+    country_names.push(b"_UNMATCHED".to_vec());
+    let num_countries = country_names.len();
 
-    // 2. Map records.csv
-    let file = match File::open(&records_path) {
+    let mut region_to_country: Vec<u8> = vec![unmatched_id; 1_000_000];
+    pos = body_start;
+    while pos < regions_data.len() {
+        let mut rid = 0usize;
+        while pos < regions_data.len() && regions_data[pos] != b',' {
+            let b = regions_data[pos];
+            if b >= b'0' && b <= b'9' {
+                rid = rid * 10 + (b - b'0') as usize;
+            }
+            pos += 1;
+        }
+        if pos >= regions_data.len() { break; }
+        pos += 1;
+        let b0 = regions_data[pos];
+        let b1 = regions_data[pos + 1];
+        let b2 = regions_data[pos + 2];
+        pos += 3;
+        while pos < regions_data.len() && regions_data[pos] != b'\n' { pos += 1; }
+        if pos < regions_data.len() { pos += 1; }
+
+        if b0 >= b'A' && b0 <= b'Z' && b1 >= b'A' && b1 <= b'Z' && b2 >= b'A' && b2 <= b'Z' {
+            let code = ((b0 - b'A') as u16) * 676 + ((b1 - b'A') as u16) * 26 + ((b2 - b'A') as u16);
+            let c_id = code_map[code as usize];
+            if rid < region_to_country.len() {
+                region_to_country[rid] = c_id;
+            }
+        }
+    }
+    unsafe { munmap(r_ptr, r_len); }
+
+    let rec_path = format!("{}/records.csv", data_dir);
+    let file = match File::open(&rec_path) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -257,55 +283,54 @@ fn main() {
         Ok(m) => m.len() as usize,
         Err(_) => return,
     };
+    if len == 0 { return; }
+
     let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, file.as_raw_fd(), 0) };
-    if ptr == usize::MAX as *mut u8 || ptr.is_null() { return; }
+    if ptr == usize::MAX as *mut u8 { return; }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
     let mut header_end = 0;
+    if header_end + 3 <= len && &data[header_end..header_end + 3] == b"\xEF\xBB\xBF" {
+        header_end += 3;
+    }
     while header_end < len && data[header_end] != b'\n' { header_end += 1; }
     if header_end < len { header_end += 1; }
 
     let num_threads = 12;
-    let mut boundaries = vec![header_end; num_threads + 1];
+    // Fast parallel boundary finding
     let chunk_target = (len - header_end) / num_threads;
-
-    for k in 1..num_threads {
-        let target = header_end + k * chunk_target;
-        let mut p = target;
-        while p + 1 < len && !(data[p] == b'\r' && data[p + 1] == b'\n') {
-            p += 1;
-        }
-        if p + 1 < len { p += 2; }
-        boundaries[k] = p;
-    }
+    let mut boundaries = vec![header_end; num_threads + 1];
     boundaries[num_threads] = len;
-
-    let interner = GlobalNameInterner::new();
-    let mut bitsets_raw = Vec::with_capacity(num_countries * BITSET_WORDS);
-    for _ in 0..(num_countries * BITSET_WORDS) {
-        bitsets_raw.push(AtomicU64::new(0));
+    for k in 1..num_threads {
+        boundaries[k] = find_record_boundary(data, header_end + k * chunk_target);
     }
-    let bitsets = bitsets_raw.into_boxed_slice();
 
-    struct ThreadParseData {
+    struct ThreadResult {
         aggs: Vec<CountryScalarAgg>,
+        records: Vec<u64>, // packed ((c_id as u64) << 32) | (name_crc as u64)
     }
 
-    let thread_data: Vec<ThreadParseData> = std::thread::scope(|s| {
+    let thread_results: Vec<ThreadResult> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for k in 0..num_threads {
             let start = boundaries[k];
             let end = boundaries[k + 1];
-            let reg_ref = &region_to_country;
-            let interner_ref = &interner;
-            let bitsets_ref = &bitsets;
+            let region_to_country_ref = &region_to_country;
 
             handles.push(s.spawn(move || {
+                let est_cap = (end - start) / 48 + 4096;
                 let mut local_aggs = vec![CountryScalarAgg::default(); num_countries];
+                let mut records = Vec::with_capacity(est_cap);
+
                 let p = data.as_ptr();
                 let mut pos = start;
+                let mut last_adv = start;
 
                 while pos < end {
+                    if pos - last_adv >= 2 * 1024 * 1024 {
+                        unsafe { madvise_dontneed(p.add(last_adv), pos - last_adv); }
+                        last_adv = pos;
+                    }
                     unsafe {
                         if pos + 3 <= len && *p.add(pos) == 0xEF && *p.add(pos + 1) == 0xBB && *p.add(pos + 2) == 0xBF {
                             pos += 3;
@@ -317,253 +342,300 @@ fn main() {
                             continue;
                         }
 
-                        // 1. Parse Record ID
-                        let mut rec_id = 0u64;
+                        let mut id: u64 = 0;
                         while *p.add(pos) != b',' {
-                            rec_id = rec_id * 10 + (*p.add(pos) - b'0') as u64;
+                            id = id * 10 + (*p.add(pos) - b'0') as u64;
                             pos += 1;
                         }
                         pos += 1;
 
-                        // 2. Parse & Unescape Name + Calculate 64-bit Hash
-                        let mut name_crc = 0u32;
-                        let mut name_fnv = 0xcbf29ce484222325u64;
-                        let mut name_len = 0usize;
-                        if *p.add(pos) == b'"' {
+                        let (name_crc, name_len): (u32, u32) = if *p.add(pos) == b'"' {
                             pos += 1;
+                            let n_start = pos;
+                            let mut crc: u32 = 0;
+                            let mut escaped_quotes: u32 = 0;
+                            let n_len: u32;
                             loop {
-                                let b = *p.add(pos);
-                                if b == b'"' {
-                                    if *p.add(pos + 1) == b'"' {
-                                        name_crc = _mm_crc32_u8(name_crc, b'"');
-                                        name_fnv = (name_fnv ^ (b'"' as u64)).wrapping_mul(0x100000001b3);
-                                        name_len += 1;
-                                        pos += 2;
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_quote_swar(w) {
+                                    crc = crc32_hardware(crc, p.add(pos), off);
+                                    let q = pos + off;
+                                    if *p.add(q + 1) == b'"' {
+                                        crc = _mm_crc32_u8(crc, b'"');
+                                        escaped_quotes += 1;
+                                        pos = q + 2;
                                     } else {
-                                        pos += 1;
+                                        n_len = (q - n_start) as u32 - escaped_quotes;
+                                        pos = q + 1;
                                         break;
                                     }
                                 } else {
-                                    name_crc = _mm_crc32_u8(name_crc, b);
-                                    name_fnv = (name_fnv ^ (b as u64)).wrapping_mul(0x100000001b3);
-                                    name_len += 1;
-                                    pos += 1;
+                                    crc = crc32_hardware(crc, p.add(pos), 8);
+                                    pos += 8;
                                 }
                             }
+                            if *p.add(pos) == b',' { pos += 1; }
+                            (_mm_crc32_u16(crc, n_len as u16), n_len)
                         } else {
-                            while *p.add(pos) != b',' {
-                                let b = *p.add(pos);
-                                name_crc = _mm_crc32_u8(name_crc, b);
-                                name_fnv = (name_fnv ^ (b as u64)).wrapping_mul(0x100000001b3);
-                                name_len += 1;
+                            let n_start = pos;
+                            let mut crc: u32 = 0;
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    crc = crc32_hardware(crc, p.add(pos), off);
+                                    pos += off;
+                                    break;
+                                } else {
+                                    crc = crc32_hardware(crc, p.add(pos), 8);
+                                    pos += 8;
+                                }
+                            }
+                            while pos < end && *p.add(pos) != b',' {
+                                crc = _mm_crc32_u8(crc, *p.add(pos));
                                 pos += 1;
                             }
-                        }
-                        let name_hash = if name_len > 0 {
-                            ((name_fnv as u64) << 32) | (name_crc as u64)
-                        } else {
-                            0u64
+                            let n_len = (pos - n_start) as u32;
+                            pos += 1;
+                            (_mm_crc32_u16(crc, n_len as u16), n_len)
                         };
-                        pos += 1; // skip comma
 
-                        // 3. Parse & Unescape Note
-                        let mut note_len = 0usize;
+                        let note_len: u64;
                         if *p.add(pos) == b'"' {
                             pos += 1;
+                            let mut escaped_quotes: u64 = 0;
+                            let n_start = pos;
                             loop {
-                                let b = *p.add(pos);
-                                if b == b'"' {
-                                    if *p.add(pos + 1) == b'"' {
-                                        note_len += 1;
-                                        pos += 2;
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_quote_swar(w) {
+                                    let q = pos + off;
+                                    if *p.add(q + 1) == b'"' {
+                                        escaped_quotes += 1;
+                                        pos = q + 2;
                                     } else {
-                                        pos += 1;
+                                        note_len = (q - n_start) as u64 - escaped_quotes;
+                                        pos = q + 1;
                                         break;
                                     }
                                 } else {
-                                    note_len += 1;
-                                    pos += 1;
+                                    pos += 8;
                                 }
                             }
+                            if *p.add(pos) == b',' { pos += 1; }
                         } else {
-                            while *p.add(pos) != b',' {
-                                note_len += 1;
-                                pos += 1;
+                            let n_start = pos;
+                            while pos + 8 <= end {
+                                let w = (p.add(pos) as *const u64).read_unaligned();
+                                if let Some(off) = find_comma_swar(w) {
+                                    pos += off;
+                                    break;
+                                } else {
+                                    pos += 8;
+                                }
                             }
+                            while pos < end && *p.add(pos) != b',' { pos += 1; }
+                            note_len = (pos - n_start) as u64;
+                            pos += 1;
                         }
-                        pos += 1; // skip comma
 
-                        // 4. Parse Region ID
-                        let mut reg_id = 0usize;
+                        let mut region_id = 0usize;
+                        let mut has_region = false;
                         while *p.add(pos) != b',' {
-                            reg_id = reg_id * 10 + (*p.add(pos) - b'0') as usize;
+                            let b = *p.add(pos);
+                            if b >= b'0' && b <= b'9' {
+                                region_id = region_id * 10 + (b - b'0') as usize;
+                                has_region = true;
+                            }
                             pos += 1;
                         }
                         pos += 1;
 
-                        // 5. Parse Amount in Cents
-                        let is_neg = if *p.add(pos) == b'-' { pos += 1; true } else { false };
-                        let mut dollars = 0i64;
-                        while *p.add(pos) != b'.' {
-                            dollars = dollars * 10 + (*p.add(pos) - b'0') as i64;
+                        let is_neg = *p.add(pos) == b'-';
+                        if is_neg { pos += 1; }
+                        let mut cents: i64 = 0;
+                        while *p.add(pos) != b'\r' && *p.add(pos) != b'\n' {
+                            let b = *p.add(pos);
+                            if b >= b'0' && b <= b'9' {
+                                cents = cents * 10 + (b - b'0') as i64;
+                            }
                             pos += 1;
                         }
-                        pos += 1;
-                        let d0 = (*p.add(pos) - b'0') as i64;
-                        let d1 = (*p.add(pos + 1) - b'0') as i64;
-                        let mut amount = dollars * 100 + d0 * 10 + d1;
-                        if is_neg { amount = -amount; }
-                        pos += 2;
+                        if is_neg { cents = -cents; }
+                        if *p.add(pos) == b'\r' { pos += 1; }
+                        if pos < len && *p.add(pos) == b'\n' { pos += 1; }
 
-                        while pos < len && *p.add(pos) != b'\n' { pos += 1; }
-                        if pos < len { pos += 1; }
+                        let c_id = if has_region && region_id < region_to_country_ref.len() {
+                            region_to_country_ref[region_id]
+                        } else {
+                            unmatched_id
+                        };
 
-                        let c_raw = if reg_id < reg_ref.len() { *reg_ref.get_unchecked(reg_id) } else { 255 };
-                        let c_id = if c_raw == 255 { unmatched_id as usize } else { c_raw as usize };
-
-                        let agg = local_aggs.get_unchecked_mut(c_id);
+                        let agg = &mut local_aggs[c_id as usize];
                         agg.count += 1;
-                        agg.id_sum += rec_id;
-                        agg.amount_sum += amount;
-                        if amount < agg.amount_min { agg.amount_min = amount; }
-                        if amount > agg.amount_max { agg.amount_max = amount; }
+                        agg.id_sum += id;
+                        agg.amount_sum += cents;
+                        agg.amount_min = agg.amount_min.min(cents);
+                        agg.amount_max = agg.amount_max.max(cents);
                         agg.name_bytes += name_len as u64;
-                        agg.note_bytes += note_len as u64;
+                        agg.note_bytes += note_len;
 
-                        // Distinct Name Bitset:
-                        let name_id = interner_ref.get_or_insert(name_hash);
-                        let word_idx = (name_id as usize) >> 6;
-                        let bit_val = 1u64 << ((name_id as usize) & 63);
-                        let bit_slot = bitsets_ref.get_unchecked(c_id * BITSET_WORDS + word_idx);
-                        bit_slot.fetch_or(bit_val, Ordering::Relaxed);
+                        records.push(((c_id as u64) << 32) | (name_crc as u64));
                     }
                 }
 
-                ThreadParseData { aggs: local_aggs }
+                if end > last_adv {
+                    unsafe { madvise_dontneed(p.add(last_adv), end - last_adv); }
+                }
+
+                ThreadResult { aggs: local_aggs, records }
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     unsafe { munmap(ptr, len); }
-    
 
-    // Merge scalar aggregates
+    // Merge scalar aggregates and compute total count per country
     let mut final_aggs = vec![CountryScalarAgg::default(); num_countries];
-    for r in &thread_data {
+    let mut country_offsets = vec![0u32; num_countries + 1];
+    for t in 0..num_threads {
         for c in 0..num_countries {
-            let src = &r.aggs[c];
+            let src = &thread_results[t].aggs[c];
             let dst = &mut final_aggs[c];
             dst.count += src.count;
             dst.id_sum += src.id_sum;
             dst.amount_sum += src.amount_sum;
-            if src.amount_min < dst.amount_min { dst.amount_min = src.amount_min; }
-            if src.amount_max > dst.amount_max { dst.amount_max = src.amount_max; }
+            dst.amount_min = dst.amount_min.min(src.amount_min);
+            dst.amount_max = dst.amount_max.max(src.amount_max);
             dst.name_bytes += src.name_bytes;
             dst.note_bytes += src.note_bytes;
+            country_offsets[c + 1] += src.count as u32;
         }
     }
 
-    // Output formatting
+    // Prefix sum to compute write offsets for each country
+    for c in 0..num_countries {
+        country_offsets[c + 1] += country_offsets[c];
+    }
+
+    let total_records = country_offsets[num_countries] as usize;
+    let mut all_crcs = vec![0u32; total_records];
+    let all_crcs_ptr = all_crcs.as_mut_ptr() as usize;
+
+    // Parallel scatter of CRCs into contiguous country slices
+    // Each thread gets write cursor per country
+    std::thread::scope(|s| {
+        // Precompute write offsets for each (thread, country)
+        let mut thread_cursors: Vec<Vec<u32>> = Vec::with_capacity(num_threads);
+        let mut cur_offsets = country_offsets[..num_countries].to_vec();
+        for t in 0..num_threads {
+            thread_cursors.push(cur_offsets.clone());
+            for c in 0..num_countries {
+                cur_offsets[c] += thread_results[t].aggs[c].count as u32;
+            }
+        }
+
+        for t in 0..num_threads {
+            let mut cursors = thread_cursors[t].clone();
+            let records_ref = &thread_results[t].records;
+            s.spawn(move || {
+                let dst_base = all_crcs_ptr as *mut u32;
+                for &rec in records_ref {
+                    let c_id = (rec >> 32) as usize;
+                    let crc = rec as u32;
+                    let dst_idx = cursors[c_id];
+                    cursors[c_id] += 1;
+                    unsafe { *dst_base.add(dst_idx as usize) = crc; }
+                }
+            });
+        }
+    });
+
+    drop(thread_results);
+
+    // Parallel sort of CRCs and distinct count formatting
+    let country_chunk = (num_countries + num_threads - 1) / num_threads;
+    let all_crcs_slice = &mut all_crcs[..];
+    let all_crcs_ref = all_crcs_slice.as_mut_ptr() as usize;
+
+    let formatted_outputs: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..num_countries).step_by(country_chunk).map(|c_start| {
+            let c_end = (c_start + country_chunk).min(num_countries);
+            let offsets_ref = &country_offsets;
+            let aggs_ref = &final_aggs;
+            let names_ref = &country_names;
+
+            s.spawn(move || {
+                let mut out = Vec::with_capacity((c_end - c_start) * 128);
+                let mut num_buf = [0u8; 32];
+                let base_ptr = all_crcs_ref as *mut u32;
+
+                for c_id in c_start..c_end {
+                    let agg = &aggs_ref[c_id];
+                    if agg.count == 0 { continue; }
+
+                    let s_idx = offsets_ref[c_id] as usize;
+                    let e_idx = offsets_ref[c_id + 1] as usize;
+                    let slice = unsafe { std::slice::from_raw_parts_mut(base_ptr.add(s_idx), e_idx - s_idx) };
+                    slice.sort_unstable();
+
+                    let mut distinct = 0u64;
+                    let mut last = u32::MAX;
+                    for &crc in slice.iter() {
+                        if crc != last {
+                            distinct += 1;
+                            last = crc;
+                        }
+                    }
+
+                    out.extend_from_slice(&names_ref[c_id]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_u64_fast(agg.count, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_u64_fast(agg.id_sum, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_cents_fast(agg.amount_sum, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_cents_fast(agg.amount_min, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_cents_fast(agg.amount_max, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_u64_fast(distinct, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_u64_fast(agg.name_bytes, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b' ');
+
+                    let w = unsafe { write_u64_fast(agg.note_bytes, num_buf.as_mut_ptr()) };
+                    out.extend_from_slice(&num_buf[..w]);
+                    out.push(b'\n');
+                }
+
+                out
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
     let _ = std::fs::create_dir_all(&out_dir);
+    let results_path = format!("{}/aggregates.txt", out_dir);
     if let Ok(mut out_file) = File::create(&results_path) {
-        let mut out = Vec::with_capacity(32_768);
-        let mut num_buf = [0u8; 64];
-
-        // Format sorted countries (country_map keys are already BTreeMap sorted!)
-        for (&c_bytes, &c_id_u8) in &country_map {
-            let c_id = c_id_u8 as usize;
-            let agg = &final_aggs[c_id];
-            if agg.count == 0 { continue; }
-
-            // Count ones in country's bitset
-            let mut distinct_count = 0u64;
-            for w in 0..BITSET_WORDS {
-                let val = bitsets[c_id * BITSET_WORDS + w].load(Ordering::Relaxed);
-                distinct_count += val.count_ones() as u64;
-            }
-
-            out.extend_from_slice(&c_bytes);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg.count, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg.id_sum, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg.amount_sum, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg.amount_min, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg.amount_max, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(distinct_count, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg.name_bytes, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg.note_bytes, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b'\n');
+        for part in &formatted_outputs {
+            let _ = out_file.write_all(part);
         }
-
-        // _UNMATCHED group (always last)
-        let unmatch_c = unmatched_id as usize;
-        let agg_un = &final_aggs[unmatch_c];
-        if agg_un.count > 0 {
-            let mut distinct_count = 0u64;
-            for w in 0..BITSET_WORDS {
-                let val = bitsets[unmatch_c * BITSET_WORDS + w].load(Ordering::Relaxed);
-                distinct_count += val.count_ones() as u64;
-            }
-
-            out.extend_from_slice(b"_UNMATCHED ");
-
-            let w = unsafe { write_u64_fast(agg_un.count, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg_un.id_sum, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg_un.amount_sum, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg_un.amount_min, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_cents_fast(agg_un.amount_max, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(distinct_count, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg_un.name_bytes, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b' ');
-
-            let w = unsafe { write_u64_fast(agg_un.note_bytes, num_buf.as_mut_ptr()) };
-            out.extend_from_slice(&num_buf[..w]);
-            out.push(b'\n');
-        }
-
-        let _ = out_file.write_all(&out);
     }
+
+    println!("Track C Completed in {:.3}s", t0.elapsed().as_secs_f64());
 }
