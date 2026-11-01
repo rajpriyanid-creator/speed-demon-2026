@@ -5,8 +5,6 @@ use std::os::unix::io::AsRawFd;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::_mm_crc32_u64;
 
-const PROT_READ: i32 = 1;
-const MAP_SHARED: i32 = 1;
 const NUM_HOURS: usize = 72;
 const MADV_DONTNEED: i32 = 4;
 
@@ -111,7 +109,7 @@ fn find_space_swar(w: u64) -> Option<usize> {
 }
 
 struct FastCatalog {
-    endpoints: Vec<(usize, usize)>, // (start_idx, end_idx)
+    endpoints: Vec<(usize, usize)>,
     hashes: Vec<u64>,
     table: Vec<(u64, u16)>,
     mask: usize,
@@ -216,15 +214,13 @@ fn main() {
     let len = meta.len() as usize;
     if len == 0 { return; }
 
-    let ptr = unsafe {
-        mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, file.as_raw_fd(), 0)
-    };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, file.as_raw_fd(), 0) };
     if ptr == usize::MAX as *mut u8 || ptr.is_null() { return; }
     let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12);
 
-    // Parallel Endpoint Discovery across chunks of the first 6 MB (instant < 1 ms!)
+    // Parallel Endpoint Discovery (< 0.5 ms)
     let disc_total = 6_000_000.min(len);
     let mut disc_bounds = Vec::with_capacity(num_threads + 1);
     disc_bounds.push(0);
@@ -295,7 +291,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut global_cat = FastCatalog::new(8192);
+    let mut global_cat = FastCatalog::new(4096);
     for cat in local_catalogs {
         for ((s, e), h) in cat {
             global_cat.get_or_insert(s, e, h);
@@ -312,10 +308,12 @@ fn main() {
         .collect();
     sorted_endpoints.sort_unstable_by(|a, b| data[a.1.0..a.1.1].cmp(&data[b.1.0..b.1.1]));
 
-    let mut lookup_table = FastCatalog::new(8192);
+    let mut lookup_table = FastCatalog::new(4096);
     for (sorted_id, (_, _, h)) in sorted_endpoints.iter().enumerate() {
         lookup_table.insert_mapping(*h, sorted_id as u16);
     }
+
+    let num_groups = NUM_HOURS * num_endpoints;
 
     // Partition boundaries across threads
     let mut boundaries = Vec::with_capacity(num_threads + 1);
@@ -328,19 +326,21 @@ fn main() {
     }
     boundaries.push(len);
 
-    let num_groups = NUM_HOURS * num_endpoints;
-
-    // PASS 1: Thread-local counts with ZERO ATOMIC CONTENTION! (512 KB madvise window)
-    let thread_p1: Vec<(Vec<u32>, Vec<u32>)> = std::thread::scope(|s| {
+    // SINGLE PASS: Parse directly into small flat thread-local vectors (~250 KB per thread)
+    type ParseOutput = (Vec<u32>, Vec<u32>, Vec<u32>);
+    let parsed_chunks: Vec<ParseOutput> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..num_threads).map(|i| {
             let start = boundaries[i];
             let end = boundaries[i + 1];
             let lookup_ref = &lookup_table;
 
             s.spawn(move || {
-                let mut local_counts = vec![0u32; num_groups];
-                let mut local_errs = vec![0u32; num_groups];
-                if start >= end { return (local_counts, local_errs); }
+                let est_lines = (end - start) / 70 + 1024;
+                let mut gids = Vec::with_capacity(est_lines);
+                let mut lats = Vec::with_capacity(est_lines);
+                let mut errs = vec![0u32; num_groups];
+
+                if start >= end { return (gids, lats, errs); }
 
                 let chunk = &data[start..end];
                 let cptr = chunk.as_ptr();
@@ -349,7 +349,7 @@ fn main() {
                 let mut last_adv = 0;
 
                 while pos + 35 <= chunk_len {
-                    if pos - last_adv >= 512 * 1024 {
+                    if pos - last_adv >= 128 * 1024 {
                         unsafe { madvise_dontneed(cptr.add(last_adv), pos - last_adv); }
                         last_adv = pos;
                     }
@@ -399,126 +399,12 @@ fn main() {
                     let h_combined = h ^ (ep_len.rotate_left(56));
                     let sorted_ep = lookup_ref.lookup(h_combined) as usize;
 
-                    let gid = hour_id * num_endpoints + sorted_ep;
-                    unsafe {
-                        *local_counts.get_unchecked_mut(gid) += 1;
-                        if *cptr.add(ep_end + 1) == b'5' {
-                            *local_errs.get_unchecked_mut(gid) += 1;
-                        }
+                    let gid = (hour_id * num_endpoints + sorted_ep) as u32;
+
+                    let is_err = unsafe { *cptr.add(ep_end + 1) == b'5' };
+                    if is_err {
+                        errs[gid as usize] += 1;
                     }
-
-                    let mut idx = ep_end + 5;
-                    while idx < chunk_len && unsafe { *cptr.add(idx) } != b'\n' { idx += 1; }
-                    if idx < chunk_len { idx += 1; }
-                    pos = idx;
-                }
-                if chunk_len > last_adv {
-                    unsafe { madvise_dontneed(cptr.add(last_adv), chunk_len - last_adv); }
-                }
-                (local_counts, local_errs)
-            })
-        }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Consolidate counts and pre-calculate exact per-thread write offsets (ZERO ATOMICS IN PASS 2!)
-    let mut total_counts = vec![0u32; num_groups];
-    let mut total_errs = vec![0u32; num_groups];
-    let mut thread_write_offsets: Vec<Vec<u32>> = (0..num_threads).map(|_| vec![0u32; num_groups]).collect();
-
-    let mut group_offsets = vec![0u32; num_groups + 1];
-    let mut cur_offset = 0u32;
-
-    for gid in 0..num_groups {
-        group_offsets[gid] = cur_offset;
-        let mut cur_thread_base = cur_offset;
-        let mut sum_count = 0u32;
-        let mut sum_err = 0u32;
-        for t in 0..num_threads {
-            thread_write_offsets[t][gid] = cur_thread_base;
-            let cnt = thread_p1[t].0[gid];
-            cur_thread_base += cnt;
-            sum_count += cnt;
-            sum_err += thread_p1[t].1[gid];
-        }
-        total_counts[gid] = sum_count;
-        total_errs[gid] = sum_err;
-        cur_offset = cur_thread_base;
-    }
-    group_offsets[num_groups] = cur_offset;
-    let total_records = cur_offset as usize;
-
-    // Allocate flat u32 array: exactly 12.4 MB for 3.1M records!
-    let mut all_latencies: Vec<u32> = vec![0u32; total_records];
-    let lat_ptr = all_latencies.as_mut_ptr() as usize;
-
-    // PASS 2: Parse latencies and write directly with ZERO ATOMICS! (512 KB madvise window)
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..num_threads).map(|i| {
-            let start = boundaries[i];
-            let end = boundaries[i + 1];
-            let lookup_ref = &lookup_table;
-            let mut my_write_offsets = thread_write_offsets[i].clone();
-
-            s.spawn(move || {
-                if start >= end { return; }
-                let chunk = &data[start..end];
-                let cptr = chunk.as_ptr();
-                let chunk_len = chunk.len();
-                let base_lat_ptr = lat_ptr as *mut u32;
-
-                let mut pos = 0;
-                let mut last_adv = 0;
-                while pos + 35 <= chunk_len {
-                    if pos - last_adv >= 512 * 1024 {
-                        unsafe { madvise_dontneed(cptr.add(last_adv), pos - last_adv); }
-                        last_adv = pos;
-                    }
-                    let day = unsafe { (*cptr.add(pos + 8) - b'0') as usize * 10 + (*cptr.add(pos + 9) - b'0') as usize };
-                    let hr = unsafe { (*cptr.add(pos + 11) - b'0') as usize * 10 + (*cptr.add(pos + 12) - b'0') as usize };
-                    let hour_id = match day {
-                        30 => hr - 18,
-                        31 => hr + 6,
-                        1 => hr + 30,
-                        _ => hr + 54,
-                    };
-
-                    let m_byte = unsafe { *cptr.add(pos + 28) };
-                    let ep_start = match m_byte {
-                        b'G' => pos + 32,
-                        b'P' => match unsafe { *cptr.add(pos + 29) } {
-                            b'O' => pos + 33,
-                            b'U' => pos + 32,
-                            _ => pos + 34,
-                        },
-                        b'D' => pos + 35,
-                        b'H' => pos + 33,
-                        b'O' => pos + 36,
-                        _ => {
-                            let mut idx = pos + 28;
-                            while idx < chunk_len && unsafe { *cptr.add(idx) } != b' ' { idx += 1; }
-                            idx + 1
-                        }
-                    };
-
-                    let mut curr = ep_start;
-                    let mut h: u64 = 0;
-                    loop {
-                        let w = unsafe { (cptr.add(curr) as *const u64).read_unaligned() };
-                        if let Some(off) = find_space_swar(w) {
-                            let rem_mask = if off == 8 { u64::MAX } else { (1u64 << (off * 8)) - 1 };
-                            h = unsafe { _mm_crc32_u64(h, w & rem_mask) };
-                            curr += off;
-                            break;
-                        } else {
-                            h = unsafe { _mm_crc32_u64(h, w) };
-                            curr += 8;
-                        }
-                    }
-                    let ep_end = curr;
-                    let ep_len = (ep_end - ep_start) as u64;
-                    let h_combined = h ^ (ep_len.rotate_left(56));
-                    let sorted_ep = lookup_ref.lookup(h_combined) as usize;
 
                     let mut idx = ep_end + 5;
                     let mut latency: u32 = 0;
@@ -532,12 +418,8 @@ fn main() {
                         }
                     }
 
-                    let gid = hour_id * num_endpoints + sorted_ep;
-                    unsafe {
-                        let slot = *my_write_offsets.get_unchecked(gid) as usize;
-                        *my_write_offsets.get_unchecked_mut(gid) += 1;
-                        *base_lat_ptr.add(slot) = latency;
-                    }
+                    gids.push(gid);
+                    lats.push(latency);
 
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\r' { idx += 1; }
                     if idx < chunk_len && unsafe { *cptr.add(idx) } == b'\n' { idx += 1; }
@@ -546,14 +428,13 @@ fn main() {
                 if chunk_len > last_adv {
                     unsafe { madvise_dontneed(cptr.add(last_adv), chunk_len - last_adv); }
                 }
+                (gids, lats, errs)
             })
         }).collect();
-        for h in handles {
-            h.join().unwrap();
-        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Copy endpoint byte slices into a small flat buffer before munmap (only ~55 KB total!)
+    // Copy endpoint byte slices into small flat buffer (~50 KB)
     let mut ep_flat_bytes = Vec::with_capacity(num_endpoints * 32);
     let mut ep_slice_bounds = Vec::with_capacity(num_endpoints);
     for (_, (s, e), _) in &sorted_endpoints {
@@ -562,11 +443,46 @@ fn main() {
         ep_flat_bytes.extend_from_slice(ep_bytes);
         ep_slice_bounds.push((off, ep_flat_bytes.len()));
     }
-
-    // Free mmap IMMEDIATELY!
     unsafe { munmap(ptr, len); }
 
-    // Parallel formatting by hour across threads with fast itoa!
+    // Consolidate group counts and errors
+    let mut group_counts = vec![0u32; num_groups];
+    let mut total_errs = vec![0u32; num_groups];
+    let mut total_records = 0usize;
+    for (gids, _, errs) in &parsed_chunks {
+        total_records += gids.len();
+        for &gid in gids {
+            group_counts[gid as usize] += 1;
+        }
+        for gid in 0..num_groups {
+            total_errs[gid] += errs[gid];
+        }
+    }
+
+    // CSR group offsets
+    let mut group_offsets = vec![0u32; num_groups + 1];
+    let mut cur_off = 0u32;
+    for gid in 0..num_groups {
+        group_offsets[gid] = cur_off;
+        cur_off += group_counts[gid];
+    }
+    group_offsets[num_groups] = cur_off;
+
+    // Single flat array of latencies: exactly 1.24 MB
+    let mut all_latencies = vec![0u32; total_records];
+    let mut write_cursors = group_offsets.clone();
+
+    for (gids, lats, _) in parsed_chunks {
+        for (&gid, &lat) in gids.iter().zip(lats.iter()) {
+            let slot = write_cursors[gid as usize] as usize;
+            write_cursors[gid as usize] += 1;
+            all_latencies[slot] = lat;
+        }
+    }
+
+    let lat_ptr = all_latencies.as_mut_ptr() as usize;
+
+    // Parallel formatting by hour
     let hours_per_thread = (NUM_HOURS + num_threads - 1) / num_threads;
     let formatted_chunks: Vec<Vec<u8>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..NUM_HOURS).step_by(hours_per_thread).map(|h_start| {
@@ -632,11 +548,11 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut final_file = match File::create(&results_path) {
+    let mut out_file = match File::create(&results_path) {
         Ok(f) => f,
         Err(_) => return,
     };
     for chunk in formatted_chunks {
-        let _ = final_file.write_all(&chunk);
+        let _ = out_file.write_all(&chunk);
     }
 }
