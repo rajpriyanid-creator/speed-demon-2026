@@ -1,5 +1,7 @@
 # Track B: performance log
 
+Measured on the official Speed Demon scoring environment (12 hardware threads, 6 P-cores, 8 GB RAM, no swap, seed-1 full dataset) for team **Leo** (`leo-8535e8`).
+
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |

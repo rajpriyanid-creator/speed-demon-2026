@@ -1,8 +1,8 @@
-# Speed Demon 2026 - Team Rajpriyan S
+# Speed Demon 2026 - Team Leo
 
 High-performance, zero-dependency Rust entries for all four tracks of **Speed Demon 2026** (Track A: Ingest, Track B: Index, Track C: Join, Track D: Traverse).
 
-- **Official Team Registration**: `Rajpriyan S` (`rajpriyan-s-c48a31`)
+- **Official Team Registration**: `Leo` (slug: `leo-8535e8` / `rajpriyan-s-c48a31`)
 - **Official Board Standing**: **64.87 pts** (geometric mean of top 3 tracks)
   - **Track A (Ingest)**: **72.070 pts** ($T=0.0432\text{ s}, M=34.6\text{ MB}$, commit `1d9e136`, run `run-f05def094f3f`)
   - **Track C (Join)**: **66.415 pts** ($T=0.0569\text{ s}, M=25.7\text{ MB}$, commit `fbf1863`, run `run-e83aa93bc850`)
@@ -62,6 +62,6 @@ python3 check.py d --data /path/to/data/d
 - [x] Builds cleanly offline with `cargo build --release --offline`.
 - [x] Zero external dependencies (`dependency_count = 0`, 0 crates in `Cargo.toml`).
 - [x] Byte-for-byte reproducibility on Seed-1 dataset verified for all tracks.
-- [x] `.speed-demon.toml` configured with `team = "Rajpriyan S"`, `language = "Rust"`.
+- [x] `.speed-demon.toml` configured with `team = "Leo"`, `language = "Rust"`.
 - [x] `PERF.md` updated with measured board run IDs and optimization progression.
 - [x] Open-source MIT `LICENSE` present.
